@@ -1,6 +1,6 @@
 # Thoth
 
-[![CI](https://github.com/thoth-coder/thoth/actions/workflows/ci.yml/badge.svg)](https://github.com/thoth-coder/thoth/actions/workflows/ci.yml)
+[![CI](https://github.com/thoth-coder/thoth/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/thoth-coder/thoth/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 **A coding agent that runs entirely on your hardware.** Point Thoth at
