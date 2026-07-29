@@ -28,10 +28,25 @@ for your approval, and nothing ever leaves your machine.
 - **Self-sufficient.** Web search through DuckDuckGo with no API key, or
   Google Programmable Search if you have one.
 
+## Install
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/install.ps1 | iex
+```
+
+Or build from source: `cargo build --release` (-> `target/release/thoth`).
+
 ## Quick start
 
 ```sh
-cargo build --release            # -> target/release/thoth
 ollama pull qwen3:8b             # any tool-calling model
 thoth                            # or: thoth -p "one-shot prompt"
 ```

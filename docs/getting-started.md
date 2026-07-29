@@ -1,6 +1,26 @@
 # Getting started
 
-## Build
+## Install
+
+Prebuilt binaries (Linux x86_64/arm64, macOS Intel/Apple Silicon,
+Windows x86_64):
+
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/install.ps1 | iex
+```
+
+Pin a version with `THOTH_VERSION=v0.1.0`, change the location with
+`THOTH_INSTALL_DIR`. Uninstall with the matching `uninstall.sh` /
+`uninstall.ps1` from the same directory (add `--purge` / `THOTH_PURGE=1`
+to also remove config and state).
+
+## Build from source
 
 ```sh
 cargo build --release   # -> target/release/thoth

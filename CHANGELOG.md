@@ -38,5 +38,8 @@ All notable changes to thoth are documented here. The format follows
 - One-shot mode (`thoth -p "..."`), `/status`, `/model`, `/models`,
   config file + env vars + CLI flags, GitHub Actions CI (Linux/macOS/
   Windows), rustls TLS (no OpenSSL requirement).
+- Release automation: tag-triggered workflow building binaries for five
+  targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
+  with install/uninstall scripts for curl | sh and irm | iex.
 
 [0.1.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.1.0
