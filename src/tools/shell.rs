@@ -54,6 +54,33 @@ fn run_background(command: &str) -> Result<String> {
     ))
 }
 
+/// Everything past this is discarded as it arrives: the model only ever sees
+/// the first few thousand characters anyway.
+const MAX_CAPTURE_BYTES: usize = 200_000;
+
+/// Drains a pipe to the end (so the child never blocks on a full buffer) but
+/// keeps at most MAX_CAPTURE_BYTES of it.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(pipe: &mut Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(r) = pipe else {
+        return Vec::new();
+    };
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if kept.len() < MAX_CAPTURE_BYTES {
+                    let room = MAX_CAPTURE_BYTES - kept.len();
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+        }
+    }
+    kept
+}
+
 pub async fn run(a: ShellArgs, cancel: CancellationToken) -> Result<String> {
     if a.background {
         return run_background(&a.command);
@@ -77,11 +104,20 @@ pub async fn run(a: ShellArgs, cancel: CancellationToken) -> Result<String> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let child = cmd.spawn().context("failed to spawn shell")?;
-    let out = tokio::select! {
+    let mut child = cmd.spawn().context("failed to spawn shell")?;
+    // read the pipes with a ceiling: a chatty build or a runaway `yes` would
+    // otherwise buffer gigabytes before the output cap ever applies
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let collect = async {
+        let (o, e) = tokio::join!(read_capped(&mut stdout_pipe), read_capped(&mut stderr_pipe));
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((o, e, status))
+    };
+    let (out_bytes, err_bytes, status) = tokio::select! {
         // dropping the future kills the child (kill_on_drop)
         _ = cancel.cancelled() => bail!("command cancelled by user"),
-        res = tokio::time::timeout(timeout, child.wait_with_output()) => {
+        res = tokio::time::timeout(timeout, collect) => {
             match res {
                 Err(_) => bail!(
                     "command timed out after {}s. For servers/watchers use background=true; \
@@ -91,6 +127,11 @@ pub async fn run(a: ShellArgs, cancel: CancellationToken) -> Result<String> {
                 Ok(r) => r.context("failed to run command")?,
             }
         }
+    };
+    let out = std::process::Output {
+        status,
+        stdout: out_bytes,
+        stderr: err_bytes,
     };
 
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -116,4 +157,53 @@ pub async fn run(a: ShellArgs, cancel: CancellationToken) -> Result<String> {
         s = "(command succeeded, exit code 0, no output)".into();
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reports_exit_code_and_output() {
+        let out = run(
+            ShellArgs {
+                command: "echo hello-shell".into(),
+                background: false,
+                timeout_secs: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("hello-shell"), "{out}");
+        assert!(!out.contains("FAILED"), "{out}");
+    }
+
+    /// A command that prints forever must not be able to fill memory.
+    #[tokio::test]
+    async fn caps_captured_output() {
+        // ~40 bytes per line, so 8000 lines is well past the 200k cap
+        let cmd = if cfg!(windows) {
+            "1..8000 | ForEach-Object { 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }"
+        } else {
+            "for i in $(seq 1 8000); do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done"
+        };
+        let out = run(
+            ShellArgs {
+                command: cmd.into(),
+                background: false,
+                timeout_secs: Some(120),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // the tool-level cap trims this further; what matters here is that
+        // the capture stopped at the ceiling instead of buffering everything
+        assert!(
+            out.len() <= MAX_CAPTURE_BYTES + 64,
+            "captured {} bytes",
+            out.len()
+        );
+    }
 }

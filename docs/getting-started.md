@@ -20,6 +20,12 @@ Pin a version with `THOTH_VERSION=v0.1.0`, change the location with
 `uninstall.ps1` from the same directory (add `--purge` / `THOTH_PURGE=1`
 to also remove config and state).
 
+Update an existing install to the latest release with:
+
+```sh
+thoth upgrade
+```
+
 ## Build from source
 
 ```sh

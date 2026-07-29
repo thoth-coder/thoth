@@ -58,11 +58,12 @@ pub fn definitions() -> Value {
         }},
         {"type": "function", "function": {
             "name": "grep",
-            "description": "Search file contents with a case-sensitive regular expression. Returns matching lines as path:line: text.",
+            "description": "Search file contents with a case-sensitive regular expression. Returns matching lines as path:line: text. With context set, also shows the surrounding lines, which is often enough to understand the code without reading the file.",
             "parameters": {"type": "object", "properties": {
                 "pattern": {"type": "string", "description": "Regular expression to search for"},
                 "path": {"type": "string", "description": "File or directory to search (default: working directory)"},
-                "glob": {"type": "string", "description": "Only search files matching this glob, e.g. '*.rs'"}
+                "glob": {"type": "string", "description": "Only search files matching this glob, e.g. '*.rs'"},
+                "context": {"type": "integer", "description": "Lines of surrounding code to show before and after each match (like grep -C). 4-6 works well when exploring. Max 10."}
             }, "required": ["pattern"]}
         }},
         {"type": "function", "function": {
@@ -116,8 +117,63 @@ The command already runs in the working directory, no need to cd first.";
     }
 }
 
-pub fn needs_permission(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "shell")
+pub fn needs_permission(name: &str, args: &Value) -> bool {
+    match name {
+        "write_file" | "edit_file" | "shell" | "remember" | "web_fetch" => true,
+        // reading inside the project is free; reaching outside it is not
+        "read_file" => !fs::inside_project(args.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+        _ => false,
+    }
+}
+
+/// What an "always allow" answer covers. Granting every future shell command
+/// from one prompt is too much, so shell is keyed by its program (`shell:git`)
+/// and web_fetch by host; the rest are keyed by tool name.
+pub fn permission_key(name: &str, args: &Value) -> String {
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "shell" => format!("shell:{}", program_of(get("command"))),
+        "web_fetch" => format!("web_fetch:{}", host_of(get("url"))),
+        _ => name.to_string(),
+    }
+}
+
+/// Human wording for what an "always" answer will allow.
+pub fn permission_scope(key: &str) -> String {
+    match key.split_once(':') {
+        Some(("shell", prog)) => format!("`{prog}` commands"),
+        Some(("web_fetch", host)) => format!("fetching from {host}"),
+        _ => format!("the {key} tool"),
+    }
+}
+
+/// First word of a command line, without its path or extension:
+/// "C:/bin/git.exe status" -> "git".
+fn program_of(command: &str) -> String {
+    let first = command.split_whitespace().next().unwrap_or("");
+    let base = first
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first)
+        .trim_end_matches(".exe")
+        .trim_matches(['"', '\'']);
+    if base.is_empty() {
+        "?".into()
+    } else {
+        base.to_lowercase()
+    }
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() {
+        "?".into()
+    } else {
+        host.to_lowercase()
+    }
 }
 
 /// Short one-line description of a call, for the tool header in the UI.
@@ -159,6 +215,18 @@ pub fn preview(name: &str, args: &Value) -> String {
         }
         "write_file" => fs::preview_write(args),
         "edit_file" => fs::preview_edit(args),
+        "read_file" => format!(
+            "read {} (outside this project)",
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        "web_fetch" => format!(
+            "fetch {}",
+            args.get("url").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        "remember" => format!(
+            "save to project memory: {}",
+            args.get("fact").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
         _ => String::new(),
     }
 }

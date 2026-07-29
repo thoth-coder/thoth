@@ -43,6 +43,7 @@ irm https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/install.ps1
 ```
 
 Or build from source: `cargo build --release` (-> `target/release/thoth`).
+Update later with `thoth upgrade`.
 
 ## Quick start
 

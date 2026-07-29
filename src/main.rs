@@ -2,9 +2,9 @@ mod agent;
 mod client;
 mod config;
 mod editor;
-mod prompt;
 mod tools;
-mod tui;
+mod ui;
+mod upgrade;
 
 use agent::{Agent, AgentCmd, AgentEvent, PermReply};
 use anyhow::{Result, anyhow, bail};
@@ -19,9 +19,14 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser)]
 #[command(name = "thoth", version)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Cmd>,
     /// Run a single prompt non-interactively (plain output) and exit
     #[arg(short, long)]
     prompt: Option<String>,
+    /// Resume this project's previous conversation
+    #[arg(short = 'c', long = "continue")]
+    resume: bool,
     /// OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 (Ollama)
     /// or http://localhost:8080/v1 (llama.cpp)
     #[arg(long)]
@@ -37,9 +42,18 @@ struct Args {
     temperature: Option<f32>,
 }
 
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// Download the latest release and replace this binary
+    Upgrade,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Cmd::Upgrade) = args.command {
+        return upgrade::run().await;
+    }
     let cfg = config::load(args.base_url, args.model, args.api_key, args.temperature);
 
     if let (Some(key), Some(cx)) = (cfg.google_api_key.clone(), cfg.google_cx.clone()) {
@@ -103,18 +117,21 @@ async fn main() -> Result<()> {
         )));
     }
 
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         client,
         cfg.max_turns,
         ev_tx,
         cancel_slot.clone(),
         auto_compact_at,
     );
+    if args.resume {
+        agent.resume_session();
+    }
     tokio::spawn(agent.run(cmd_rx));
 
     match args.prompt {
         Some(p) => run_print_mode(p, cmd_tx, ev_rx).await,
-        None => tui::run(model, base_url, num_ctx_ui, cmd_tx, ev_rx, cancel_slot).await,
+        None => ui::run(model, base_url, num_ctx_ui, cmd_tx, ev_rx, cancel_slot).await,
     }
 }
 
@@ -124,8 +141,12 @@ async fn run_print_mode(
     cmd_tx: mpsc::UnboundedSender<AgentCmd>,
     mut ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
 ) -> Result<()> {
+    let (attachments, labels) = ui::input::expand_mentions(&prompt, &ui::input::cwd());
+    for l in labels {
+        eprintln!("* {l}");
+    }
     cmd_tx
-        .send(AgentCmd::UserInput(prompt))
+        .send(AgentCmd::UserInput(format!("{prompt}{attachments}")))
         .map_err(|_| anyhow!("agent task died"))?;
     let mut ctx_tokens = 0u64;
     let mut out_tokens = 0u64;

@@ -2,43 +2,99 @@ use anyhow::{Context, Result, bail};
 use globset::GlobBuilder;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
 
-/// Files the model has read this session. edit_file needs any read;
-/// overwriting with write_file needs a full read — a 1-line peek must not
-/// unlock rewriting a whole file.
-fn read_registry() -> &'static Mutex<(HashSet<PathBuf>, HashSet<PathBuf>)> {
-    static R: OnceLock<Mutex<(HashSet<PathBuf>, HashSet<PathBuf>)>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new((HashSet::new(), HashSet::new())))
+/// What the model has actually seen of each file this session, as merged
+/// line ranges. edit_file needs any read; overwriting a file with write_file
+/// needs every line covered, so neither a 1-line peek nor two peeks at the
+/// first and last line can unlock a blind rewrite.
+#[derive(Default)]
+struct ReadState {
+    /// Sorted, non-overlapping (first, last) line ranges, 1-based inclusive.
+    seen: Vec<(usize, usize)>,
+    total: usize,
+}
+
+impl ReadState {
+    fn add(&mut self, first: usize, last: usize) {
+        if last < first {
+            return;
+        }
+        self.seen.push((first, last));
+        self.seen.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.seen.len());
+        for &(a, b) in &self.seen {
+            match merged.last_mut() {
+                // ranges touching end to end count as continuous
+                Some((_, e)) if a <= *e + 1 => *e = (*e).max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        self.seen = merged;
+    }
+
+    fn covers_all(&self) -> bool {
+        self.total > 0 && self.seen.first() == Some(&(1, self.total))
+    }
+}
+
+fn read_registry() -> &'static Mutex<HashMap<PathBuf, ReadState>> {
+    static R: OnceLock<Mutex<HashMap<PathBuf, ReadState>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn registry_key(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
-fn mark_read(p: &Path, full: bool) {
-    let key = registry_key(p);
+/// Records that lines `first..=last` of a file with `total` lines were shown.
+fn mark_read(p: &Path, first: usize, last: usize, total: usize) {
     let mut r = read_registry().lock().unwrap();
-    r.0.insert(key.clone());
+    let e = r.entry(registry_key(p)).or_default();
+    // the file changed size since the last read: start over
+    if e.total != total {
+        e.seen.clear();
+        e.total = total;
+    }
+    e.add(first, last);
+}
+
+/// A file the user pulled in with `@path`. `full` is false when the
+/// attachment was truncated, which must not unlock a blind overwrite.
+pub fn mark_attached(p: &Path, lines: usize, full: bool) {
     if full {
-        r.1.insert(key);
+        mark_read(p, 1, lines, lines);
+    } else {
+        // seen from the top but not to the end: enough for edit_file only
+        mark_read(p, 1, lines.saturating_sub(1).max(1), lines.max(2));
     }
 }
 
 fn was_read(p: &Path) -> bool {
-    read_registry().lock().unwrap().0.contains(&registry_key(p))
+    read_registry()
+        .lock()
+        .unwrap()
+        .get(&registry_key(p))
+        .is_some_and(|s| !s.seen.is_empty())
 }
 
 fn was_fully_read(p: &Path) -> bool {
-    read_registry().lock().unwrap().1.contains(&registry_key(p))
+    read_registry()
+        .lock()
+        .unwrap()
+        .get(&registry_key(p))
+        .is_some_and(ReadState::covers_all)
 }
 
 const MAX_READ_LINES: usize = 600;
 const MAX_LINE_CHARS: usize = 500;
 const MAX_ENTRIES: usize = 500;
+/// Refuse to slurp anything bigger than this into the context; the model
+/// should use offset/limit or grep instead.
+pub const MAX_FILE_BYTES: u64 = 2_000_000;
 
 pub fn resolve(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
@@ -48,6 +104,21 @@ pub fn resolve(path: &str) -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(p)
+    }
+}
+
+/// True when a tool argument points inside the working directory. Used to
+/// decide whether an operation is routine or needs the user to approve it.
+pub fn inside_project(path: &str) -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let target = resolve(path);
+    match (cwd.canonicalize(), target.canonicalize()) {
+        (Ok(c), Ok(t)) => t.starts_with(c),
+        // a file that does not exist yet: judge the path we would create
+        (Ok(c), Err(_)) => target.starts_with(&c) && !path.contains(".."),
+        _ => false,
     }
 }
 
@@ -69,6 +140,16 @@ pub struct ReadArgs {
 
 pub fn read_file(a: ReadArgs) -> Result<String> {
     let path = resolve(&a.path);
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > MAX_FILE_BYTES
+    {
+        bail!(
+            "{} is {} MB, too large to read into the context. Use grep to find what you need, \
+             or read_file with offset and limit",
+            path.display(),
+            meta.len() / 1_000_000
+        );
+    }
     let bytes = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let offset = a.offset.unwrap_or(1).max(1);
@@ -95,13 +176,10 @@ pub fn read_file(a: ReadArgs) -> Result<String> {
         last_shown = n;
     }
     if total == 0 {
-        mark_read(&path, true);
+        mark_read(&path, 1, 1, 1);
         return Ok("(empty file)".into());
     }
-    // "full" = this read reached the end, starting from the top or continuing
-    // an earlier read of the same file
-    let full = last_shown >= total && (offset <= 1 || was_read(&path));
-    mark_read(&path, full);
+    mark_read(&path, offset.min(total), last_shown, total);
     if offset > 1 || last_shown < total {
         out.push_str(&format!(
             "(showing lines {}-{} of {}, use offset/limit to read more)\n",
@@ -134,7 +212,9 @@ pub fn write_file(a: WriteArgs) -> Result<String> {
     }
     std::fs::write(&path, &a.content)
         .with_context(|| format!("cannot write {}", path.display()))?;
-    mark_read(&path, true);
+    // the model authored the whole file, so it has seen all of it
+    let lines = a.content.lines().count().max(1);
+    mark_read(&path, 1, lines, lines);
     Ok(format!(
         "Wrote {} lines ({} bytes) to {}",
         a.content.lines().count(),
@@ -388,4 +468,81 @@ fn raw_edit_preview(old: &str, new: &str) -> String {
         s.push_str("+ …\n");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str, lines: usize) -> PathBuf {
+        let dir = std::env::temp_dir().join("thoth-fs-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn read(p: &Path, offset: usize, limit: usize) {
+        read_file(ReadArgs {
+            path: p.to_string_lossy().into_owned(),
+            offset: Some(offset),
+            limit: Some(limit),
+        })
+        .unwrap();
+    }
+
+    /// The hole found in review: peeking at the first and the last line used
+    /// to count as having read the whole file.
+    #[test]
+    fn peeking_at_both_ends_does_not_unlock_overwrite() {
+        let p = tmp("peek.txt", 500);
+        read(&p, 1, 1);
+        assert!(was_read(&p), "a peek still unlocks edit_file");
+        read(&p, 500, 1);
+        assert!(
+            !was_fully_read(&p),
+            "two 1-line peeks must not unlock write_file"
+        );
+        // reading the middle closes the gap
+        read(&p, 2, 498);
+        assert!(was_fully_read(&p), "contiguous coverage should unlock it");
+    }
+
+    #[test]
+    fn reading_in_pages_unlocks_overwrite() {
+        let p = tmp("pages.txt", 1000);
+        read(&p, 1, 600);
+        assert!(!was_fully_read(&p));
+        read(&p, 601, 600);
+        assert!(was_fully_read(&p), "sequential pages cover the file");
+    }
+
+    #[test]
+    fn edits_to_the_file_reset_coverage() {
+        let p = tmp("changed.txt", 10);
+        read(&p, 1, 600);
+        assert!(was_fully_read(&p));
+        std::fs::write(&p, "a\n".repeat(40)).unwrap();
+        read(&p, 1, 5);
+        assert!(
+            !was_fully_read(&p),
+            "the file grew, old coverage must not carry over"
+        );
+    }
+
+    #[test]
+    fn refuses_to_slurp_a_huge_file() {
+        let dir = std::env::temp_dir().join("thoth-fs-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("big.bin");
+        std::fs::write(&p, vec![b'x'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
+        let err = read_file(ReadArgs {
+            path: p.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("too large"), "{err:#}");
+    }
 }

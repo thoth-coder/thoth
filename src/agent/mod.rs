@@ -1,5 +1,7 @@
+pub mod prompt;
+pub mod session;
+
 use crate::client::{Client, Message, StreamEvent, ToolCall, Usage};
-use crate::prompt;
 use crate::tools;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
@@ -18,6 +20,13 @@ pub enum AgentCmd {
     Compact,
     /// Load .thoth/last-session.md back into the conversation context.
     Recap,
+    /// A command the user ran themselves with `!cmd`: executed without asking
+    /// the model, its output goes into the conversation as context.
+    Shell(String),
+    /// Show the persistent allowlist, or clear it (`/allow reset`).
+    Permissions {
+        reset: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +88,7 @@ impl Agent {
         Self {
             client,
             messages: vec![Message::system(prompt::system_prompt())],
-            always_allow: HashSet::new(),
+            always_allow: crate::agent::session::load_allow(),
             max_turns,
             tx,
             cancel_slot,
@@ -92,8 +101,26 @@ impl Agent {
         let _ = self.tx.send(ev);
     }
 
+    /// Loads the saved transcript of this project's last run. The system
+    /// prompt stays the fresh one built at startup.
+    pub fn resume_session(&mut self) {
+        match crate::agent::session::load() {
+            Some(msgs) => {
+                let n = msgs.len();
+                self.messages.extend(msgs);
+                self.send(AgentEvent::Info(format!(
+                    "resumed the previous session ({n} messages). /clear starts fresh"
+                )));
+            }
+            None => self.send(AgentEvent::Info(
+                "no saved session for this project yet".into(),
+            )),
+        }
+    }
+
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<AgentCmd>) {
         while let Some(cmd) = rx.recv().await {
+            let persist = !matches!(cmd, AgentCmd::ListModels | AgentCmd::Permissions { .. });
             match cmd {
                 AgentCmd::UserInput(input) => {
                     self.send(AgentEvent::TurnStart);
@@ -122,7 +149,32 @@ impl Agent {
                     // (and any project changes) are picked up immediately
                     self.messages.clear();
                     self.messages.push(Message::system(prompt::system_prompt()));
+                    crate::agent::session::clear();
                     self.send(AgentEvent::Info("conversation context cleared".into()));
+                }
+                AgentCmd::Shell(command) => self.run_user_command(&command).await,
+                AgentCmd::Permissions { reset } => {
+                    if reset {
+                        self.always_allow.clear();
+                        crate::agent::session::clear_allow();
+                        self.send(AgentEvent::Info(
+                            "permission allowlist cleared, every tool asks again".into(),
+                        ));
+                    } else if self.always_allow.is_empty() {
+                        self.send(AgentEvent::Info(
+                            "no tools are always-allowed in this project. answer (a) at a \
+                             permission prompt to add one"
+                                .into(),
+                        ));
+                    } else {
+                        let mut names: Vec<&str> =
+                            self.always_allow.iter().map(String::as_str).collect();
+                        names.sort_unstable();
+                        self.send(AgentEvent::Info(format!(
+                            "always allowed in this project (saved): {}\n/allow reset to undo",
+                            names.join(", ")
+                        )));
+                    }
                 }
                 AgentCmd::Compact => self.compact().await,
                 AgentCmd::Recap => match tools::memory::load_recap() {
@@ -140,8 +192,35 @@ impl Agent {
                     )),
                 },
             }
+            if persist {
+                crate::agent::session::save(&self.messages);
+            }
             self.send(AgentEvent::TurnEnd);
         }
+    }
+
+    /// `!cmd`: the user ran this themselves, so it needs no permission. The
+    /// output is added to the conversation as context, without a model call.
+    async fn run_user_command(&mut self, command: &str) {
+        self.send(AgentEvent::ToolStart {
+            name: "shell".into(),
+            summary: command.to_string(),
+        });
+        let token = CancellationToken::new();
+        *self.cancel_slot.lock().unwrap() = token.clone();
+        let args = serde_json::json!({ "command": command });
+        let (content, is_error) = match tools::execute("shell", args, token).await {
+            Ok(s) => (s, false),
+            Err(e) => (format!("Error: {e:#}"), true),
+        };
+        self.send(AgentEvent::ToolResult {
+            content: content.clone(),
+            is_error,
+        });
+        self.messages.push(Message::user(format!(
+            "(the user ran this command in their terminal, for context, no reply needed)\n\
+             $ {command}\n{content}"
+        )));
     }
 
     async fn compact(&mut self) {
@@ -401,7 +480,8 @@ impl Agent {
             summary: tools::summarize(name, &args),
         });
 
-        let must_ask = tools::needs_permission(name) && !self.always_allow.contains(name);
+        let key = tools::permission_key(name, &args);
+        let must_ask = tools::needs_permission(name, &args) && !self.always_allow.contains(&key);
         // permission skipped (always-allowed): still show exactly what runs —
         // the full diff for file changes, the full command line for shell
         if !must_ask && matches!(name, "write_file" | "edit_file" | "shell") {
@@ -420,7 +500,12 @@ impl Agent {
             };
             match reply {
                 PermReply::Always => {
-                    self.always_allow.insert(name.to_string());
+                    self.always_allow.insert(key.clone());
+                    crate::agent::session::save_allow(&self.always_allow);
+                    self.send(AgentEvent::Info(format!(
+                        "always allowing {} in this project. /allow to review",
+                        tools::permission_scope(&key)
+                    )));
                 }
                 PermReply::Yes => {}
                 PermReply::No => {
@@ -433,5 +518,47 @@ impl Agent {
         }
 
         tools::execute(name, args, token.clone()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Client;
+
+    /// `!cmd` runs without a model or a permission prompt, and its output
+    /// lands in the conversation for the next turn to use.
+    #[tokio::test]
+    async fn user_command_runs_and_enters_the_conversation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = Client::new("http://127.0.0.1:1".into(), None, None, None);
+        let mut agent = Agent::new(
+            client,
+            1,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+            None,
+        );
+        agent.run_user_command("echo hello-from-thoth").await;
+
+        match rx.try_recv() {
+            Ok(AgentEvent::ToolStart { name, summary }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(summary, "echo hello-from-thoth");
+            }
+            _ => panic!("expected the command to be shown before it runs"),
+        }
+        match rx.try_recv() {
+            Ok(AgentEvent::ToolResult { content, is_error }) => {
+                assert!(!is_error, "command failed: {content}");
+                assert!(content.contains("hello-from-thoth"), "got: {content}");
+            }
+            _ => panic!("expected a result"),
+        }
+        let last = agent.messages.last().unwrap();
+        assert_eq!(last.role, "user");
+        let text = last.content.clone().unwrap();
+        assert!(text.contains("$ echo hello-from-thoth"));
+        assert!(text.contains("hello-from-thoth"));
     }
 }

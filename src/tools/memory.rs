@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 const MAX_MEMORY_CHARS: usize = 3000;
@@ -21,22 +22,40 @@ fn memory_path() -> PathBuf {
     thoth_dir().join("memory.md")
 }
 
-/// Encodes the cwd the way Claude Code does: "C:\Users\U\proj" -> "C--Users-U-proj".
+/// Encodes the cwd the way Claude Code does ("C:\Users\U\proj" ->
+/// "C--Users-U-proj"), plus a hash of the real path. Without the hash,
+/// `proj-a`, `proj_a` and `proj.a` would share one directory, and with it a
+/// project's saved session and permissions cannot leak into another.
 fn project_key() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    cwd.to_string_lossy()
+    let raw = cwd.to_string_lossy();
+    // Windows paths are case-insensitive, so C:\Proj and c:\proj are one project
+    let canonical = if cfg!(windows) {
+        raw.to_lowercase()
+    } else {
+        raw.to_string()
+    };
+    let digest = Sha256::digest(canonical.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let readable: String = raw
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect()
+        .collect();
+    format!("{readable}-{short}")
 }
 
-fn recap_path() -> PathBuf {
+/// `~/.thoth/projects/<encoded-cwd>/` — private per-project state (recap,
+/// saved session, permission allowlist). Never inside the repo.
+pub fn project_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".thoth")
         .join("projects")
         .join(project_key())
-        .join("last-session.md")
+}
+
+fn recap_path() -> PathBuf {
+    project_dir().join("last-session.md")
 }
 
 #[derive(Deserialize)]
@@ -102,8 +121,22 @@ pub fn save_recap(summary: &str) {
 }
 
 pub fn load_recap() -> Option<String> {
-    // fall back to the old in-project location for recaps saved before the move
+    // fall back to older locations: the key before it carried a path hash,
+    // and before that the recap lived in the project itself
+    let legacy_key: String = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let legacy = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".thoth")
+        .join("projects")
+        .join(legacy_key)
+        .join("last-session.md");
     let text = std::fs::read_to_string(recap_path())
+        .or_else(|_| std::fs::read_to_string(legacy))
         .or_else(|_| std::fs::read_to_string(thoth_dir().join("last-session.md")))
         .ok()?;
     let text = text.trim().to_string();

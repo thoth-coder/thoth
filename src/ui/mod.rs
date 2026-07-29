@@ -1,4 +1,15 @@
+pub mod input;
+pub mod render;
+pub mod theme;
+
 use crate::agent::{AgentCmd, AgentEvent, PermReply};
+use crate::ui::input::{
+    common_prefix, complete_candidates, cwd, expand_mentions, split_path_fragment,
+};
+use crate::ui::render::{
+    clip, expand_tabs, fmt_elapsed, fmt_k, render_diff_body, render_markdown, short_url, wrap_into,
+};
+use crate::ui::theme::{PROMPT, RULE, SPINNER};
 use anyhow::Result;
 use ratatui::Frame;
 use ratatui::crossterm::event::{
@@ -7,16 +18,18 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const RESULT_PREVIEW_LINES: usize = 4;
+/// Transcript blocks kept in memory. Tool results can be 12k chars each, so
+/// an all-day session would grow without this.
+const MAX_BLOCKS: usize = 600;
 
 const HELP: &str = "commands:
   /help          show this help
@@ -24,19 +37,27 @@ const HELP: &str = "commands:
   /compact       summarize the conversation to free context space
   /recap         load the previous session's summary into context
   /memory        show project memory (/memory clear to wipe)
+  /allow         tools always allowed here (/allow reset to clear)
   /status        session info: model, tokens, uptime
   /init          analyze the project and generate THOTH.md
   /model NAME    switch model
   /models        list models available on the server
   /quit          exit
+input:
+  @path          attach a file to your message (tab completes the path)
+  !command       run a command yourself; its output goes into the context
 keys:
   enter          send
+  tab            complete an @path
   esc            interrupt generation / clear input
   up / down      input history
   mouse wheel / pgup / pgdn   scroll transcript
   ctrl+o         expand / collapse long tool outputs
   ctrl+c         quit
-tip: hold shift while dragging to select text with the mouse";
+tips: hold shift while dragging to select text with the mouse
+      start thoth with --continue to resume this project's last conversation";
+
+const MAX_COMPLETIONS: usize = 12;
 
 enum ChatBlock {
     User(String),
@@ -120,34 +141,7 @@ pub async fn run(
         }
     });
 
-    let mut app = App {
-        model,
-        base_url,
-        blocks: vec![ChatBlock::Info("/help for commands".into())],
-        input: String::new(),
-        cursor: 0,
-        history: Vec::new(),
-        hist_idx: None,
-        draft: String::new(),
-        mode: Mode::Input,
-        scroll: None,
-        max_scroll: 0,
-        spin: 0,
-        quit: false,
-        session_start: std::time::Instant::now(),
-        turn_start: None,
-        editor_status: crate::editor::live_status(),
-        tick_count: 0,
-        num_ctx,
-        expanded: false,
-        cache: Vec::new(),
-        cached_blocks: 0,
-        cache_width: 0,
-        ctx_tokens: 0,
-        out_tokens: 0,
-        cmd_tx,
-        cancel_slot,
-    };
+    let mut app = App::new(model, base_url, num_ctx, cmd_tx, cancel_slot);
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut dirty = true;
@@ -158,9 +152,24 @@ pub async fn run(
                 while let Ok(ev) = key_rx.try_recv() { app.on_term_event(ev); }
                 dirty = true;
             }
-            Some(ev) = ev_rx.recv() => {
-                app.on_agent_event(ev);
-                while let Ok(ev) = ev_rx.try_recv() { app.on_agent_event(ev); }
+            ev = ev_rx.recv() => {
+                match ev {
+                    Some(ev) => {
+                        app.on_agent_event(ev);
+                        while let Ok(ev) = ev_rx.try_recv() { app.on_agent_event(ev); }
+                    }
+                    // the agent task is gone (panicked or shut down): say so
+                    // instead of spinning forever on a dead channel
+                    None => {
+                        app.blocks.push(ChatBlock::Error(
+                            "the agent stopped unexpectedly. ctrl+c to quit, then restart thoth".into(),
+                        ));
+                        app.mode = Mode::Input;
+                        app.turn_start = None;
+                        terminal.draw(|f| app.draw(f))?;
+                        break;
+                    }
+                }
                 dirty = true;
             }
             _ = tick.tick() => {
@@ -196,6 +205,43 @@ pub async fn run(
 }
 
 impl App {
+    fn new(
+        model: String,
+        base_url: String,
+        num_ctx: Option<u32>,
+        cmd_tx: mpsc::UnboundedSender<AgentCmd>,
+        cancel_slot: Arc<Mutex<CancellationToken>>,
+    ) -> Self {
+        Self {
+            model,
+            base_url,
+            blocks: vec![ChatBlock::Info("/help for commands".into())],
+            input: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            hist_idx: None,
+            draft: String::new(),
+            mode: Mode::Input,
+            scroll: None,
+            max_scroll: 0,
+            spin: 0,
+            quit: false,
+            session_start: std::time::Instant::now(),
+            turn_start: None,
+            editor_status: crate::editor::live_status(),
+            tick_count: 0,
+            num_ctx,
+            expanded: false,
+            cache: Vec::new(),
+            cached_blocks: 0,
+            cache_width: 0,
+            ctx_tokens: 0,
+            out_tokens: 0,
+            cmd_tx,
+            cancel_slot,
+        }
+    }
+
     // ---- events ----
 
     fn on_term_event(&mut self, ev: Event) {
@@ -266,6 +312,7 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit(),
+            KeyCode::Tab => self.complete_mention(),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
                 let i = self.byte_idx(self.cursor);
@@ -317,26 +364,18 @@ impl App {
                 });
             }
             AgentEvent::ToolResult { content, is_error } => {
-                if let Some(ChatBlock::Tool { result, .. }) = self
-                    .blocks
-                    .iter_mut()
-                    .rev()
-                    .find(|b| matches!(b, ChatBlock::Tool { result: None, .. }))
-                {
-                    *result = Some((content, is_error));
+                if let Some(i) = self.pending_tool() {
+                    if let ChatBlock::Tool { result, .. } = &mut self.blocks[i] {
+                        *result = Some((content, is_error));
+                    }
+                    self.invalidate_from(i);
                 }
-                // may have mutated an already-cached block
-                self.invalidate_cache();
             }
             AgentEvent::Permission { preview, reply, .. } => {
                 self.attach_tool_detail(preview);
                 self.mode = Mode::Perm(reply);
-                self.invalidate_cache();
             }
-            AgentEvent::Diff(t) => {
-                self.attach_tool_detail(t);
-                self.invalidate_cache();
-            }
+            AgentEvent::Diff(t) => self.attach_tool_detail(t),
             AgentEvent::Info(t) => self.blocks.push(ChatBlock::Info(t)),
             AgentEvent::Error(t) => self.blocks.push(ChatBlock::Error(t)),
             AgentEvent::ModelChanged(m) => self.model = m,
@@ -357,24 +396,47 @@ impl App {
                     self.mode = Mode::Input;
                 }
                 self.turn_start = None;
+                self.trim_blocks();
             }
         }
     }
 
+    /// Drops the oldest part of the transcript once it gets long. Scrollback
+    /// is not worth an unbounded heap in a session that runs for hours.
+    fn trim_blocks(&mut self) {
+        if self.blocks.len() <= MAX_BLOCKS {
+            return;
+        }
+        let drop = self.blocks.len() - MAX_BLOCKS * 3 / 4;
+        self.blocks.drain(..drop);
+        self.blocks.insert(
+            0,
+            ChatBlock::Info(format!("({drop} earlier messages dropped from the view)")),
+        );
+        self.invalidate_cache();
+        self.scroll = None;
+    }
+
     // ---- actions ----
+
+    /// Index of the tool block still waiting for its result.
+    fn pending_tool(&self) -> Option<usize> {
+        self.blocks
+            .iter()
+            .rposition(|b| matches!(b, ChatBlock::Tool { result: None, .. }))
+    }
 
     /// Puts a command/diff preview inside its tool block so the transcript
     /// reads header -> command -> result in order.
     fn attach_tool_detail(&mut self, text: String) {
-        if let Some(ChatBlock::Tool { detail, .. }) = self
-            .blocks
-            .iter_mut()
-            .rev()
-            .find(|b| matches!(b, ChatBlock::Tool { result: None, .. }))
-        {
-            *detail = Some(text);
-        } else {
-            self.blocks.push(ChatBlock::Diff(text));
+        match self.pending_tool() {
+            Some(i) => {
+                if let ChatBlock::Tool { detail, .. } = &mut self.blocks[i] {
+                    *detail = Some(text);
+                }
+                self.invalidate_from(i);
+            }
+            None => self.blocks.push(ChatBlock::Diff(text)),
         }
     }
 
@@ -403,14 +465,72 @@ impl App {
             self.command(rest.trim());
             return;
         }
+        if let Some(cmd) = text.strip_prefix('!') {
+            let cmd = cmd.trim();
+            if cmd.is_empty() {
+                return;
+            }
+            self.scroll = None;
+            if matches!(self.mode, Mode::Input) {
+                self.set_busy();
+            } else {
+                self.blocks.push(ChatBlock::Info("(queued)".into()));
+            }
+            let _ = self.cmd_tx.send(AgentCmd::Shell(cmd.to_string()));
+            return;
+        }
         self.blocks.push(ChatBlock::User(text.clone()));
+        let (attachments, labels) = expand_mentions(&text, &cwd());
+        for l in labels {
+            self.blocks.push(ChatBlock::Info(l));
+        }
         self.scroll = None;
         if matches!(self.mode, Mode::Input) {
             self.set_busy();
         } else {
             self.blocks.push(ChatBlock::Info("(queued)".into()));
         }
-        let _ = self.cmd_tx.send(AgentCmd::UserInput(text));
+        let _ = self
+            .cmd_tx
+            .send(AgentCmd::UserInput(format!("{text}{attachments}")));
+    }
+
+    /// Tab: completes the `@path` word the cursor sits in.
+    fn complete_mention(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cur = self.cursor.min(chars.len());
+        let mut start = cur;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        if start >= cur || chars[start] != '@' {
+            return;
+        }
+        let typed: String = chars[start + 1..cur].iter().collect();
+        let (dir, frag) = split_path_fragment(&typed);
+        let base = cwd().join(dir);
+        let matches = complete_candidates(&base, frag);
+        if matches.is_empty() {
+            return;
+        }
+        let completed = format!("{dir}{}", common_prefix(&matches));
+        if completed != typed {
+            let mut next: String = chars[..start + 1].iter().collect();
+            next.push_str(&completed);
+            let tail: String = chars[cur..].iter().collect();
+            self.cursor = next.chars().count();
+            next.push_str(&tail);
+            self.input = next;
+        } else if matches.len() > 1 {
+            let shown: Vec<String> = matches.iter().take(MAX_COMPLETIONS).cloned().collect();
+            let more = matches.len().saturating_sub(shown.len());
+            let mut list = shown.join("  ");
+            if more > 0 {
+                list.push_str(&format!("  ... +{more} more"));
+            }
+            self.blocks.push(ChatBlock::Info(list));
+            self.scroll = None;
+        }
     }
 
     fn set_busy(&mut self) {
@@ -461,6 +581,11 @@ impl App {
                         )),
                     }
                 }
+            }
+            "allow" | "permissions" => {
+                let _ = self.cmd_tx.send(AgentCmd::Permissions {
+                    reset: arg == "reset" || arg == "clear",
+                });
             }
             "status" => {
                 let up = self.session_start.elapsed().as_secs();
@@ -575,29 +700,23 @@ impl App {
     // ---- drawing ----
 
     fn draw(&mut self, f: &mut Frame) {
-        let [header_a, chat_a, input_a, status_a] = Layout::vertical([
+        // one line of chrome at the top, one status line above the input and
+        // one hint line below it: everything else belongs to the transcript
+        let [header_a, chat_a, state_a, rule_a, input_a, status_a] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(f.area());
 
         // header
         let header = Line::from(vec![
-            Span::styled(
-                " thoth ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(self.model.clone(), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!(" · {}", self.base_url),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" thoth ", theme::accent().add_modifier(Modifier::REVERSED)),
+            Span::styled(format!(" {}", self.model), theme::accent()),
+            Span::styled(format!("  {}", short_url(&self.base_url)), theme::muted()),
         ]);
         f.render_widget(Paragraph::new(header), header_a);
 
@@ -628,102 +747,100 @@ impl App {
         }
         f.render_widget(Paragraph::new(Text::from(visible)), chat_a);
 
-        // input box
-        let (title, border_style) = match &self.mode {
-            Mode::Busy => (
-                format!(
-                    " {} working {}s - esc to interrupt ",
-                    SPINNER[self.spin],
-                    self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+        // state line: what thoth is doing right now
+        let state = match &self.mode {
+            Mode::Busy => Line::from(vec![
+                Span::styled(SPINNER[self.spin], Style::default().fg(theme::BUSY)),
+                Span::styled(
+                    format!(
+                        " working  {}  esc to interrupt",
+                        fmt_elapsed(self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0))
+                    ),
+                    theme::muted(),
                 ),
-                Style::default().fg(Color::Yellow),
-            ),
-            Mode::Perm(_) => (
-                " permission required ".to_string(),
-                Style::default().fg(Color::Yellow),
-            ),
-            Mode::Input => (String::new(), Style::default().fg(Color::DarkGray)),
+            ]),
+            Mode::Perm(_) => Line::from(vec![
+                Span::styled("permission needed  ", Style::default().fg(theme::BUSY)),
+                Span::styled("y", theme::key()),
+                Span::styled(" once   ", theme::muted()),
+                Span::styled("a", theme::key()),
+                Span::styled(" always   ", theme::muted()),
+                Span::styled("n", theme::key()),
+                Span::styled(" no", theme::muted()),
+            ]),
+            Mode::Input => Line::default(),
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(border_style)
-            .title(title);
-        let inner = block.inner(input_a);
-        f.render_widget(block, input_a);
+        f.render_widget(Paragraph::new(state), state_a);
 
-        if matches!(self.mode, Mode::Perm(_)) {
-            let key = Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("(y)", key),
-                    Span::raw(" allow once   "),
-                    Span::styled("(a)", key),
-                    Span::raw(" always allow this tool   "),
-                    Span::styled("(n)", key),
-                    Span::raw(" deny"),
-                ])),
-                inner,
-            );
-        } else {
-            let avail = inner.width.saturating_sub(3) as usize;
-            let (view, cx) = self.input_window(avail);
-            let style = if matches!(self.mode, Mode::Busy) {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(Color::Cyan)),
-                    Span::styled(view, style),
-                ])),
-                inner,
-            );
-            if matches!(self.mode, Mode::Input) {
-                f.set_cursor_position(Position::new(inner.x + 2 + cx as u16, inner.y));
-            }
-        }
-
-        // status
-        let mut status = format!(
-            " enter send | wheel/pgup scroll | ctrl+o {} | /help | ctrl+c quit",
-            if self.expanded { "collapse" } else { "expand" }
+        // a single rule instead of a box: less chrome, more transcript
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                RULE.repeat(rule_a.width as usize),
+                theme::muted(),
+            ))),
+            rule_a,
         );
-        if self.scroll.is_some() {
-            status.push_str("  [scrolled up - pgdn for latest]");
+
+        // input line
+        let avail = input_a.width.saturating_sub(3) as usize;
+        let (view, cx) = self.input_window(avail);
+        let style = if matches!(self.mode, Mode::Input) {
+            Style::default()
+        } else {
+            theme::muted()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(PROMPT, theme::accent()),
+                Span::styled(view, style),
+            ])),
+            input_a,
+        );
+        if matches!(self.mode, Mode::Input) {
+            f.set_cursor_position(Position::new(input_a.x + 2 + cx as u16, input_a.y));
         }
+
+        // status: hints on the left, live numbers and editor file on the right
+        let left_text = if self.scroll.is_some() {
+            "scrolled up  ·  pgdn for the latest".to_string()
+        } else {
+            format!(
+                "/help  ·  ctrl+o {}  ·  ctrl+c quit",
+                if self.expanded { "collapse" } else { "expand" }
+            )
+        };
         let mut right_parts: Vec<String> = Vec::new();
         if self.ctx_tokens > 0 {
-            let ctx = match self.num_ctx {
-                Some(max) => format!("ctx {}/{}", fmt_k(self.ctx_tokens), fmt_k(max as u64)),
+            right_parts.push(match self.num_ctx {
+                Some(max) => format!(
+                    "ctx {}/{} ({}%)",
+                    fmt_k(self.ctx_tokens),
+                    fmt_k(max as u64),
+                    (self.ctx_tokens * 100 / max.max(1) as u64).min(999)
+                ),
                 None => format!("ctx {}", fmt_k(self.ctx_tokens)),
-            };
-            right_parts.push(format!("{ctx} | out {}", fmt_k(self.out_tokens)));
+            });
+            right_parts.push(format!("out {}", fmt_k(self.out_tokens)));
         }
         if let Some(s) = &self.editor_status {
             right_parts.push(s.clone());
         }
-        let right = if right_parts.is_empty() {
-            String::new()
-        } else {
-            format!("{} ", right_parts.join(" | "))
-        };
+        let right = right_parts.join("  ·  ");
         // the right side (tokens + editor file) wins over the key hints
         let w = status_a.width as usize;
-        let (left, pad) = if status.chars().count() + right.chars().count() > w {
+        let (left, pad) = if left_text.chars().count() + right.chars().count() + 2 > w {
             (String::new(), w.saturating_sub(right.chars().count()))
         } else {
-            let pad = w - status.chars().count() - right.chars().count();
-            (status, pad)
+            (
+                left_text.clone(),
+                w - left_text.chars().count() - right.chars().count(),
+            )
         };
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(left, Style::default().fg(Color::DarkGray)),
+                Span::styled(left, theme::muted()),
                 Span::raw(" ".repeat(pad)),
-                Span::styled(right, Style::default().fg(Color::DarkGray)),
+                Span::styled(right, theme::muted()),
             ])),
             status_a,
         );
@@ -791,275 +908,244 @@ impl App {
         self.cached_blocks = 0;
     }
 
+    /// Block `bi` changed. The last block is never cached, so mutating it
+    /// costs nothing; anything older forces a re-wrap.
+    fn invalidate_from(&mut self, bi: usize) {
+        if bi + 1 < self.blocks.len() {
+            self.invalidate_cache();
+        }
+    }
+
     fn render_block(&self, bi: usize, out: &mut Vec<Line<'static>>, width: usize) {
-        let dim = Style::default().fg(Color::DarkGray);
-        let dim_italic = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC);
-        let red = Style::default().fg(Color::Red);
+        let dim = theme::muted();
+        let dim_italic = theme::muted_italic();
+        let red = theme::danger();
         let is_last = bi + 1 == self.blocks.len();
-        {
-            match &self.blocks[bi] {
-                ChatBlock::User(t) => wrap_into(
-                    out,
-                    t,
-                    width,
-                    "> ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                ChatBlock::Assistant(t) => render_markdown(out, t, width),
-                ChatBlock::Reasoning(t) => {
-                    // while streaming (last block) show a live tail; else collapse
-                    if is_last && matches!(self.mode, Mode::Busy) {
-                        out.push(Line::from(Span::styled("thinking...", dim_italic)));
-                        let tail: Vec<&str> = t.lines().rev().take(3).collect();
-                        for l in tail.into_iter().rev() {
-                            out.push(Line::from(Span::styled(
-                                format!("  {}", clip(&expand_tabs(l), width.saturating_sub(2))),
-                                dim_italic,
-                            )));
-                        }
-                    } else {
-                        let n = t.lines().count();
+        match &self.blocks[bi] {
+            ChatBlock::User(t) => wrap_into(out, t, width, PROMPT, theme::accent(), theme::bold()),
+            ChatBlock::Assistant(t) => render_markdown(out, t, width),
+            ChatBlock::Reasoning(t) => {
+                // while streaming (last block) show a live tail; else collapse
+                if is_last && matches!(self.mode, Mode::Busy) {
+                    out.push(Line::from(Span::styled("thinking", dim_italic)));
+                    let tail: Vec<&str> = t.lines().rev().take(3).collect();
+                    for l in tail.into_iter().rev() {
                         out.push(Line::from(Span::styled(
-                            format!("(thought, {n} {})", if n == 1 { "line" } else { "lines" }),
+                            format!("  {}", clip(&expand_tabs(l), width.saturating_sub(2))),
                             dim_italic,
                         )));
                     }
+                } else {
+                    let n = t.lines().count();
+                    out.push(Line::from(Span::styled(
+                        format!("thought for {n} {}", if n == 1 { "line" } else { "lines" }),
+                        dim_italic,
+                    )));
                 }
-                ChatBlock::Tool {
-                    name,
-                    summary,
-                    detail,
-                    result,
-                } => {
-                    out.push(Line::from(vec![
-                        Span::styled("[", dim),
-                        Span::styled(name.clone(), Style::default().fg(Color::Cyan)),
-                        Span::styled("] ", dim),
-                        Span::styled(summary.clone(), Style::default()),
-                    ]));
-                    if let Some(d) = detail {
-                        render_diff_body(out, d, width);
-                    }
-                    match result {
-                        None => out.push(Line::from(Span::styled("  ...", dim))),
-                        Some((content, is_error)) => {
-                            let style = if *is_error { red } else { dim };
-                            let lines: Vec<&str> = content.lines().collect();
-                            let shown = if self.expanded {
-                                lines.len()
-                            } else {
-                                RESULT_PREVIEW_LINES
-                            };
-                            for l in lines.iter().take(shown) {
-                                out.push(Line::from(Span::styled(
-                                    format!("  {}", clip(&expand_tabs(l), width.saturating_sub(2))),
-                                    style,
-                                )));
-                            }
-                            if lines.len() > shown {
-                                out.push(Line::from(Span::styled(
-                                    format!(
-                                        "  ... +{} lines (ctrl+o to expand)",
-                                        lines.len() - shown
-                                    ),
-                                    dim,
-                                )));
-                            }
+            }
+            ChatBlock::Tool {
+                name,
+                summary,
+                detail,
+                result,
+            } => {
+                out.push(Line::from(vec![
+                    Span::styled(name.clone(), theme::accent().add_modifier(Modifier::BOLD)),
+                    Span::raw("  "),
+                    Span::styled(clip(summary, width.saturating_sub(name.len() + 2)), dim),
+                ]));
+                if let Some(d) = detail {
+                    render_diff_body(out, d, width);
+                }
+                match result {
+                    None => out.push(Line::from(Span::styled("  running", dim))),
+                    Some((content, is_error)) => {
+                        let style = if *is_error { red } else { dim };
+                        let lines: Vec<&str> = content.lines().collect();
+                        let shown = if self.expanded {
+                            lines.len()
+                        } else {
+                            RESULT_PREVIEW_LINES
+                        };
+                        for l in lines.iter().take(shown) {
+                            out.push(Line::from(Span::styled(
+                                format!("  {}", clip(&expand_tabs(l), width.saturating_sub(2))),
+                                style,
+                            )));
+                        }
+                        if lines.len() > shown {
+                            out.push(Line::from(Span::styled(
+                                format!("  +{} more lines  ctrl+o", lines.len() - shown),
+                                dim_italic,
+                            )));
                         }
                     }
                 }
-                ChatBlock::Diff(t) => render_diff_body(out, t, width),
-                ChatBlock::Info(t) => wrap_into(out, t, width, "", dim, dim),
-                ChatBlock::Error(t) => wrap_into(out, t, width, "error: ", red, red),
             }
+            ChatBlock::Diff(t) => render_diff_body(out, t, width),
+            ChatBlock::Info(t) => wrap_into(out, t, width, "  ", dim, dim),
+            ChatBlock::Error(t) => wrap_into(out, t, width, "error  ", red, red),
         }
     }
 }
 
-fn expand_tabs(s: &str) -> String {
-    s.replace('\t', "    ")
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-fn fmt_k(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else {
-        format!("{:.1}k", n as f64 / 1000.0)
+    fn app() -> App {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut a = App::new(
+            "qwen3:8b".into(),
+            "http://localhost:11434/v1".into(),
+            Some(32768),
+            cmd_tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+        // whatever the developer has open in VS Code must not leak into tests
+        a.editor_status = None;
+        a
     }
-}
 
-/// Renders the body of a diff/permission preview. Lines are colored by their
-/// first character: '+' insert, '-' delete, ' ' context, '$' command, other = header.
-fn render_diff_body(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
-    let dim = Style::default().fg(Color::DarkGray);
-    for l in text.lines() {
-        let l = expand_tabs(l);
-        let style = match l.chars().next() {
-            Some('+') => Style::default().fg(Color::Green),
-            Some('-') => Style::default().fg(Color::Red),
-            Some(' ') | Some('.') => dim,
-            Some('$') => Style::default().add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(Color::Yellow),
-        };
-        out.push(Line::from(Span::styled(
-            format!("  {}", clip(&l, width.saturating_sub(2))),
-            style,
-        )));
+    /// Renders to an off-screen terminal and returns the visible text lines.
+    fn screen(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
-}
 
-/// Lightweight markdown rendering: code fences, headings, quotes,
-/// `inline code` and **bold**.
-fn render_markdown(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
-    let mut in_fence = false;
-    for src in text.lines() {
-        let trimmed = src.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            out.push(Line::from(Span::styled(
-                clip(&expand_tabs(src), width),
-                Style::default().fg(Color::DarkGray),
-            )));
-            continue;
-        }
-        if in_fence {
-            out.push(Line::from(Span::styled(
-                format!("  {}", clip(&expand_tabs(src), width.saturating_sub(2))),
-                Style::default().fg(Color::LightGreen),
-            )));
-            continue;
-        }
-        if src.is_empty() {
-            out.push(Line::default());
-            continue;
-        }
-        let base = if trimmed.starts_with('#') {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else if trimmed.starts_with('>') {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-        for piece in textwrap::wrap(&expand_tabs(src), width.max(2)) {
-            out.push(Line::from(inline_spans(&piece, base)));
-        }
-    }
-}
+    #[test]
+    fn draws_header_rule_and_prompt() {
+        let mut a = app();
+        a.ctx_tokens = 15_400;
+        a.out_tokens = 820;
+        a.input = "hello".into();
+        a.cursor = 5;
+        let s = screen(&mut a, 80, 12);
 
-/// Splits a single line into styled spans for `code` and **bold** markers.
-fn inline_spans(s: &str, base: Style) -> Vec<Span<'static>> {
-    let code = base.fg(Color::Yellow);
-    let bold = base.add_modifier(Modifier::BOLD);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cur = String::new();
-    let mut chars = s.chars().peekable();
-    let flush = |spans: &mut Vec<Span<'static>>, cur: &mut String| {
-        if !cur.is_empty() {
-            spans.push(Span::styled(std::mem::take(cur), base));
-        }
-    };
-    while let Some(c) = chars.next() {
-        if c == '`' {
-            let mut inner = String::new();
-            let mut closed = false;
-            for c2 in chars.by_ref() {
-                if c2 == '`' {
-                    closed = true;
-                    break;
-                }
-                inner.push(c2);
-            }
-            if closed && !inner.is_empty() {
-                flush(&mut spans, &mut cur);
-                spans.push(Span::styled(inner, code));
-            } else {
-                cur.push('`');
-                cur.push_str(&inner);
-            }
-        } else if c == '*' && chars.peek() == Some(&'*') {
-            chars.next();
-            let mut inner = String::new();
-            let mut closed = false;
-            while let Some(c2) = chars.next() {
-                if c2 == '*' && chars.peek() == Some(&'*') {
-                    chars.next();
-                    closed = true;
-                    break;
-                }
-                inner.push(c2);
-            }
-            if closed && !inner.is_empty() {
-                flush(&mut spans, &mut cur);
-                spans.push(Span::styled(inner, bold));
-            } else {
-                cur.push_str("**");
-                cur.push_str(&inner);
-            }
-        } else {
-            cur.push(c);
-        }
+        assert!(s[0].contains("thoth"), "{:?}", s[0]);
+        assert!(s[0].contains("qwen3:8b"));
+        // the server url is shortened, not printed raw
+        assert!(s[0].contains("localhost:11434") && !s[0].contains("http://"));
+        // the input sits between a full-width rule and the status line
+        assert_eq!(s[9], RULE.repeat(80));
+        assert!(s[10].starts_with(PROMPT), "{:?}", s[10]);
+        assert!(s[10].contains("hello"));
+        assert!(s[11].contains("/help"), "{:?}", s[11]);
+        assert!(s[11].contains("ctx 15.4k/32.8k (46%)"), "{:?}", s[11]);
+        assert!(s[11].contains("out 820"));
     }
-    flush(&mut spans, &mut cur);
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base));
-    }
-    spans
-}
 
-fn clip(s: &str, max: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max {
-        return s.to_string();
+    #[test]
+    fn busy_state_shows_spinner_and_elapsed() {
+        let mut a = app();
+        a.mode = Mode::Busy;
+        a.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(75));
+        let s = screen(&mut a, 80, 12);
+        assert!(s[8].contains("working"), "{:?}", s[8]);
+        assert!(s[8].contains("1m 15s"), "{:?}", s[8]);
+        assert!(s[8].contains("esc to interrupt"));
     }
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(1);
-        if w + cw > max.saturating_sub(1) {
-            break;
-        }
-        w += cw;
-        out.push(c);
-    }
-    out.push('…');
-    out
-}
 
-fn wrap_into(
-    out: &mut Vec<Line<'static>>,
-    text: &str,
-    width: usize,
-    prefix: &str,
-    prefix_style: Style,
-    style: Style,
-) {
-    let pw = UnicodeWidthStr::width(prefix);
-    let w = width.saturating_sub(pw).max(2);
-    let mut first = true;
-    for src in text.lines() {
-        if src.is_empty() {
-            out.push(Line::default());
-            continue;
-        }
-        for piece in textwrap::wrap(src, w) {
-            let mut spans = Vec::new();
-            if first {
-                spans.push(Span::styled(prefix.to_string(), prefix_style));
-                first = false;
-            } else if pw > 0 {
-                spans.push(Span::raw(" ".repeat(pw)));
-            }
-            spans.push(Span::styled(piece.into_owned(), style));
-            out.push(Line::from(spans));
+    #[test]
+    fn permission_state_shows_the_three_keys() {
+        let mut a = app();
+        let (tx, _rx) = oneshot::channel();
+        a.mode = Mode::Perm(tx);
+        let s = screen(&mut a, 80, 12);
+        assert!(s[8].contains("permission needed"), "{:?}", s[8]);
+        assert!(s[8].contains("y once") && s[8].contains("a always") && s[8].contains("n no"));
+    }
+
+    #[test]
+    fn tool_output_collapses_until_expanded() {
+        let mut a = app();
+        a.blocks.push(ChatBlock::Tool {
+            name: "grep".into(),
+            summary: "fn main".into(),
+            detail: None,
+            result: Some(("1\n2\n3\n4\n5\n6\n7".into(), false)),
+        });
+        let s = screen(&mut a, 80, 20).join("\n");
+        assert!(s.contains("grep  fn main"), "{s}");
+        assert!(s.contains("+3 more lines  ctrl+o"), "{s}");
+        a.expanded = true;
+        a.invalidate_cache();
+        let s = screen(&mut a, 80, 20).join("\n");
+        assert!(
+            s.contains("  7"),
+            "expanded output should show every line:\n{s}"
+        );
+    }
+
+    /// Prints a full mock screen for eyeballing layout changes:
+    /// cargo test ui_preview -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ui_preview() {
+        let mut a = app();
+        a.ctx_tokens = 15_400;
+        a.out_tokens = 820;
+        a.editor_status = Some("In main.rs, 7 lines selected".into());
+        a.blocks = vec![
+            ChatBlock::User("add a health check to the server".into()),
+            ChatBlock::Reasoning("looking at the routes\nchecking the framework".into()),
+            ChatBlock::Assistant("Adding a `/healthz` route next to the existing ones.".into()),
+            ChatBlock::Tool {
+                name: "grep".into(),
+                summary: "app.get".into(),
+                detail: None,
+                result: Some(("src/server.ts:12: app.get(\"/\", home)".into(), false)),
+            },
+            ChatBlock::Tool {
+                name: "edit_file".into(),
+                summary: "src/server.ts".into(),
+                detail: Some(
+                    "src/server.ts\n  12   app.get(\"/\", home);\n+ 13   app.get(\"/healthz\", () => new Response(\"ok\"));"
+                        .into(),
+                ),
+                result: Some(("Edited src/server.ts".into(), false)),
+            },
+            ChatBlock::Info("attached src/server.ts (48 lines)".into()),
+        ];
+        a.input = "run the tests".into();
+        a.cursor = a.input.chars().count();
+        println!();
+        for l in screen(&mut a, 100, 24) {
+            println!("{l}");
         }
     }
-    if first {
-        out.push(Line::from(Span::styled(prefix.to_string(), prefix_style)));
+
+    /// The wrap cache must not be thrown away when the block that changed is
+    /// the last one, which is re-rendered every frame anyway.
+    #[test]
+    fn cache_survives_updates_to_the_live_block() {
+        let mut a = app();
+        a.blocks.push(ChatBlock::User("first".into()));
+        a.blocks.push(ChatBlock::Tool {
+            name: "shell".into(),
+            summary: "ls".into(),
+            detail: None,
+            result: None,
+        });
+        screen(&mut a, 80, 20);
+        let cached = a.cached_blocks;
+        assert!(cached > 0, "nothing was cached");
+        a.on_agent_event(AgentEvent::ToolResult {
+            content: "done".into(),
+            is_error: false,
+        });
+        assert_eq!(a.cached_blocks, cached, "the cache was dropped needlessly");
     }
 }
