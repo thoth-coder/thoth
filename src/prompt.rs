@@ -60,16 +60,14 @@ fn project_context() -> String {
             continue;
         };
         let mut name = f;
-        if content.chars().count() < 300 {
-            if let Some(target) = INSTRUCTION_FILES
+        if content.chars().count() < 300
+            && let Some(target) = INSTRUCTION_FILES
                 .iter()
                 .find(|t| **t != f && content.contains(**t))
-            {
-                if let Ok(c) = std::fs::read_to_string(target) {
-                    name = target;
-                    content = c;
-                }
-            }
+            && let Ok(c) = std::fs::read_to_string(target)
+        {
+            name = target;
+            content = c;
         }
         let content: String = content.chars().take(4000).collect();
         out.push_str(&format!(

@@ -1,7 +1,7 @@
 use crate::client::{Client, Message, StreamEvent, ToolCall, Usage};
 use crate::prompt;
 use crate::tools;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -157,10 +157,11 @@ impl Agent {
         for m in msgs.iter_mut() {
             if m.role == "tool"
                 && let Some(c) = &m.content
-                    && c.chars().count() > 400 {
-                        let cut: String = c.chars().take(400).collect();
-                        m.content = Some(format!("{cut}\n...(trimmed)"));
-                    }
+                && c.chars().count() > 400
+            {
+                let cut: String = c.chars().take(400).collect();
+                m.content = Some(format!("{cut}\n...(trimmed)"));
+            }
         }
         msgs.push(Message::user(
             "Summarize this entire conversation so it can be continued later: the user's \
@@ -208,11 +209,12 @@ impl Agent {
                 continue;
             }
             if let Some(c) = &m.content
-                && c.chars().count() > 200 {
-                    let cut: String = c.chars().take(200).collect();
-                    m.content = Some(format!("{cut}\n...(trimmed to save context)"));
-                    trimmed += 1;
-                }
+                && c.chars().count() > 200
+            {
+                let cut: String = c.chars().take(200).collect();
+                m.content = Some(format!("{cut}\n...(trimmed to save context)"));
+                trimmed += 1;
+            }
         }
         self.send(AgentEvent::Info(format!(
             "trimmed {trimmed} old tool results to free context"
@@ -234,7 +236,8 @@ impl Agent {
         self.messages.push(Message::user(full_input));
         let tools_def = tools::definitions();
         // breaks infinite loops: counts identical tool calls within this task
-        let mut call_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut call_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         let mut compact_pending = false;
         let mut truncations = 0u32;
 
@@ -255,9 +258,10 @@ impl Agent {
 
             if let Some(u) = turn.usage {
                 if let Some(limit) = self.auto_compact_at
-                    && u.prompt_tokens >= limit {
-                        compact_pending = true;
-                    }
+                    && u.prompt_tokens >= limit
+                {
+                    compact_pending = true;
+                }
                 self.send(AgentEvent::Usage(u));
             }
             let trimmed = turn.content.trim();
@@ -375,9 +379,7 @@ impl Agent {
             }
             if compact_pending {
                 compact_pending = false;
-                self.send(AgentEvent::Info(
-                    "context almost full, compacting".into(),
-                ));
+                self.send(AgentEvent::Info("context almost full, compacting".into()));
                 self.compact().await;
             }
         }

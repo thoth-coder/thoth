@@ -7,7 +7,7 @@ mod tools;
 mod tui;
 
 use agent::{Agent, AgentCmd, AgentEvent, PermReply};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use client::Client;
 use std::io::Write as _;
@@ -151,7 +151,11 @@ async fn run_print_mode(
                     eprintln!("  | (error)");
                 }
             }
-            AgentEvent::Permission { tool, preview, reply } => {
+            AgentEvent::Permission {
+                tool,
+                preview,
+                reply,
+            } => {
                 eprintln!("\n{preview}");
                 let q = format!("allow {tool}? [y=yes / a=always / n=no] ");
                 let ans = tokio::task::spawn_blocking(move || {

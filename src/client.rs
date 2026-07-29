@@ -1,7 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,16 +34,40 @@ pub struct Message {
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system", content: Some(content.into()), tool_calls: None, tool_call_id: None, name: None }
+        Self {
+            role: "system",
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user", content: Some(content.into()), tool_calls: None, tool_call_id: None, name: None }
+        Self {
+            role: "user",
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     pub fn assistant(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Self { role: "assistant", content, tool_calls, tool_call_id: None, name: None }
+        Self {
+            role: "assistant",
+            content,
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+        }
     }
     pub fn tool(tool_call_id: String, name: String, content: String) -> Self {
-        Self { role: "tool", content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id), name: Some(name) }
+        Self {
+            role: "tool",
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            name: Some(name),
+        }
     }
 }
 
@@ -209,12 +233,15 @@ impl Client {
     /// request a proper context window (Ollama's default 4096 silently
     /// truncates agentic prompts).
     pub async fn detect_ollama(&mut self) {
-        let Some(origin) = self.base_url.strip_suffix("/v1") else { return };
+        let Some(origin) = self.base_url.strip_suffix("/v1") else {
+            return;
+        };
         let probe = self.http.get(format!("{origin}/api/version")).send();
         if let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(3), probe).await
-            && resp.status().is_success() {
-                self.transport = Transport::Ollama;
-            }
+            && resp.status().is_success()
+        {
+            self.transport = Transport::Ollama;
+        }
     }
 
     pub async fn models(&self) -> Result<Vec<String>> {
@@ -388,7 +415,11 @@ impl Client {
                 continue;
             }
             turn.tool_calls.push(ToolCall {
-                id: if id.is_empty() { format!("call_{i}") } else { id },
+                id: if id.is_empty() {
+                    format!("call_{i}")
+                } else {
+                    id
+                },
                 kind: "function".into(),
                 function: FunctionCall {
                     name,

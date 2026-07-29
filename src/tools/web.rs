@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
 use std::sync::OnceLock;
@@ -36,7 +36,9 @@ pub async fn search(a: SearchArgs) -> Result<String> {
             Err(e) => {
                 // fall back to DuckDuckGo so search still works
                 let ddg = ddg_search(&a.query).await?;
-                return Ok(format!("(google search failed: {e:#}; results below are from DuckDuckGo)\n\n{ddg}"));
+                return Ok(format!(
+                    "(google search failed: {e:#}; results below are from DuckDuckGo)\n\n{ddg}"
+                ));
             }
         }
     }
@@ -76,7 +78,13 @@ async fn google_search(key: &str, cx: &str, query: &str) -> Result<String> {
     for (i, item) in r.items.iter().take(MAX_RESULTS).enumerate() {
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, item.title, item.link));
         if !item.snippet.is_empty() {
-            out.push_str(&format!("   {}\n", item.snippet.split_whitespace().collect::<Vec<_>>().join(" ")));
+            out.push_str(&format!(
+                "   {}\n",
+                item.snippet
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
         }
     }
     out.push_str("\nUse web_fetch with a URL to read a page.");
@@ -109,9 +117,10 @@ async fn ddg_search(query: &str) -> Result<String> {
         let title = clean_text(&c[2]);
         out.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
         if let Some(s) = snippets.get(i)
-            && !s.is_empty() {
-                out.push_str(&format!("   {s}\n"));
-            }
+            && !s.is_empty()
+        {
+            out.push_str(&format!("   {s}\n"));
+        }
     }
     if out.is_empty() {
         return Ok("No results found.".into());
@@ -247,14 +256,20 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn google_bad_key_reports_error() {
-        let err = google_search("bad-key", "bad-cx", "rust").await.unwrap_err();
+        let err = google_search("bad-key", "bad-cx", "rust")
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("google"), "{err:#}");
     }
 
     #[tokio::test]
     #[ignore]
     async fn fetch_extracts_text() {
-        let out = fetch(FetchArgs { url: "https://example.com".into() }).await.unwrap();
+        let out = fetch(FetchArgs {
+            url: "https://example.com".into(),
+        })
+        .await
+        .unwrap();
         assert!(out.to_lowercase().contains("example domain"), "{out}");
     }
 }
@@ -264,12 +279,14 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
         out.push(bytes[i]);
         i += 1;
     }

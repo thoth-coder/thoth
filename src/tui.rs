@@ -1,5 +1,6 @@
 use crate::agent::{AgentCmd, AgentEvent, PermReply};
 use anyhow::Result;
+use ratatui::Frame;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -9,7 +10,6 @@ use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
-use ratatui::Frame;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -186,7 +186,11 @@ pub async fn run(
         }
     }
 
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
     Ok(())
 }
@@ -202,11 +206,10 @@ impl App {
                 MouseEventKind::ScrollDown => self.scroll_by(3),
                 _ => {}
             },
-            Event::Paste(s)
-                if !matches!(self.mode, Mode::Perm(_)) => {
-                    let s = s.replace("\r\n", " ").replace(['\r', '\n'], " ");
-                    self.insert_str(&s);
-                }
+            Event::Paste(s) if !matches!(self.mode, Mode::Perm(_)) => {
+                let s = s.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                self.insert_str(&s);
+            }
             _ => {}
         }
     }
@@ -226,13 +229,14 @@ impl App {
                 _ => None,
             };
             if let Some(r) = reply
-                && let Mode::Perm(tx) = std::mem::replace(&mut self.mode, Mode::Busy) {
-                    let denied = matches!(r, PermReply::No);
-                    let _ = tx.send(r);
-                    self.blocks.push(ChatBlock::Info(
-                        if denied { "denied" } else { "allowed" }.into(),
-                    ));
-                }
+                && let Mode::Perm(tx) = std::mem::replace(&mut self.mode, Mode::Busy)
+            {
+                let denied = matches!(r, PermReply::No);
+                let _ = tx.send(r);
+                self.blocks.push(ChatBlock::Info(
+                    if denied { "denied" } else { "allowed" }.into(),
+                ));
+            }
             return;
         }
 
@@ -262,17 +266,15 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Backspace
-                if self.cursor > 0 => {
-                    self.cursor -= 1;
-                    let i = self.byte_idx(self.cursor);
-                    self.input.remove(i);
-                }
-            KeyCode::Delete
-                if self.cursor < self.input.chars().count() => {
-                    let i = self.byte_idx(self.cursor);
-                    self.input.remove(i);
-                }
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                let i = self.byte_idx(self.cursor);
+                self.input.remove(i);
+            }
+            KeyCode::Delete if self.cursor < self.input.chars().count() => {
+                let i = self.byte_idx(self.cursor);
+                self.input.remove(i);
+            }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
             KeyCode::Home => self.cursor = 0,
@@ -443,7 +445,9 @@ impl App {
             "memory" => {
                 if arg == "clear" {
                     match crate::tools::memory::clear_memory() {
-                        Ok(_) => self.blocks.push(ChatBlock::Info("project memory cleared".into())),
+                        Ok(_) => self
+                            .blocks
+                            .push(ChatBlock::Info("project memory cleared".into())),
                         Err(e) => self.blocks.push(ChatBlock::Error(format!("{e:#}"))),
                     }
                 } else {
@@ -561,7 +565,11 @@ impl App {
         } else {
             cur.saturating_add(delta as usize)
         };
-        self.scroll = if new >= self.max_scroll { None } else { Some(new) };
+        self.scroll = if new >= self.max_scroll {
+            None
+        } else {
+            Some(new)
+        };
     }
 
     // ---- drawing ----

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use globset::GlobBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -45,7 +45,9 @@ pub fn resolve(path: &str) -> PathBuf {
     if p.is_absolute() {
         p
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
     }
 }
 
@@ -67,8 +69,7 @@ pub struct ReadArgs {
 
 pub fn read_file(a: ReadArgs) -> Result<String> {
     let path = resolve(&a.path);
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let offset = a.offset.unwrap_or(1).max(1);
     let limit = a.limit.unwrap_or(MAX_READ_LINES).min(MAX_READ_LINES);
@@ -341,8 +342,14 @@ pub fn preview_write(args: &Value) -> String {
 
 pub fn preview_edit(args: &Value) -> String {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-    let old_s = args.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-    let new_s = args.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    let old_s = args
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new_s = args
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let replace_all = args
         .get("replace_all")
         .and_then(|v| v.as_bool())
@@ -357,7 +364,11 @@ pub fn preview_edit(args: &Value) -> String {
             };
             header + &unified_diff(&content, &new_content)
         }
-        Ok(_) => header + "(old_string not found in file, this edit will fail)\n" + &raw_edit_preview(old_s, new_s),
+        Ok(_) => {
+            header
+                + "(old_string not found in file, this edit will fail)\n"
+                + &raw_edit_preview(old_s, new_s)
+        }
         Err(_) => header + "(cannot read file)\n" + &raw_edit_preview(old_s, new_s),
     }
 }

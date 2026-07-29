@@ -194,9 +194,10 @@ fn context_from_state(s: &IdeState) -> EditorContext {
         }
     }
     if let Some(t) = &s.selected_text
-        && !t.trim().is_empty() {
-            note.push_str(&format!("\nSelected text:\n```\n{t}\n```"));
-        }
+        && !t.trim().is_empty()
+    {
+        note.push_str(&format!("\nSelected text:\n```\n{t}\n```"));
+    }
     if !s.diagnostics.is_empty() {
         let total = s.diagnostics.len();
         note.push_str(&format!("\nCurrent problems in the project ({total}):"));
@@ -242,12 +243,13 @@ rustrover64,clion64,pycharm64,webstorm64,goland64,devenv -ErrorAction SilentlyCo
     let titles = String::from_utf8_lossy(&out.stdout);
     for title in titles.lines() {
         if let Some(name) = parse_title(title.trim())
-            && let Some(path) = find_in_project(&name) {
-                return Some(EditorContext {
-                    note: format!("The user currently has {path} open in their editor."),
-                    label: path,
-                });
-            }
+            && let Some(path) = find_in_project(&name)
+        {
+            return Some(EditorContext {
+                note: format!("The user currently has {path} open in their editor."),
+                label: path,
+            });
+        }
     }
     None
 }
@@ -275,11 +277,7 @@ fn parse_title(title: &str) -> Option<String> {
         && name.contains('.')
         && !name.ends_with('.')
         && !name.contains(' ');
-    if ok {
-        Some(name.to_string())
-    } else {
-        None
-    }
+    if ok { Some(name.to_string()) } else { None }
 }
 
 /// Finds a file with this name inside the working directory.
@@ -334,19 +332,39 @@ mod tests {
         let n = |s: &str| norm_path_impl(s, true);
         // case-insensitive, mixed separators, trailing sep
         assert_eq!(n("C:/Users/U/Proj/"), "c:\\users\\u\\proj");
-        assert!(path_contains_impl(&n("C:\\a\\thoth"), &n("c:\\A\\thoth\\src"), true));
+        assert!(path_contains_impl(
+            &n("C:\\a\\thoth"),
+            &n("c:\\A\\thoth\\src"),
+            true
+        ));
         // component boundary: thoth-for-vcscode is not inside thoth
-        assert!(!path_contains_impl(&n("C:\\a\\thoth"), &n("C:\\a\\thoth-for-vcscode"), true));
+        assert!(!path_contains_impl(
+            &n("C:\\a\\thoth"),
+            &n("C:\\a\\thoth-for-vcscode"),
+            true
+        ));
     }
 
     #[test]
     fn path_matching_unix() {
         let n = |s: &str| norm_path_impl(s, false);
         assert_eq!(n("/home/u/proj/"), "/home/u/proj");
-        assert!(path_contains_impl(&n("/home/u/proj"), &n("/home/u/proj/src"), false));
-        assert!(!path_contains_impl(&n("/home/u/proj"), &n("/home/u/proj2"), false));
+        assert!(path_contains_impl(
+            &n("/home/u/proj"),
+            &n("/home/u/proj/src"),
+            false
+        ));
+        assert!(!path_contains_impl(
+            &n("/home/u/proj"),
+            &n("/home/u/proj2"),
+            false
+        ));
         // unix paths are case-sensitive
-        assert!(!path_contains_impl(&n("/home/u/proj"), &n("/home/U/proj/src"), false));
+        assert!(!path_contains_impl(
+            &n("/home/u/proj"),
+            &n("/home/U/proj/src"),
+            false
+        ));
     }
 
     #[test]

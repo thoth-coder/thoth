@@ -107,9 +107,5 @@ pub fn load_recap() -> Option<String> {
         .or_else(|_| std::fs::read_to_string(thoth_dir().join("last-session.md")))
         .ok()?;
     let text = text.trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }

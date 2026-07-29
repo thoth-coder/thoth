@@ -16,8 +16,7 @@ pub struct GrepArgs {
 }
 
 pub fn grep(a: GrepArgs) -> Result<String> {
-    let re = Regex::new(&a.pattern)
-        .with_context(|| format!("invalid regex: {}", a.pattern))?;
+    let re = Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
     let root = resolve(a.path.as_deref().unwrap_or("."));
     let glob_matcher = match &a.glob {
         Some(g) => Some(
@@ -34,10 +33,19 @@ pub fn grep(a: GrepArgs) -> Result<String> {
     let mut matches = 0usize;
     let mut search_one = |path: &Path, rel: &str| -> bool {
         if let Some(m) = &glob_matcher
-            && !m.is_match(rel) && !m.is_match(path.file_name().unwrap_or_default().to_string_lossy().as_ref()) {
-                return true;
-            }
-        let Ok(bytes) = std::fs::read(path) else { return true };
+            && !m.is_match(rel)
+            && !m.is_match(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+        {
+            return true;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            return true;
+        };
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return true; // binary
         }
@@ -61,7 +69,11 @@ pub fn grep(a: GrepArgs) -> Result<String> {
         search_one(&root, &rel);
     } else {
         for entry in walk(&root) {
-            if entry.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+            if entry
+                .metadata()
+                .map(|m| m.len() > MAX_FILE_BYTES)
+                .unwrap_or(true)
+            {
                 continue;
             }
             let rel = rel_slash_path(entry.path(), &root);

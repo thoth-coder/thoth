@@ -4,8 +4,8 @@ pub mod search;
 pub mod shell;
 pub mod web;
 
-use anyhow::{bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, bail};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 // Sized for local-model context windows (~16k tokens): one tool result
@@ -108,7 +108,9 @@ fn shell_description() -> String {
 Use for builds, tests, git, package managers, and anything the other tools do not cover. \
 The command already runs in the working directory, no need to cd first.";
     if cfg!(windows) {
-        format!("{base} The shell is Windows PowerShell 5.1: chain commands with ';' because '&&' is NOT supported.")
+        format!(
+            "{base} The shell is Windows PowerShell 5.1: chain commands with ';' because '&&' is NOT supported."
+        )
     } else {
         format!("{base} The shell is sh.")
     }
@@ -125,7 +127,11 @@ pub fn summarize(name: &str, args: &Value) -> String {
         "read_file" | "write_file" | "edit_file" => get("path").to_string(),
         "list_dir" => {
             let p = get("path");
-            if p.is_empty() { ".".into() } else { p.to_string() }
+            if p.is_empty() {
+                ".".into()
+            } else {
+                p.to_string()
+            }
         }
         "glob" | "grep" => get("pattern").to_string(),
         "remember" => get("fact").to_string(),
