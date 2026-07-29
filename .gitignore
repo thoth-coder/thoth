@@ -1,0 +1,4 @@
+/target
+
+# thoth agent state
+.thoth/
