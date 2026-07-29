@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
 ### Added
 - `grep` tool: optional `context` parameter shows up to 10 surrounding
   lines per match in ripgrep-style blocks, and the system prompt now steers
@@ -94,4 +96,5 @@ All notable changes to thoth are documented here. The format follows
   targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
   with install/uninstall scripts for curl | sh and irm | iex.
 
+[0.2.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.2.0
 [0.1.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.1.0
