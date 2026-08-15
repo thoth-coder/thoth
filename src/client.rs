@@ -227,6 +227,236 @@ impl ThinkFilter {
     }
 }
 
+/// A tool call the model wrote as text instead of sending as `tool_calls`.
+/// Plenty of self-hosted models do this, and without it thoth just prints
+/// the json and stops, which reads as "it talks about editing the file but
+/// never does".
+///
+/// The filter holds a span back only while it could still be a call, and
+/// hands the text back untouched the moment it turns out not to be one, so
+/// nothing the model wrote can be swallowed. A json object only counts when
+/// it names a tool that actually exists.
+struct ToolTextFilter {
+    names: Vec<String>,
+    buf: String,
+    /// The buffer starts with a span that might be a call.
+    holding: bool,
+}
+
+const TOOL_OPEN: &str = "<tool_call>";
+const TOOL_CLOSE: &str = "</tool_call>";
+
+enum Taken {
+    Call(ToolCall),
+    /// Not a call after all: this many bytes go back to the transcript.
+    Text(usize),
+    /// The span is not finished yet.
+    More,
+}
+
+impl ToolTextFilter {
+    fn new(tools: &Value) -> Self {
+        let names = tools
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| Some(t.get("function")?.get("name")?.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            names,
+            buf: String::new(),
+            holding: false,
+        }
+    }
+
+    /// Returns the text that should still be shown; anything that parsed as
+    /// a call goes into `calls`.
+    fn push(&mut self, text: &str, calls: &mut Vec<ToolCall>) -> String {
+        self.buf.push_str(text);
+        let mut out = String::new();
+        loop {
+            if !self.holding {
+                match candidate_start(&self.buf) {
+                    Some(at) => {
+                        out.push_str(&self.buf[..at]);
+                        self.buf.drain(..at);
+                        self.holding = true;
+                    }
+                    None => {
+                        // keep a tail that could be the start of a split tag
+                        let hold = longest_suffix_prefix(&self.buf, TOOL_OPEN);
+                        let emit = self.buf.len() - hold;
+                        out.push_str(&self.buf[..emit]);
+                        self.buf.drain(..emit);
+                        break;
+                    }
+                }
+            }
+            match self.take(calls.len()) {
+                Taken::Call(c) => {
+                    calls.push(c);
+                    self.holding = false;
+                }
+                Taken::Text(len) => {
+                    out.push_str(&self.buf[..len]);
+                    self.buf.drain(..len);
+                    self.holding = false;
+                }
+                Taken::More => break,
+            }
+        }
+        out
+    }
+
+    /// End of the stream: whatever is still held is either a call or text.
+    fn flush(&mut self, calls: &mut Vec<ToolCall>) -> String {
+        if self.holding
+            && let Taken::Call(c) = self.take_final(calls.len())
+        {
+            calls.push(c);
+            self.buf.clear();
+        }
+        self.holding = false;
+        std::mem::take(&mut self.buf)
+    }
+
+    /// Tries to take a whole call off the front of the buffer.
+    fn take(&mut self, seq: usize) -> Taken {
+        if let Some(rest) = self.buf.strip_prefix(TOOL_OPEN) {
+            let Some(end) = rest.find(TOOL_CLOSE) else {
+                return Taken::More;
+            };
+            let inner = rest[..end].to_string();
+            let span = TOOL_OPEN.len() + end + TOOL_CLOSE.len();
+            return match call_from_json(&inner, &self.names, seq) {
+                Some(c) => {
+                    self.buf.drain(..span);
+                    Taken::Call(c)
+                }
+                None => Taken::Text(span),
+            };
+        }
+        match json_object_end(&self.buf) {
+            None => Taken::More,
+            Some(end) => match call_from_json(&self.buf[..end], &self.names, seq) {
+                Some(c) => {
+                    self.buf.drain(..end);
+                    Taken::Call(c)
+                }
+                None => Taken::Text(end),
+            },
+        }
+    }
+
+    /// Same, for a span the stream ended in the middle of: an unclosed
+    /// `<tool_call>` still holds a usable call.
+    fn take_final(&mut self, seq: usize) -> Taken {
+        let body = self
+            .buf
+            .strip_prefix(TOOL_OPEN)
+            .unwrap_or(&self.buf)
+            .trim_end_matches(TOOL_CLOSE);
+        match call_from_json(body, &self.names, seq) {
+            Some(c) => Taken::Call(c),
+            None => Taken::Text(self.buf.len()),
+        }
+    }
+}
+
+/// Where a span that might be a call starts: an explicit tag, or a json
+/// object whose first key is `name`. Requiring the key keeps ordinary prose
+/// and code blocks flowing through without being held back.
+fn candidate_start(s: &str) -> Option<usize> {
+    let tag = s.find(TOOL_OPEN);
+    let json = json_name_start(s);
+    match (tag, json) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn json_name_start(s: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = s[from..].find('{') {
+        let at = from + rel;
+        let rest = s[at + 1..].trim_start();
+        // "name" may still be arriving one chunk at a time
+        if rest.starts_with("\"name\"") || (!rest.is_empty() && "\"name\"".starts_with(rest)) {
+            return Some(at);
+        }
+        if rest.is_empty() {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// Index just past the `}` that closes the object the text starts with.
+fn json_object_end(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `{"name": "grep", "arguments": {...}}` and its variants, but only for a
+/// tool that exists: anything else is the model talking, not calling.
+fn call_from_json(text: &str, names: &[String], seq: usize) -> Option<ToolCall> {
+    let text = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_matches('`')
+        .trim();
+    let v: Value = serde_json::from_str(text).ok()?;
+    let name = v.get("name").or_else(|| v.get("tool"))?.as_str()?;
+    if !names.iter().any(|n| n == name) {
+        return None;
+    }
+    let args = v
+        .get("arguments")
+        .or_else(|| v.get("parameters"))
+        .or_else(|| v.get("input"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Some(ToolCall {
+        id: format!("text_call_{seq}"),
+        kind: "function".into(),
+        function: FunctionCall {
+            name: name.to_string(),
+            // some models put the arguments in a json string of their own
+            arguments: match args {
+                Value::String(s) => s,
+                other => other.to_string(),
+            },
+        },
+    })
+}
+
 fn longest_suffix_prefix(s: &str, tag: &str) -> usize {
     let max = (tag.len() - 1).min(s.len());
     for l in (1..=max).rev() {
@@ -424,6 +654,8 @@ impl Client {
         let mut buf: Vec<u8> = Vec::new();
         let mut turn = AssistantTurn::default();
         let mut think = ThinkFilter::default();
+        let mut from_text = ToolTextFilter::new(tools);
+        let mut text_calls: Vec<ToolCall> = Vec::new();
         // (id, name, arguments) accumulated per tool-call index
         let mut partials: Vec<(String, String, String)> = Vec::new();
 
@@ -465,8 +697,11 @@ impl Client {
                                         if is_reasoning {
                                             on_event(StreamEvent::Reasoning(text));
                                         } else {
-                                            turn.content.push_str(&text);
-                                            on_event(StreamEvent::Content(text));
+                                            let shown = from_text.push(&text, &mut text_calls);
+                                            if !shown.is_empty() {
+                                                turn.content.push_str(&shown);
+                                                on_event(StreamEvent::Content(shown));
+                                            }
                                         }
                                     }
                                 }
@@ -505,9 +740,17 @@ impl Client {
             if is_reasoning {
                 on_event(StreamEvent::Reasoning(text));
             } else {
-                turn.content.push_str(&text);
-                on_event(StreamEvent::Content(text));
+                let shown = from_text.push(&text, &mut text_calls);
+                if !shown.is_empty() {
+                    turn.content.push_str(&shown);
+                    on_event(StreamEvent::Content(shown));
+                }
             }
+        }
+        let shown = from_text.flush(&mut text_calls);
+        if !shown.is_empty() {
+            turn.content.push_str(&shown);
+            on_event(StreamEvent::Content(shown));
         }
 
         for (i, (id, name, args)) in partials.into_iter().enumerate() {
@@ -526,6 +769,9 @@ impl Client {
                     arguments: if args.is_empty() { "{}".into() } else { args },
                 },
             });
+        }
+        if turn.tool_calls.is_empty() {
+            turn.tool_calls = text_calls;
         }
         Ok(turn)
     }
@@ -598,6 +844,8 @@ impl Client {
         let mut buf: Vec<u8> = Vec::new();
         let mut turn = AssistantTurn::default();
         let mut think = ThinkFilter::default();
+        let mut from_text = ToolTextFilter::new(tools);
+        let mut text_calls: Vec<ToolCall> = Vec::new();
 
         'outer: loop {
             tokio::select! {
@@ -631,8 +879,11 @@ impl Client {
                                         if is_reasoning {
                                             on_event(StreamEvent::Reasoning(text));
                                         } else {
-                                            turn.content.push_str(&text);
-                                            on_event(StreamEvent::Content(text));
+                                            let shown = from_text.push(&text, &mut text_calls);
+                                            if !shown.is_empty() {
+                                                turn.content.push_str(&shown);
+                                                on_event(StreamEvent::Content(shown));
+                                            }
                                         }
                                     }
                                 }
@@ -670,9 +921,20 @@ impl Client {
             if is_reasoning {
                 on_event(StreamEvent::Reasoning(text));
             } else {
-                turn.content.push_str(&text);
-                on_event(StreamEvent::Content(text));
+                let shown = from_text.push(&text, &mut text_calls);
+                if !shown.is_empty() {
+                    turn.content.push_str(&shown);
+                    on_event(StreamEvent::Content(shown));
+                }
             }
+        }
+        let shown = from_text.flush(&mut text_calls);
+        if !shown.is_empty() {
+            turn.content.push_str(&shown);
+            on_event(StreamEvent::Content(shown));
+        }
+        if turn.tool_calls.is_empty() {
+            turn.tool_calls = text_calls;
         }
         Ok(turn)
     }
@@ -1076,6 +1338,120 @@ fn to_ollama_message(m: &Message) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter() -> ToolTextFilter {
+        ToolTextFilter::new(&json!([
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "grep"}}
+        ]))
+    }
+
+    /// Feeds the text in one piece and returns (shown, calls).
+    fn run(text: &str) -> (String, Vec<ToolCall>) {
+        run_chunked(&[text])
+    }
+
+    /// Feeds the text the way a stream would, in pieces.
+    fn run_chunked(chunks: &[&str]) -> (String, Vec<ToolCall>) {
+        let mut f = filter();
+        let mut calls = Vec::new();
+        let mut shown = String::new();
+        for c in chunks {
+            shown.push_str(&f.push(c, &mut calls));
+        }
+        shown.push_str(&f.flush(&mut calls));
+        (shown, calls)
+    }
+
+    #[test]
+    fn reads_a_tool_call_the_model_wrote_as_text() {
+        let (shown, calls) = run(
+            "sure\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\"}}\n</tool_call>",
+        );
+        assert_eq!(calls.len(), 1, "{shown}");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"src/main.rs\"}");
+        // the json never reaches the transcript
+        assert_eq!(shown.trim(), "sure");
+    }
+
+    #[test]
+    fn reads_a_bare_json_call_and_one_in_a_fence() {
+        let (_, calls) = run("{\"name\": \"grep\", \"parameters\": {\"pattern\": \"fn main\"}}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, "{\"pattern\":\"fn main\"}");
+
+        let (_, calls) =
+            run("```json\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"x\"}}\n```");
+        assert_eq!(calls.len(), 1, "a fenced call is still a call");
+    }
+
+    #[test]
+    fn survives_being_split_across_chunks() {
+        let (shown, calls) = run_chunked(&[
+            "ok <tool_",
+            "call>{\"name\": \"read_",
+            "file\", \"argum",
+            "ents\": {\"path\": \"a.rs\"}}</tool_call> done",
+        ]);
+        assert_eq!(calls.len(), 1, "{shown}");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(shown, "ok  done");
+    }
+
+    #[test]
+    fn an_unclosed_tag_at_the_end_of_the_stream_still_counts() {
+        let (_, calls) =
+            run("<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"x\"}}");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn text_that_is_not_a_call_comes_back_untouched() {
+        // a tool that does not exist is the model talking about json
+        let same = "{\"name\": \"launch_missiles\", \"arguments\": {}}";
+        let (shown, calls) = run(same);
+        assert!(calls.is_empty());
+        assert_eq!(shown, same);
+
+        // prose, code and braces flow through
+        for text in [
+            "here is a struct:\n\n```rust\nstruct A { name: String }\n```\n",
+            "use serde_json::json; let v = json!({\"a\": 1});",
+            "{ this is not json at all }",
+            "the file has {} in it",
+        ] {
+            let (shown, calls) = run(text);
+            assert!(calls.is_empty(), "{text} became a call");
+            assert_eq!(shown, text, "text changed");
+        }
+    }
+
+    #[test]
+    fn broken_json_is_left_alone() {
+        let text = "<tool_call>{\"name\": \"read_file\", \"argu</tool_call>";
+        let (shown, calls) = run(text);
+        assert!(calls.is_empty());
+        assert_eq!(shown, text, "a half-written call must still be readable");
+    }
+
+    #[test]
+    fn several_calls_in_one_reply() {
+        let (shown, calls) = run(
+            "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a\"}}</tool_call>\
+             <tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"b\"}}</tool_call>",
+        );
+        assert_eq!(calls.len(), 2, "{shown}");
+        assert_ne!(calls[0].id, calls[1].id, "ids must be distinct");
+    }
+
+    #[test]
+    fn arguments_that_arrive_as_a_json_string_are_kept_as_written() {
+        let (_, calls) =
+            run("{\"name\": \"grep\", \"arguments\": \"{\\\"pattern\\\": \\\"x\\\"}\"}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, "{\"pattern\": \"x\"}");
+    }
 
     #[test]
     fn recognises_local_and_hosted_endpoints() {

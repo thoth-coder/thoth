@@ -93,6 +93,8 @@ pub struct Agent {
     /// UI cancels the current generation/tool by cancelling the token in this slot.
     cancel_slot: Arc<Mutex<CancellationToken>>,
     last_editor_note: Option<String>,
+    /// Said once, the first time a tool call has to be read out of the text.
+    warned_text_calls: bool,
     /// Auto-compact when the prompt reaches this many tokens (None = never).
     auto_compact_at: Option<u64>,
 }
@@ -129,6 +131,7 @@ impl Agent {
             tx,
             cancel_slot,
             last_editor_note: None,
+            warned_text_calls: false,
         }
     }
 
@@ -447,6 +450,17 @@ impl Agent {
 
             let tool_calls = turn.tool_calls;
             let had_content = content.is_some();
+            // a call read out of the model's own text runs like any other,
+            // but the user should know that is what happened
+            if !self.warned_text_calls && tool_calls.iter().any(|c| c.id.starts_with("text_call_"))
+            {
+                self.warned_text_calls = true;
+                self.send(AgentEvent::Info(
+                    "this model writes tool calls as text instead of sending them. thoth is \
+                     reading them anyway; a model with proper tool support will be steadier"
+                        .into(),
+                ));
+            }
             self.messages.push(Message::assistant(
                 content,
                 if tool_calls.is_empty() {
