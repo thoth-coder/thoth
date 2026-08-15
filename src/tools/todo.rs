@@ -11,13 +11,34 @@ use serde::Deserialize;
 const MAX_ITEMS: usize = 12;
 const MAX_TEXT: usize = 100;
 
-#[derive(Deserialize, Default, PartialEq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
+#[derive(Default, PartialEq, Clone, Copy)]
 pub enum Status {
     #[default]
     Todo,
     Doing,
     Done,
+}
+
+/// Read loosely on purpose. A model that writes "in_progress" or "Pending"
+/// means something obvious, and failing the whole call over the spelling of
+/// one word costs a round trip to learn nothing.
+impl<'de> Deserialize<'de> for Status {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        parse_status(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown status '{raw}': use todo, doing or done"))
+        })
+    }
+}
+
+fn parse_status(raw: &str) -> Option<Status> {
+    let s = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    Some(match s.as_str() {
+        "done" | "complete" | "completed" | "finished" | "x" => Status::Done,
+        "doing" | "in_progress" | "active" | "current" | "started" | "working" => Status::Doing,
+        "todo" | "to_do" | "pending" | "open" | "not_started" | "" => Status::Todo,
+        _ => return None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -75,14 +96,19 @@ pub fn summary(args: &serde_json::Value) -> String {
     let Some(items) = items else {
         return String::new();
     };
-    let done = items
-        .iter()
-        .filter(|i| i.get("status").and_then(|s| s.as_str()) == Some("done"))
-        .count();
+    // read the same way the tool itself reads it, or a model that writes
+    // "completed" gets a header saying nothing is done
+    let status = |i: &serde_json::Value| {
+        i.get("status")
+            .and_then(|s| s.as_str())
+            .and_then(parse_status)
+            .unwrap_or_default()
+    };
+    let done = items.iter().filter(|i| status(i) == Status::Done).count();
     // the one being worked on is the useful half of the header
     let doing = items
         .iter()
-        .find(|i| i.get("status").and_then(|s| s.as_str()) == Some("doing"))
+        .find(|i| status(i) == Status::Doing)
         .and_then(|i| i.get("text"))
         .and_then(|t| t.as_str())
         .unwrap_or("");
@@ -132,11 +158,37 @@ mod tests {
         assert!(out.lines().next().unwrap().chars().count() < 110, "{out}");
     }
 
+    /// What the schema asks for is one wording of three; models write the
+    /// others. Losing a turn to that is the kind of tax a small model
+    /// cannot afford.
+    #[test]
+    fn a_status_written_another_way_still_reads() {
+        let out = write(items(json!([
+            {"text": "one", "status": "Completed"},
+            {"text": "two", "status": "in_progress"},
+            {"text": "three", "status": "pending"}
+        ])))
+        .unwrap();
+        assert_eq!(out, "[x] one\n[>] two\n[ ] three\n2 left");
+        // but a word that means nothing here is still an error, not a guess
+        assert!(
+            serde_json::from_value::<TodoArgs>(json!({"items": [
+                {"text": "one", "status": "blocked"}
+            ]}))
+            .is_err()
+        );
+    }
+
     #[test]
     fn the_header_shows_progress_and_what_is_running() {
         let s = summary(&json!({"items": [
             {"text": "a", "status": "done"},
             {"text": "run the tests", "status": "doing"}
+        ]}));
+        assert_eq!(s, "1/2 done  run the tests");
+        let s = summary(&json!({"items": [
+            {"text": "a", "status": "Completed"},
+            {"text": "run the tests", "status": "in-progress"}
         ]}));
         assert_eq!(s, "1/2 done  run the tests");
     }

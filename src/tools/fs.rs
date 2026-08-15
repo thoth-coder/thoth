@@ -243,18 +243,38 @@ pub fn write_file(a: WriteArgs) -> Result<String> {
             .with_context(|| format!("cannot create directory {}", parent.display()))?;
     }
     let before = crate::agent::undo::snapshot(&path);
-    std::fs::write(&path, &a.content)
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    // an overwrite that flips a CRLF file to LF shows up as every line
+    // changed, which is not what was asked for
+    let content = match &before {
+        crate::agent::undo::Before::Text(old) => align_newlines(old, &a.content),
+        _ => a.content.clone(),
+    };
+    std::fs::write(&path, &content).with_context(|| format!("cannot write {}", path.display()))?;
     crate::agent::undo::record(&path, before);
     // the model authored the whole file, so it has seen all of it
-    let lines = a.content.lines().count().max(1);
+    let lines = content.lines().count().max(1);
     mark_read(&path, 1, lines, lines);
     Ok(format!(
         "Wrote {} lines ({} bytes) to {}",
-        a.content.lines().count(),
-        a.content.len(),
+        content.lines().count(),
+        content.len(),
         path.display()
     ))
+}
+
+/// Text the model wrote, in the line endings the file already uses.
+/// read_file hands out lines with the `\r` stripped, so a multi-line
+/// old_string copied straight from it can never match a CRLF file byte for
+/// byte. That is the tool's problem, not the model's, and finding out costs
+/// a whole turn. The same alignment keeps a full overwrite from flipping
+/// every line of a CRLF file to LF.
+fn align_newlines(content: &str, s: &str) -> String {
+    let flat = s.replace("\r\n", "\n");
+    if content.contains("\r\n") {
+        flat.replace('\n', "\r\n")
+    } else {
+        flat
+    }
 }
 
 #[derive(Deserialize)]
@@ -279,7 +299,9 @@ pub fn edit_file(a: EditArgs) -> Result<String> {
     if a.old_string == a.new_string {
         bail!("old_string and new_string are identical");
     }
-    let count = content.matches(&a.old_string).count();
+    let old = align_newlines(&content, &a.old_string);
+    let new = align_newlines(&content, &a.new_string);
+    let count = content.matches(&old).count();
     if count == 0 {
         bail!(
             "old_string not found in {}. read the file and copy the exact text",
@@ -293,9 +315,9 @@ pub fn edit_file(a: EditArgs) -> Result<String> {
         );
     }
     let new_content = if a.replace_all {
-        content.replace(&a.old_string, &a.new_string)
+        content.replace(&old, &new)
     } else {
-        content.replacen(&a.old_string, &a.new_string, 1)
+        content.replacen(&old, &new, 1)
     };
     std::fs::write(&path, new_content)
         .with_context(|| format!("cannot write {}", path.display()))?;
@@ -357,7 +379,9 @@ fn apply_edits(content: &str, edits: &[EditStep], name: &str) -> Result<(String,
         if e.old_string == e.new_string {
             bail!("edit {step}: old_string and new_string are identical");
         }
-        let count = out.matches(&e.old_string).count();
+        let old = align_newlines(&out, &e.old_string);
+        let new = align_newlines(&out, &e.new_string);
+        let count = out.matches(&old).count();
         if count == 0 {
             bail!(
                 "edit {step}: old_string not found in {name}. copy the exact text, and remember \
@@ -372,10 +396,10 @@ fn apply_edits(content: &str, edits: &[EditStep], name: &str) -> Result<(String,
         }
         out = if e.replace_all {
             total += count;
-            out.replace(&e.old_string, &e.new_string)
+            out.replace(&old, &new)
         } else {
             total += 1;
-            out.replacen(&e.old_string, &e.new_string, 1)
+            out.replacen(&old, &new, 1)
         };
     }
     Ok((out, total))
@@ -711,11 +735,15 @@ pub fn preview_edit(args: &Value) -> String {
         .unwrap_or(false);
     let header = format!("Edit {path}:\n");
     match std::fs::read_to_string(resolve(path)) {
-        Ok(content) if !old_s.is_empty() && content.contains(old_s) => {
+        Ok(content) if !old_s.is_empty() && content.contains(&align_newlines(&content, old_s)) => {
+            let (old_s, new_s) = (
+                align_newlines(&content, old_s),
+                align_newlines(&content, new_s),
+            );
             let new_content = if replace_all {
-                content.replace(old_s, new_s)
+                content.replace(&old_s, &new_s)
             } else {
-                content.replacen(old_s, new_s, 1)
+                content.replacen(&old_s, &new_s, 1)
             };
             header + &unified_diff(&content, &new_content)
         }
@@ -1024,6 +1052,46 @@ mod tests {
     /// the caller cut the text at a fixed 12k characters, which threw away
     /// read_file's own footer. Losing that footer is what left the model not
     /// knowing there was more of the file, or how to ask for it.
+    /// read_file strips the `\r`, so a multi-line old_string copied from it
+    /// is LF while the file is CRLF, and every multi-line edit on a Windows
+    /// checkout fails to match. The tool has to meet the file where it is.
+    #[test]
+    fn a_crlf_file_can_be_edited_and_stays_crlf() {
+        let p = tmp("crlf.txt", 3);
+        std::fs::write(&p, "one\r\ntwo\r\nthree\r\n").unwrap();
+        read_file(
+            ReadArgs {
+                path: p.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            },
+            12_000,
+        )
+        .unwrap();
+        // the model copies what it was shown: no carriage returns in it
+        edit_file(EditArgs {
+            path: p.to_string_lossy().into_owned(),
+            old_string: "one\ntwo".into(),
+            new_string: "one\ntwo and a half".into(),
+            replace_all: false,
+        })
+        .expect("a CRLF file must be editable");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "one\r\ntwo and a half\r\nthree\r\n",
+            "the file's own line endings must survive the edit"
+        );
+
+        // and a full overwrite keeps them too, instead of turning every
+        // line of the file into a change
+        write_file(WriteArgs {
+            path: p.to_string_lossy().into_owned(),
+            content: "alpha\nbeta\n".into(),
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\r\nbeta\r\n");
+    }
+
     /// The same double-cap trap read_file had: a listing that overran the
     /// caller's budget got cut blind, taking the "there is more" note with
     /// it. It has to fit and still say what was left out.

@@ -48,6 +48,9 @@ blocking. The model kills the pid when it is done.
   overwriting it, and only works inside the working directory. That also
   shuts the back door of deleting a file and writing a fresh one in its
   place to dodge the read rule. Directories are never deleted.
+- Edits are matched in the line endings the file already uses, so a CRLF
+  file can be edited from text copied out of `read_file`, and an overwrite
+  does not silently convert the whole file.
 - `move_file` refuses to land on an existing file, so nothing is lost to a
   rename. The read record follows the file, since the content did not change.
 - A tool call repeated with identical input gets blocked after 2 attempts,

@@ -100,6 +100,16 @@ All notable changes to thoth are documented here. The format follows
   `/clear` shows it again.
 
 ### Fixed
+- Every multi-line `edit_file` failed on a file with CRLF line endings,
+  which is most files on a Windows checkout. `read_file` shows lines with
+  the carriage return stripped, so the text the model copies back could
+  never match the file byte for byte. Edits are now matched in the file's
+  own line endings, and a full overwrite keeps them instead of turning
+  every line into a change.
+- The `todo` tool refused a status it understood perfectly well: a model
+  writing "in_progress" or "Completed" instead of "doing" and "done" lost a
+  turn to a validation error. Those spellings are read as what they mean; a
+  word that means nothing here is still refused.
 - Security: one "always allow" for a file outside the working directory
   covered every file everywhere for the life of the project. Reads and
   writes outside it are now scoped to the directory the file is in; inside
