@@ -4,10 +4,11 @@ pub mod theme;
 
 use crate::agent::{AgentCmd, AgentEvent, PermReply};
 use crate::ui::input::{
-    common_prefix, complete_candidates, cwd, expand_mentions, split_path_fragment,
+    complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
 };
 use crate::ui::render::{
-    clip, expand_tabs, fmt_elapsed, fmt_k, render_diff_body, render_markdown, short_url, wrap_into,
+    clip, expand_tabs, fmt_elapsed, fmt_k, home_relative, render_diff_body, render_markdown,
+    short_url, wrap_into,
 };
 use crate::ui::theme::{PROMPT, RULE, SPINNER};
 use anyhow::Result;
@@ -44,22 +45,58 @@ const HELP: &str = "commands:
   /models        list models available on the server
   /quit          exit
 input:
-  @path          attach a file to your message (tab completes the path)
+  @path          attach a file to your message (a file picker opens as you type)
   !command       run a command yourself; its output goes into the context
 keys:
   enter          send
-  tab            complete an @path
-  esc            interrupt generation / clear input
-  up / down      input history
+  tab / enter    take the highlighted path while the picker is open
+  esc            close the picker / interrupt generation / clear input
+  up / down      move in the picker, otherwise input history
   mouse wheel / pgup / pgdn   scroll transcript
   ctrl+o         expand / collapse long tool outputs
   ctrl+c         quit
 tips: hold shift while dragging to select text with the mouse
       start thoth with --continue to resume this project's last conversation";
 
-const MAX_COMPLETIONS: usize = 12;
+/// Rows the `@path` picker may take from the transcript.
+const PICKER_ROWS: usize = 8;
+
+/// The list of paths shown under the input while an `@path` is being typed.
+struct Picker {
+    /// Char index of the `@` that opened it.
+    at: usize,
+    /// Directory part already typed, e.g. "src/". Kept so accepting an entry
+    /// can rebuild the whole mention.
+    dir: String,
+    items: Vec<String>,
+    sel: usize,
+    /// First visible row, so a long directory scrolls instead of growing.
+    top: usize,
+}
+
+impl Picker {
+    fn height(&self) -> u16 {
+        self.items.len().min(PICKER_ROWS) as u16
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let n = self.items.len();
+        if n == 0 {
+            return;
+        }
+        // wraps, so holding one arrow key reaches everything
+        self.sel = (self.sel as isize + delta).rem_euclid(n as isize) as usize;
+        let rows = PICKER_ROWS.min(n);
+        self.top = self
+            .top
+            .min(self.sel)
+            .max((self.sel + 1).saturating_sub(rows));
+    }
+}
 
 enum ChatBlock {
+    /// The startup screen: logo, version, where we are, what to type.
+    Banner,
     User(String),
     Reasoning(String),
     Assistant(String),
@@ -93,6 +130,10 @@ struct App {
     hist_idx: Option<usize>,
     /// The unfinished line stashed while browsing history.
     draft: String,
+    /// Open `@path` picker, rebuilt after every edit of the input.
+    picker: Option<Picker>,
+    /// Esc closed the picker: stay closed until the mention is edited again.
+    picker_off: bool,
     mode: Mode,
     /// None = follow the bottom of the transcript.
     scroll: Option<usize>,
@@ -215,12 +256,14 @@ impl App {
         Self {
             model,
             base_url,
-            blocks: vec![ChatBlock::Info("/help for commands".into())],
+            blocks: vec![ChatBlock::Banner],
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
             hist_idx: None,
             draft: String::new(),
+            picker: None,
+            picker_off: false,
             mode: Mode::Input,
             scroll: None,
             max_scroll: 0,
@@ -255,6 +298,8 @@ impl App {
             Event::Paste(s) if !matches!(self.mode, Mode::Perm(_)) => {
                 let s = s.replace("\r\n", " ").replace(['\r', '\n'], " ");
                 self.insert_str(&s);
+                self.picker_off = false;
+                self.refresh_picker();
             }
             _ => {}
         }
@@ -286,6 +331,38 @@ impl App {
             return;
         }
 
+        // typing anywhere re-opens a picker that was dismissed with esc
+        if matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+        ) {
+            self.picker_off = false;
+        }
+        // while the @path picker is up it owns the keys it needs, and only
+        // those: everything else still edits the line underneath
+        if self.picker.is_some() && !ctrl {
+            match k.code {
+                KeyCode::Up => {
+                    self.move_pick(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.move_pick(1);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.accept_pick();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.picker = None;
+                    self.picker_off = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match k.code {
             KeyCode::Char('c') if ctrl => {
                 if matches!(self.mode, Mode::Busy) {
@@ -312,7 +389,6 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Tab => self.complete_mention(),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
                 let i = self.byte_idx(self.cursor);
@@ -333,6 +409,7 @@ impl App {
             KeyCode::Char(ch) if !ctrl => self.insert_char(ch),
             _ => {}
         }
+        self.refresh_picker();
     }
 
     fn on_agent_event(&mut self, ev: AgentEvent) {
@@ -495,42 +572,66 @@ impl App {
             .send(AgentCmd::UserInput(format!("{text}{attachments}")));
     }
 
-    /// Tab: completes the `@path` word the cursor sits in.
-    fn complete_mention(&mut self) {
+    /// Rebuilds the `@path` picker for whatever the cursor sits in now. Called
+    /// after every change to the input, so the list always matches the line.
+    fn refresh_picker(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let Some((at, typed)) = mention_at(&chars, self.cursor) else {
+            self.picker = None;
+            self.picker_off = false;
+            return;
+        };
+        if self.picker_off {
+            return;
+        }
+        let (dir, frag) = split_path_fragment(&typed);
+        let items = complete_candidates(&cwd().join(dir), frag);
+        if items.is_empty() {
+            self.picker = None;
+            return;
+        }
+        // keep the highlight where the user put it while the list is the same
+        let keep = match &self.picker {
+            Some(p) => p.at == at && p.dir == dir && p.items == items,
+            None => false,
+        };
+        if keep {
+            return;
+        }
+        self.picker = Some(Picker {
+            at,
+            dir: dir.to_string(),
+            items,
+            sel: 0,
+            top: 0,
+        });
+    }
+
+    fn move_pick(&mut self, delta: isize) {
+        if let Some(p) = &mut self.picker {
+            p.move_sel(delta);
+        }
+    }
+
+    /// Puts the highlighted entry into the line. Directories keep the picker
+    /// open one level down; a file ends the mention with a space.
+    fn accept_pick(&mut self) {
+        let Some(p) = self.picker.take() else { return };
+        let Some(item) = p.items.get(p.sel).cloned() else {
+            return;
+        };
         let chars: Vec<char> = self.input.chars().collect();
         let cur = self.cursor.min(chars.len());
-        let mut start = cur;
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
+        let mut next: String = chars[..p.at + 1].iter().collect();
+        next.push_str(&p.dir);
+        next.push_str(&item);
+        if !item.ends_with('/') {
+            next.push(' ');
         }
-        if start >= cur || chars[start] != '@' {
-            return;
-        }
-        let typed: String = chars[start + 1..cur].iter().collect();
-        let (dir, frag) = split_path_fragment(&typed);
-        let base = cwd().join(dir);
-        let matches = complete_candidates(&base, frag);
-        if matches.is_empty() {
-            return;
-        }
-        let completed = format!("{dir}{}", common_prefix(&matches));
-        if completed != typed {
-            let mut next: String = chars[..start + 1].iter().collect();
-            next.push_str(&completed);
-            let tail: String = chars[cur..].iter().collect();
-            self.cursor = next.chars().count();
-            next.push_str(&tail);
-            self.input = next;
-        } else if matches.len() > 1 {
-            let shown: Vec<String> = matches.iter().take(MAX_COMPLETIONS).cloned().collect();
-            let more = matches.len().saturating_sub(shown.len());
-            let mut list = shown.join("  ");
-            if more > 0 {
-                list.push_str(&format!("  ... +{more} more"));
-            }
-            self.blocks.push(ChatBlock::Info(list));
-            self.scroll = None;
-        }
+        self.cursor = next.chars().count();
+        next.push_str(&chars[cur..].iter().collect::<String>());
+        self.input = next;
+        self.refresh_picker();
     }
 
     fn set_busy(&mut self) {
@@ -548,6 +649,7 @@ impl App {
             "quit" | "exit" | "q" => self.quit = true,
             "clear" => {
                 self.blocks.clear();
+                self.blocks.push(ChatBlock::Banner);
                 self.invalidate_cache();
                 self.scroll = None;
                 self.ctx_tokens = 0;
@@ -701,24 +803,44 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         // one line of chrome at the top, one status line above the input and
-        // one hint line below it: everything else belongs to the transcript
-        let [header_a, chat_a, state_a, rule_a, input_a, status_a] = Layout::vertical([
+        // one hint line below it: everything else belongs to the transcript.
+        // the @path picker sits between the input and the hints, and is zero
+        // rows tall while it is closed
+        let pick_h = self.picker.as_ref().map(|p| p.height()).unwrap_or(0);
+        let [header_a, chat_a, state_a, rule_a, input_a, pick_a, status_a] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(pick_h),
             Constraint::Length(1),
         ])
         .areas(f.area());
 
-        // header
-        let header = Line::from(vec![
-            Span::styled(" thoth ", theme::accent().add_modifier(Modifier::REVERSED)),
-            Span::styled(format!(" {}", self.model), theme::accent()),
-            Span::styled(format!("  {}", short_url(&self.base_url)), theme::muted()),
-        ]);
-        f.render_widget(Paragraph::new(header), header_a);
+        // header: name and version as one chip on the left, the server we are
+        // talking to on the right. the tagline is the first thing to go when
+        // the two sides do not both fit
+        let chip = format!(" thoth v{} ", env!("CARGO_PKG_VERSION"));
+        let tag = "  agentic coding";
+        let url = short_url(&self.base_url);
+        let hw = header_a.width as usize;
+        let right_len = self.model.chars().count() + 2 + url.chars().count();
+        let mut header = vec![Span::styled(
+            chip.clone(),
+            theme::accent().add_modifier(Modifier::REVERSED),
+        )];
+        let mut left_len = chip.chars().count();
+        if left_len + tag.chars().count() + right_len + 2 <= hw {
+            header.push(Span::styled(tag, theme::muted()));
+            left_len += tag.chars().count();
+        }
+        header.push(Span::raw(
+            " ".repeat(hw.saturating_sub(left_len + right_len)),
+        ));
+        header.push(Span::styled(self.model.clone(), theme::accent()));
+        header.push(Span::styled(format!("  {url}"), theme::muted()));
+        f.render_widget(Paragraph::new(Line::from(header)), header_a);
 
         // transcript: cached prefix + freshly rendered last block
         let width = chat_a.width.max(4) as usize;
@@ -768,6 +890,15 @@ impl App {
                 Span::styled("n", theme::key()),
                 Span::styled(" no", theme::muted()),
             ]),
+            // the picker takes over some keys, so say which ones while it is up
+            Mode::Input if self.picker.is_some() => Line::from(vec![
+                Span::styled("up/down", theme::key()),
+                Span::styled(" pick   ", theme::muted()),
+                Span::styled("tab", theme::key()),
+                Span::styled(" take   ", theme::muted()),
+                Span::styled("esc", theme::key()),
+                Span::styled(" close", theme::muted()),
+            ]),
             Mode::Input => Line::default(),
         };
         f.render_widget(Paragraph::new(state), state_a);
@@ -798,6 +929,39 @@ impl App {
         );
         if matches!(self.mode, Mode::Input) {
             f.set_cursor_position(Position::new(input_a.x + 2 + cx as u16, input_a.y));
+        }
+
+        // @path picker: one row per candidate, the highlighted one reversed
+        if let Some(p) = &self.picker {
+            let rows = pick_h as usize;
+            let last = p.top + rows;
+            let width = pick_a.width.saturating_sub(2) as usize;
+            let lines: Vec<Line> = p.items[p.top..last.min(p.items.len())]
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let idx = p.top + i;
+                    let more = p.items.len().saturating_sub(last);
+                    // the bottom row doubles as the "there is more" marker
+                    let text = if more > 0 && idx + 1 == last {
+                        format!("{item}  +{more} more")
+                    } else {
+                        item.clone()
+                    };
+                    let style = if idx == p.sel {
+                        theme::accent().add_modifier(Modifier::REVERSED)
+                    } else if item.ends_with('/') {
+                        theme::accent()
+                    } else {
+                        theme::muted()
+                    };
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(clip(&text, width), style),
+                    ])
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), pick_a);
         }
 
         // status: hints on the left, live numbers and editor file on the right
@@ -916,12 +1080,55 @@ impl App {
         }
     }
 
+    /// Startup screen: the logo, then where we are and what to type. The name
+    /// and version live in the header, so nothing here repeats them. On
+    /// terminals too narrow for the art the logo is dropped rather than
+    /// wrapped to rubble.
+    fn render_banner(&self, out: &mut Vec<Line<'static>>, width: usize) {
+        if width >= theme::LOGO_WIDTH + 2 {
+            for (row, art) in theme::LOGO.iter().enumerate() {
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        *art,
+                        Style::default()
+                            .fg(theme::LOGO_RAMP[row])
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            out.push(Line::default());
+        }
+        out.push(Line::from(Span::styled(
+            format!(
+                "  {}",
+                clip(&home_relative(&cwd()), width.saturating_sub(2))
+            ),
+            theme::muted_italic(),
+        )));
+        // the context window is only known on the ollama native api, and this
+        // is the one place with room to say where the number comes from
+        if let Some(n) = self.num_ctx {
+            out.push(Line::from(Span::styled(
+                format!("  ollama native api  ·  {} context window", fmt_k(n as u64)),
+                theme::muted(),
+            )));
+        }
+        out.push(Line::default());
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("/help", theme::key()),
+            Span::styled("  commands and keys", theme::muted()),
+        ]));
+    }
+
     fn render_block(&self, bi: usize, out: &mut Vec<Line<'static>>, width: usize) {
         let dim = theme::muted();
         let dim_italic = theme::muted_italic();
         let red = theme::danger();
         let is_last = bi + 1 == self.blocks.len();
         match &self.blocks[bi] {
+            ChatBlock::Banner => self.render_banner(out, width),
             ChatBlock::User(t) => wrap_into(out, t, width, PROMPT, theme::accent(), theme::bold()),
             ChatBlock::Assistant(t) => render_markdown(out, t, width),
             ChatBlock::Reasoning(t) => {
@@ -1069,6 +1276,89 @@ mod tests {
     }
 
     #[test]
+    fn banner_greets_with_the_logo_and_version() {
+        let mut a = app();
+        let s = screen(&mut a, 80, 24).join("\n");
+        let name = format!("thoth v{}", env!("CARGO_PKG_VERSION"));
+        assert!(s.contains(theme::LOGO[3]), "no logo:\n{s}");
+        assert!(s.contains("/help"), "{s}");
+        // the window size is startup information, not a transcript message
+        assert!(s.contains("32.8k context window"), "{s}");
+        // name, version and tagline belong to the header, not to the art
+        let head = s.lines().next().unwrap();
+        assert!(head.contains(&name), "{head:?}");
+        assert!(head.contains("agentic coding"), "{head:?}");
+        assert!(head.contains("qwen3:8b"), "{head:?}");
+        assert_eq!(s.matches(&name).count(), 1, "name repeated:\n{s}");
+
+        // narrow terminal: the art goes, and the tagline gives its room to the
+        // model and server, which are the part worth keeping
+        let s = screen(&mut a, 26, 24);
+        assert!(!s.join("\n").contains(theme::LOGO[3]), "art still drawn");
+        assert!(
+            s[0].contains("thoth v") && s[0].contains("qwen3:8b"),
+            "{:?}",
+            s[0]
+        );
+        assert!(
+            !s[0].contains("agentic coding"),
+            "tagline held on: {:?}",
+            s[0]
+        );
+    }
+
+    // cargo runs tests from the crate root, so this repo is the fixture the
+    // picker completes against
+    #[test]
+    fn at_path_picker_completes_a_file() {
+        let mut a = app();
+        a.input = "look at @src/conf".into();
+        a.cursor = a.input.chars().count();
+        a.refresh_picker();
+        assert_eq!(
+            a.picker.as_ref().expect("picker is open").items,
+            ["config.rs"]
+        );
+        a.accept_pick();
+        assert_eq!(a.input, "look at @src/config.rs ");
+        assert!(a.picker.is_none(), "a finished file closes the picker");
+    }
+
+    #[test]
+    fn at_path_picker_walks_into_a_directory() {
+        let mut a = app();
+        a.input = "@sr".into();
+        a.cursor = 3;
+        a.refresh_picker();
+        a.accept_pick();
+        assert_eq!(a.input, "@src/");
+        let p = a.picker.as_ref().expect("still open one level down");
+        assert!(
+            p.items[0].ends_with('/'),
+            "directories first: {:?}",
+            p.items
+        );
+        assert!(p.items.iter().any(|i| i == "main.rs"), "{:?}", p.items);
+        // the highlight wraps, and the window follows it
+        a.move_pick(-1);
+        let p = a.picker.as_ref().unwrap();
+        assert_eq!(p.sel, p.items.len() - 1);
+        assert!(p.sel < p.top + PICKER_ROWS && p.sel >= p.top);
+    }
+
+    #[test]
+    fn picker_rows_sit_between_the_input_and_the_status_line() {
+        let mut a = app();
+        a.input = "@src/".into();
+        a.cursor = 5;
+        a.refresh_picker();
+        let s = screen(&mut a, 80, 20);
+        assert!(s[10].contains("@src/"), "input line: {:?}", s[10]);
+        assert!(s[11].contains("agent/"), "first candidate: {:?}", s[11]);
+        assert!(s[19].contains("/help"), "status moved: {:?}", s[19]);
+    }
+
+    #[test]
     fn tool_output_collapses_until_expanded() {
         let mut a = app();
         a.blocks.push(ChatBlock::Tool {
@@ -1087,6 +1377,21 @@ mod tests {
             s.contains("  7"),
             "expanded output should show every line:\n{s}"
         );
+    }
+
+    /// The startup screen with the @path picker open, for eyeballing colors:
+    /// cargo test start_screen -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn start_screen_preview() {
+        let mut a = app();
+        a.input = "look at @src/".into();
+        a.cursor = a.input.chars().count();
+        a.refresh_picker();
+        println!();
+        for l in screen(&mut a, 100, 26) {
+            println!("{l}");
+        }
     }
 
     /// Prints a full mock screen for eyeballing layout changes:

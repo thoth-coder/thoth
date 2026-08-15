@@ -37,6 +37,23 @@ pub fn short_url(url: &str) -> String {
         .to_string()
 }
 
+/// Path with the home directory folded back to `~`, so the banner does not
+/// spell out the user's account name.
+pub fn home_relative(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        let rest = rest.display().to_string();
+        return if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+        };
+    }
+    s
+}
+
 /// Renders the body of a diff/permission preview. Lines are colored by their
 /// first character: '+' insert, '-' delete, ' ' context, '$' command, other = header.
 pub fn render_diff_body(out: &mut Vec<Line<'static>>, text: &str, width: usize) {

@@ -76,6 +76,21 @@ fn inside(base: &std::path::Path, path: &std::path::Path) -> bool {
     }
 }
 
+/// The `@path` word the cursor sits in, as (index of the `@`, text typed
+/// after it). `None` when the cursor is not inside a mention. A bare `@`
+/// counts, so the picker opens as soon as it is typed.
+pub fn mention_at(chars: &[char], cursor: usize) -> Option<(usize, String)> {
+    let cur = cursor.min(chars.len());
+    let mut start = cur;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    if start >= cur || chars[start] != '@' {
+        return None;
+    }
+    Some((start, chars[start + 1..cur].iter().collect()))
+}
+
 /// "src/too" -> ("src/", "too"); "too" -> ("", "too").
 pub fn split_path_fragment(typed: &str) -> (&str, &str) {
     match typed.rfind(['/', '\\']) {
@@ -85,7 +100,8 @@ pub fn split_path_fragment(typed: &str) -> (&str, &str) {
 }
 
 /// Entries of `dir` starting with `frag`, directories marked with a trailing
-/// slash. Hidden entries only show when the fragment starts with a dot.
+/// slash and listed first. Hidden entries only show when the fragment starts
+/// with a dot.
 pub fn complete_candidates(dir: &std::path::Path, frag: &str) -> Vec<String> {
     let lower = frag.to_lowercase();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -107,25 +123,15 @@ pub fn complete_candidates(dir: &std::path::Path, frag: &str) -> Vec<String> {
             out.push(name);
         }
     }
-    out.sort_unstable();
+    // directories first: picking one narrows the list, so it is the move the
+    // user is most likely making
+    out.sort_unstable_by(|a, b| {
+        let file = |s: &String| !s.ends_with('/');
+        file(a)
+            .cmp(&file(b))
+            .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+    });
     out
-}
-
-pub fn common_prefix(items: &[String]) -> String {
-    let Some(first) = items.first() else {
-        return String::new();
-    };
-    let mut len = first.chars().count();
-    for other in &items[1..] {
-        len = len.min(
-            first
-                .chars()
-                .zip(other.chars())
-                .take_while(|(a, b)| a == b)
-                .count(),
-        );
-    }
-    first.chars().take(len).collect()
 }
 
 #[cfg(test)]
@@ -163,18 +169,33 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_mention_under_the_cursor() {
+        let chars: Vec<char> = "look at @src/ma now".chars().collect();
+        assert_eq!(mention_at(&chars, 15), Some((8, "src/ma".into())));
+        // a bare @ opens the picker on the whole directory
+        assert_eq!(mention_at(&chars, 9), Some((8, String::new())));
+        // outside the mention, and on a word that is not one
+        assert_eq!(mention_at(&chars, 4), None);
+        assert_eq!(mention_at(&chars, 17), None);
+        // right after the completed word, not inside it any more
+        let done: Vec<char> = "@src/main.rs ".chars().collect();
+        assert_eq!(mention_at(&done, 13), None);
+    }
+
+    #[test]
     fn completes_paths() {
         let base = fixture("complete");
         assert_eq!(split_path_fragment("src/ma"), ("src/", "ma"));
         assert_eq!(split_path_fragment("Car"), ("", "Car"));
         // one match completes fully
         assert_eq!(complete_candidates(&base.join("src"), "mai"), ["main.rs"]);
-        // several matches stop at the shared prefix
-        let both = complete_candidates(&base.join("src"), "m");
-        assert_eq!(both, ["main.rs", "model.rs"]);
-        assert_eq!(common_prefix(&both), "m");
-        // directories are marked, hidden files stay hidden until asked for
+        assert_eq!(
+            complete_candidates(&base.join("src"), "m"),
+            ["main.rs", "model.rs"]
+        );
+        // directories are marked and sort ahead of files
         assert_eq!(complete_candidates(&base, "s"), ["src/"]);
+        assert_eq!(complete_candidates(&base, "")[0], "src/");
         assert!(
             complete_candidates(&base, "")
                 .iter()

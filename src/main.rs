@@ -110,7 +110,8 @@ async fn main() -> Result<()> {
     if let Some(note) = startup_note {
         let _ = ev_tx.send(AgentEvent::Info(note));
     }
-    if is_ollama {
+    // the TUI says this on its startup screen; -p has no screen to say it on
+    if is_ollama && args.prompt.is_some() {
         let _ = ev_tx.send(AgentEvent::Info(format!(
             "ollama native api, context window {} tokens",
             client.num_ctx

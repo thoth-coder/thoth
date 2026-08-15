@@ -5,6 +5,14 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `@path` now opens a picker under the input instead of completing on tab
+  only: up/down move, tab or enter takes the highlighted entry, esc closes
+  it, and picking a directory lists what is inside it.
+- Startup screen: logo, version, working directory and, on the Ollama
+  native api, the context window that used to be a transcript line.
+  `/clear` shows it again.
+
 ## [0.2.0] - 2026-07-29
 
 ### Added

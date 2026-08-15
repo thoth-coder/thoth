@@ -2,8 +2,11 @@
 
 ## Writing a message
 
-- `@path` attaches a file to your message. `tab` completes the path, and a
-  file attached whole counts as read, so the model can edit it right away.
+- `@path` attaches a file to your message. Typing `@` opens a picker under
+  the input: `up` / `down` moves through the matches, `tab` takes the
+  highlighted one, `esc` closes it. Picking a directory walks into it, so
+  you can browse down to a file without typing the whole path. A file
+  attached whole counts as read, so the model can edit it right away.
   Works in `-p` mode too: `thoth -p "explain @src/main.rs"`.
 - `!command` runs a command yourself. Its output goes into the conversation
   as context without spending a model turn, which is the cheap way to show
@@ -14,9 +17,11 @@
 ## Keys
 
 - `enter` sends. While the agent is working, messages queue up.
-- `tab` completes an `@path`.
-- `esc` interrupts generation, or clears the input when idle.
-- `up` / `down` move through input history.
+- `tab` or `enter` takes the highlighted path while the `@path` picker is
+  open.
+- `esc` closes the picker, interrupts generation, or clears the input when
+  idle.
+- `up` / `down` move in the picker, otherwise through input history.
 - Mouse wheel, `pgup` / `pgdn` scroll the transcript. Hold `shift` while
   dragging to select text.
 - `ctrl+o` expands or collapses long tool outputs.
