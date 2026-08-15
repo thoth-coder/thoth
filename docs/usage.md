@@ -38,7 +38,7 @@
 | `/recap` | load the previous session's summary into context |
 | `/memory` | show project memory, `/memory clear` wipes it |
 | `/allow` | list what is always allowed here, `/allow reset` clears it |
-| `/status` | model, server, tokens, uptime |
+| `/status` | profile, model, server and api, tokens, cost, uptime |
 | `/init` | analyze the project and generate THOTH.md |
 | `/model NAME` | switch model, `/models` lists what the server has |
 | `/help`, `/quit` | help and exit |
@@ -67,8 +67,9 @@ Without the extension, on Windows, thoth falls back to reading editor window
 titles. That only reveals which file is open, not selections or diagnostics.
 
 The status bar shows `ctx 12.3k/32.8k (37%)` (context used / window size),
-`out` (tokens generated this session) and the current editor file. While the
-model works, the line above the input shows a spinner and the elapsed time.
+`out` (tokens generated this session), the running cost when the profile has
+prices, and the current editor file. While the model works, the line above
+the input shows a spinner and the elapsed time.
 
 ## Memory and recap
 

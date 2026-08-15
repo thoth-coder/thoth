@@ -69,6 +69,7 @@ pub enum AgentEvent {
         profile: Option<String>,
         model: String,
         base_url: String,
+        api: &'static str,
         num_ctx: Option<u32>,
     },
     /// Token usage of the latest model call, and what it cost when the
@@ -158,6 +159,7 @@ impl Agent {
             profile: Some(name.to_string()),
             model: model.clone(),
             base_url: base_url.clone(),
+            api: self.client.transport.name(),
             num_ctx: window,
         });
         self.send(AgentEvent::Info(format!(
@@ -430,8 +432,8 @@ impl Agent {
                     continue;
                 }
                 self.send(AgentEvent::Error(
-                    "generation keeps hitting the context limit. raise num_ctx in the config, \
-                     or set think = false to spend fewer tokens on reasoning"
+                    "generation keeps hitting the context limit. raise context_window in the \
+                     profile, or set think = false to spend fewer tokens on reasoning"
                         .into(),
                 ));
                 return Ok(());

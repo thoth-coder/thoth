@@ -231,12 +231,22 @@ pub fn load(o: Overrides) -> Result<(Config, Option<String>)> {
 }
 
 pub fn load_store() -> Store {
-    let text = std::fs::read_to_string(config_path())
-        .or_else(|_| std::fs::read_to_string(legacy_config_path().unwrap_or_default()));
-    match text {
-        Ok(text) => parse_store(&text),
-        Err(_) => Store::default(),
+    let new = std::fs::read_to_string(config_path()).ok();
+    let legacy = legacy_config_path().and_then(|p| std::fs::read_to_string(p).ok());
+    pick_store(new.as_deref(), legacy.as_deref())
+}
+
+/// The current path wins, unless what is there holds no profiles: saving an
+/// empty screen once must not hide a working config at the old path.
+fn pick_store(new: Option<&str>, legacy: Option<&str>) -> Store {
+    let store = new.map(parse_store).unwrap_or_default();
+    if !store.profiles.is_empty() {
+        return store;
     }
+    legacy
+        .map(parse_store)
+        .filter(|s| !s.profiles.is_empty())
+        .unwrap_or(store)
 }
 
 /// Reads the current format, and the flat pre-profile file thoth 0.1/0.2
@@ -367,10 +377,63 @@ num_ctx = 65536
     }
 
     #[test]
+    fn an_empty_new_file_does_not_hide_the_old_one() {
+        let legacy = "model = \"qwen3:8b\"\n";
+        // what the screen writes when it is saved with nothing in it
+        assert_eq!(
+            pick_store(Some("[profiles]\n"), Some(legacy))
+                .get("default")
+                .model
+                .as_deref(),
+            Some("qwen3:8b")
+        );
+        // but a real one at the new path wins
+        let new = "[profiles.mine]\nmodel = \"m\"\n";
+        let store = pick_store(Some(new), Some(legacy));
+        assert!(store.profiles.contains_key("mine"), "{store:?}");
+        assert!(!store.profiles.contains_key("default"), "{store:?}");
+        assert!(pick_store(None, None).profiles.is_empty());
+    }
+
+    #[test]
     fn suggests_a_free_name() {
         let mut store = parse_store("[profiles.new]\n");
         assert_eq!(store.free_name(), "new2");
         store.profiles.insert("new2".into(), Profile::default());
         assert_eq!(store.free_name(), "new3");
     }
+}
+
+/// toml puts tables after values: a map in the middle of the struct
+/// could swallow every field written after it. Every field at once,
+/// through save and load.
+#[test]
+fn a_full_profile_survives_a_round_trip() {
+    let mut store = Store::default();
+    let p = Profile {
+        api: Some(Api::Anthropic),
+        base_url: Some("https://api.anthropic.com/v1".into()),
+        model: Some("claude-sonnet-4-5".into()),
+        api_key: Some("sk-ant-x".into()),
+        headers: [("api-key".to_string(), "abc".to_string())]
+            .into_iter()
+            .collect(),
+        temperature: Some(0.7),
+        max_turns: Some(30),
+        context_window: Some(200_000),
+        max_tokens: Some(8192),
+        think: Some(false),
+        price_in: Some(3.0),
+        price_out: Some(15.0),
+        price_cached: Some(0.3),
+    };
+    store.active = Some("claude".into());
+    store.profiles.insert("claude".into(), p.clone());
+    store.profiles.insert("second".into(), Profile::default());
+
+    let text = toml::to_string_pretty(&store).expect("serializes");
+    let back = parse_store(&text);
+    assert_eq!(back.active.as_deref(), Some("claude"), "{text}");
+    assert_eq!(back.get("claude"), p, "{text}");
+    assert_eq!(back.profiles.len(), 2, "{text}");
 }

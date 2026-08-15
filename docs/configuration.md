@@ -35,7 +35,7 @@ live in it. `thoth config path` prints it.
 
 thoth 0.2 and earlier kept it in the platform config directory
 (`%APPDATA%\thoth` on Windows, `~/.config/thoth` elsewhere). That file is
-still read when there is nothing in `~/.thoth`, so nothing breaks; the next
+still read while the new one holds no profiles, so nothing breaks; the next
 save writes to the new place and the old file can be deleted.
 
 ```toml
@@ -77,7 +77,7 @@ Every field is optional. A profile only records what it changes.
 | `api_key` | bearer token, or `x-api-key` on Anthropic |
 | `headers` | extra request headers, for endpoints that want their own |
 | `context_window` | requested per call on Ollama; elsewhere it is what auto-compact measures against. Was called `num_ctx` |
-| `max_tokens` | cap on one reply |
+| `max_tokens` | cap on one reply. Anthropic gets 8192 when it is unset, since that api requires one. Leave it empty on OpenAI reasoning models, which want `max_completion_tokens` instead and reject this |
 | `think` | force thinking on or off (Ollama) |
 | `temperature`, `max_turns` | sampling, and tool calls allowed per request |
 | `price_in`, `price_out`, `price_cached` | usd per million tokens |

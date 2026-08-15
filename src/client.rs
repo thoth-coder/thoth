@@ -384,15 +384,25 @@ impl Client {
         if let Some(m) = self.max_tokens {
             body["max_tokens"] = json!(m);
         }
-        let resp = self
-            .auth(
-                self.http
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .json(&body),
-            )
-            .send()
+        let url = format!("{}/chat/completions", self.base_url);
+        let send = |body: &Value| self.auth(self.http.post(&url).json(body)).send();
+        let mut resp = send(&body)
             .await
             .with_context(|| format!("cannot reach {}. is the server running?", self.base_url))?;
+        // stream_options is an OpenAI extension and not every compatible
+        // server takes it. Losing the token counts beats losing the answer,
+        // so drop it and go again rather than failing the turn.
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let complaint = resp.text().await.unwrap_or_default();
+            if !complaint.contains("stream_options") {
+                let short: String = complaint.chars().take(500).collect();
+                bail!("server returned 400 Bad Request: {short}");
+            }
+            body.as_object_mut()
+                .expect("json object")
+                .remove("stream_options");
+            resp = send(&body).await.context("retry without stream_options")?;
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -846,9 +856,10 @@ fn host_of(url: &str) -> String {
     host.to_ascii_lowercase()
 }
 
-/// Localhost or a private network address. Only these get probed for Ollama:
-/// a paid endpoint must never see a request to a path we merely guessed at.
-fn is_local(url: &str) -> bool {
+/// Localhost or a private network address. Only these get probed for Ollama,
+/// and only for these will thoth pick a model on its own: a paid endpoint
+/// must never see a request to a path we guessed, nor a model we guessed.
+pub fn is_local(url: &str) -> bool {
     let host = host_of(url);
     if matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
         || host.ends_with(".local")

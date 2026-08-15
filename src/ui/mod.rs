@@ -126,6 +126,8 @@ struct App {
     base_url: String,
     /// Config profile this session is running, when there is one.
     profile: Option<String>,
+    /// Which wire protocol the session ended up on.
+    api: &'static str,
     /// Last answer to /models, so `/model 3` can mean something.
     models: Vec<String>,
     /// Open config screen; while it is up it owns the frame and the keys.
@@ -174,11 +176,18 @@ struct App {
     cancel_slot: Arc<Mutex<CancellationToken>>,
 }
 
+/// What the interface knows about the connection before the first turn.
+pub struct Session {
+    pub model: String,
+    pub base_url: String,
+    pub profile: Option<String>,
+    pub api: &'static str,
+    /// Context window, when anything knows it.
+    pub window: Option<u32>,
+}
+
 pub async fn run(
-    model: String,
-    base_url: String,
-    profile: Option<String>,
-    num_ctx: Option<u32>,
+    session: Session,
     cmd_tx: mpsc::UnboundedSender<AgentCmd>,
     mut ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
     cancel_slot: Arc<Mutex<CancellationToken>>,
@@ -196,7 +205,7 @@ pub async fn run(
         }
     });
 
-    let mut app = App::new(model, base_url, profile, num_ctx, cmd_tx, cancel_slot);
+    let mut app = App::new(session, cmd_tx, cancel_slot);
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut dirty = true;
@@ -261,17 +270,15 @@ pub async fn run(
 
 impl App {
     fn new(
-        model: String,
-        base_url: String,
-        profile: Option<String>,
-        num_ctx: Option<u32>,
+        session: Session,
         cmd_tx: mpsc::UnboundedSender<AgentCmd>,
         cancel_slot: Arc<Mutex<CancellationToken>>,
     ) -> Self {
         Self {
-            model,
-            base_url,
-            profile,
+            model: session.model,
+            base_url: session.base_url,
+            profile: session.profile,
+            api: session.api,
             models: Vec::new(),
             config: None,
             blocks: vec![ChatBlock::Banner],
@@ -291,7 +298,7 @@ impl App {
             turn_start: None,
             editor_status: crate::editor::live_status(),
             tick_count: 0,
-            num_ctx,
+            num_ctx: session.window,
             expanded: false,
             cache: Vec::new(),
             cached_blocks: 0,
@@ -510,11 +517,13 @@ impl App {
                 profile,
                 model,
                 base_url,
+                api,
                 num_ctx,
             } => {
                 self.profile = profile;
                 self.model = model;
                 self.base_url = base_url;
+                self.api = api;
                 self.num_ctx = num_ctx;
             }
             AgentEvent::TurnStart => {
@@ -765,10 +774,11 @@ impl App {
             "status" => {
                 let up = self.session_start.elapsed().as_secs();
                 let mut out = format!(
-                    "profile:  {}\nmodel:    {}\nserver:   {}\ncwd:      {}\ncontext:  {} tokens (last request)\noutput:   {} tokens (session)",
+                    "profile:  {}\nmodel:    {}\nserver:   {} ({} api)\ncwd:      {}\ncontext:  {} tokens (last request)\noutput:   {} tokens (session)",
                     self.profile.as_deref().unwrap_or("(none)"),
                     self.model,
                     self.base_url,
+                    self.api,
                     std::env::current_dir()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
@@ -1222,14 +1232,14 @@ impl App {
             ),
             theme::muted_italic(),
         )));
-        // the context window is only known on the ollama native api, and this
-        // is the one place with room to say where the number comes from
-        if let Some(n) = self.num_ctx {
-            out.push(Line::from(Span::styled(
-                format!("  ollama native api  ·  {} context window", fmt_k(n as u64)),
-                theme::muted(),
-            )));
-        }
+        // which api, and the window it is measured against when one is known
+        out.push(Line::from(Span::styled(
+            match self.num_ctx {
+                Some(n) => format!("  {} api  ·  {} context window", self.api, fmt_k(n as u64)),
+                None => format!("  {} api", self.api),
+            },
+            theme::muted(),
+        )));
         out.push(Line::default());
         out.push(Line::from(vec![
             Span::raw("  "),
@@ -1321,10 +1331,13 @@ mod tests {
     fn app() -> App {
         let (cmd_tx, _rx) = mpsc::unbounded_channel();
         let mut a = App::new(
-            "qwen3:8b".into(),
-            "http://localhost:11434/v1".into(),
-            None,
-            Some(32768),
+            Session {
+                model: "qwen3:8b".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                profile: None,
+                api: "ollama native",
+                window: Some(32768),
+            },
             cmd_tx,
             Arc::new(Mutex::new(CancellationToken::new())),
         );
@@ -1407,6 +1420,18 @@ mod tests {
         assert!(head.contains("agentic coding"), "{head:?}");
         assert!(head.contains("qwen3:8b"), "{head:?}");
         assert_eq!(s.matches(&name).count(), 1, "name repeated:\n{s}");
+
+        // the api on the banner is the one actually in use, not a guess
+        assert!(s.contains("ollama native api"), "{s}");
+        a.api = "anthropic native";
+        a.num_ctx = Some(200_000);
+        a.invalidate_cache();
+        let s = screen(&mut a, 80, 24).join("\n");
+        assert!(s.contains("anthropic native api  ·  200.0k"), "{s}");
+        assert!(!s.contains("ollama"), "{s}");
+        a.api = "ollama native";
+        a.num_ctx = Some(32768);
+        a.invalidate_cache();
 
         // narrow terminal: the art goes, and the tagline gives its room to the
         // model and server, which are the part worth keeping

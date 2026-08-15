@@ -125,7 +125,21 @@ async fn main() -> Result<()> {
 
     match args.prompt {
         Some(p) => run_print_mode(p, cmd_tx, ev_rx).await,
-        None => ui::run(model, base_url, profile, window, cmd_tx, ev_rx, cancel_slot).await,
+        None => {
+            ui::run(
+                ui::Session {
+                    model,
+                    base_url,
+                    profile,
+                    api: transport.name(),
+                    window,
+                },
+                cmd_tx,
+                ev_rx,
+                cancel_slot,
+            )
+            .await
+        }
     }
 }
 
@@ -143,7 +157,7 @@ async fn choose_model(client: &Client) -> Result<(String, Option<String>)> {
     })?;
     let chat: Vec<&String> = models.iter().filter(|m| looks_like_chat_model(m)).collect();
     let pick = |list: &[&String]| list.first().map(|m| (*m).clone());
-    match (chat.len(), is_local(&client.base_url)) {
+    match (chat.len(), client::is_local(&client.base_url)) {
         (0, _) => bail!(
             "no usable models on {}. pull one first, e.g. `ollama pull qwen3:8b`",
             client.base_url
@@ -187,23 +201,6 @@ fn looks_like_chat_model(id: &str) -> bool {
     ]
     .iter()
     .any(|bad| id.contains(bad))
-}
-
-/// Same rule as the transport probe: only a local address is one we may
-/// guess about.
-fn is_local(base_url: &str) -> bool {
-    let host = base_url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(base_url)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0")
-        || host.ends_with(".local")
-        || host.starts_with("192.168.")
-        || host.starts_with("10.")
 }
 
 /// `thoth config`: the screen with no arguments, and the three things that
