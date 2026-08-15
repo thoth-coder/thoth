@@ -11,23 +11,60 @@ use std::path::PathBuf;
 pub const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 pub const DEFAULT_MAX_TURNS: usize = 40;
 
+/// Which wire protocol to speak. `Auto` looks at the endpoint and decides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    #[default]
+    Auto,
+    /// OpenAI-compatible /chat/completions. Also OpenAI itself, Gemini,
+    /// OpenRouter, Groq, vLLM, llama.cpp, LM Studio, ...
+    Openai,
+    /// Ollama native /api/chat: lets us set the context window per request.
+    Ollama,
+    /// Anthropic native /v1/messages, with prompt caching.
+    Anthropic,
+}
+
 /// What a run actually uses, after profile, env and flags are layered.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub api: Api,
     pub base_url: String,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// Extra request headers, for endpoints that do not take a bearer token
+    /// (Azure's `api-key`, gateways that want their own).
+    pub headers: BTreeMap<String, String>,
     pub temperature: Option<f32>,
     pub max_turns: usize,
-    /// Context window to request (Ollama native API only).
-    pub num_ctx: Option<u32>,
+    /// Context window. Requested per call on Ollama; elsewhere it is what
+    /// auto-compact measures against, since the server never tells us.
+    pub context_window: Option<u32>,
+    /// Cap on one reply. Required by the Anthropic API, optional elsewhere.
+    pub max_tokens: Option<u32>,
     /// Force thinking mode on/off (Ollama native only). Turning it off helps
     /// small context windows a lot.
     pub think: Option<bool>,
-    /// Google Programmable Search credentials; when set, web_search uses
-    /// Google instead of DuckDuckGo.
-    pub google_api_key: Option<String>,
-    pub google_cx: Option<String>,
+    /// USD per million tokens, for the running cost in the status line.
+    pub price_in: Option<f64>,
+    pub price_out: Option<f64>,
+    /// Price of a cached input token, when the provider discounts one.
+    pub price_cached: Option<f64>,
+}
+
+impl Config {
+    /// Cost of a call in USD, or None when the profile has no prices.
+    pub fn cost(&self, u: &crate::client::Usage) -> Option<f64> {
+        let (pin, pout) = (self.price_in?, self.price_out.unwrap_or(0.0));
+        let cached = u.cached_tokens.min(u.prompt_tokens);
+        let fresh = u.prompt_tokens - cached;
+        let pcached = self.price_cached.unwrap_or(pin);
+        Some(
+            (fresh as f64 * pin + cached as f64 * pcached + u.completion_tokens as f64 * pout)
+                / 1_000_000.0,
+        )
+    }
 }
 
 /// One saved set of settings. Every field is optional: a profile only records
@@ -35,23 +72,33 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<Api>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Only editable in the file: the screen shows how many are set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
+    /// `num_ctx` was this field's name while thoth only spoke to Ollama.
+    #[serde(alias = "num_ctx", skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_ctx: Option<u32>,
+    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub google_api_key: Option<String>,
+    pub price_in: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub google_cx: Option<String>,
+    pub price_out: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_cached: Option<f64>,
 }
 
 /// The whole config file.
@@ -132,6 +179,7 @@ fn env(k: &str) -> Option<String> {
 /// two paths cannot drift apart.
 pub fn resolve(p: &Profile) -> Config {
     Config {
+        api: p.api.unwrap_or_default(),
         base_url: env("THOTH_BASE_URL")
             .or_else(|| p.base_url.clone())
             .unwrap_or_else(|| DEFAULT_BASE_URL.into())
@@ -139,16 +187,20 @@ pub fn resolve(p: &Profile) -> Config {
             .to_string(),
         model: env("THOTH_MODEL").or_else(|| p.model.clone()),
         api_key: env("THOTH_API_KEY").or_else(|| p.api_key.clone()),
+        headers: p.headers.clone(),
         temperature: env("THOTH_TEMPERATURE")
             .and_then(|v| v.parse().ok())
             .or(p.temperature),
         max_turns: p.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
-        num_ctx: env("THOTH_NUM_CTX")
+        context_window: env("THOTH_CONTEXT_WINDOW")
+            .or_else(|| env("THOTH_NUM_CTX"))
             .and_then(|v| v.parse().ok())
-            .or(p.num_ctx),
+            .or(p.context_window),
+        max_tokens: p.max_tokens,
         think: env("THOTH_THINK").and_then(|v| v.parse().ok()).or(p.think),
-        google_api_key: env("THOTH_GOOGLE_API_KEY").or_else(|| p.google_api_key.clone()),
-        google_cx: env("THOTH_GOOGLE_CX").or_else(|| p.google_cx.clone()),
+        price_in: p.price_in,
+        price_out: p.price_out,
+        price_cached: p.price_cached,
     }
 }
 
@@ -245,21 +297,43 @@ num_ctx = 65536
         assert_eq!(store.pick(None).unwrap().as_deref(), Some("big"));
         assert_eq!(store.pick(Some("small")).unwrap().as_deref(), Some("small"));
         assert!(store.pick(Some("nope")).is_err());
-        assert_eq!(store.get("big").num_ctx, Some(65536));
+        assert_eq!(store.get("big").context_window, Some(65536));
     }
 
-    /// The 0.1/0.2 file must keep working: it becomes one profile.
+    /// The 0.1/0.2 file must keep working: it becomes one profile, and the
+    /// field `num_ctx` becomes `context_window`.
     #[test]
     fn migrates_a_flat_config_file() {
         let store = parse_store("model = \"qwen3:8b\"\nnum_ctx = 16384\n");
         assert_eq!(store.pick(None).unwrap().as_deref(), Some("default"));
         let p = store.get("default");
         assert_eq!(p.model.as_deref(), Some("qwen3:8b"));
-        assert_eq!(p.num_ctx, Some(16384));
+        assert_eq!(p.context_window, Some(16384));
         // and it round-trips into the new shape
         let text = toml::to_string_pretty(&store).unwrap();
         assert!(text.contains("[profiles.default]"), "{text}");
+        assert!(text.contains("context_window"), "{text}");
         assert_eq!(parse_store(&text).get("default"), p);
+    }
+
+    #[test]
+    fn cost_uses_the_cached_rate_for_cached_input() {
+        let cfg = resolve(&Profile {
+            price_in: Some(3.0),
+            price_out: Some(15.0),
+            price_cached: Some(0.3),
+            ..Default::default()
+        });
+        let usage = crate::client::Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 1_000_000,
+            cached_tokens: 900_000,
+        };
+        // 100k fresh at $3, 900k cached at $0.30, 1M out at $15
+        let cost = cfg.cost(&usage).unwrap();
+        assert!((cost - (0.3 + 0.27 + 15.0)).abs() < 1e-9, "{cost}");
+        // no prices in the profile means no number to show
+        assert!(resolve(&Profile::default()).cost(&usage).is_none());
     }
 
     #[test]

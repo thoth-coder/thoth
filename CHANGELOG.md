@@ -6,6 +6,17 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Hosted apis are first-class. Anthropic gets a native transport
+  (`/v1/messages`) with prompt caching on the system prompt, the tool
+  schemas and the end of the history. OpenAI, Google's OpenAI-compatible
+  endpoint, OpenRouter and the rest work through the existing OpenAI path.
+  A profile picks the protocol with `api = "auto" | "openai" | "ollama" |
+  "anthropic"`.
+- Per-profile `headers`, for endpoints that do not take a bearer token
+  (Azure's `api-key`, gateways with their own).
+- Running cost. Set `price_in` / `price_out` / `price_cached` on a profile
+  and the status bar, `/status` and `-p` show what the session has spent.
+- `/models` numbers the list, and `/model 3` picks from it.
 - Named config profiles. `thoth config` (or `thoth cfg`) opens a screen to
   edit them, `/config` does the same inside a session and applies the saved
   profile to the running conversation. `thoth -P NAME` runs one profile
@@ -14,6 +25,15 @@ All notable changes to thoth are documented here. The format follows
   are read as a profile named `default`.
 
 ### Changed
+- Auto-compact works on every api, not just Ollama: it measures against the
+  profile's `context_window`. The field used to be called `num_ctx`, which
+  is still read.
+- thoth no longer picks a model on its own when the endpoint is hosted. A
+  local server usually has one or two and guessing is a kindness; a hosted
+  one has hundreds and guessing spends the user's money, so it lists some
+  and asks.
+- The Ollama probe only fires at a local address. A hosted endpoint never
+  sees a request to a path thoth guessed at.
 - The config file moved to `~/.thoth/config.toml` on every OS, next to the
   state thoth already kept there, instead of the platform config directory
   (`%APPDATA%\thoth` on Windows, `~/.config/thoth` elsewhere). The old path
@@ -25,6 +45,11 @@ All notable changes to thoth are documented here. The format follows
 - Startup screen: logo, version, working directory and, on the Ollama
   native api, the context window that used to be a transcript line.
   `/clear` shows it again.
+
+### Removed
+- Google Programmable Search. `web_search` goes through DuckDuckGo, which
+  needs no key and no account. The `google_api_key` and `google_cx`
+  settings are gone; search backends are worth revisiting as a whole later.
 
 ## [0.2.0] - 2026-07-29
 

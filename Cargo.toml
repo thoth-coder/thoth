@@ -2,7 +2,7 @@
 name = "thoth"
 version = "0.2.0"
 edition = "2024"
-description = "Agentic coding assistant for local LLMs (Ollama / llama.cpp)"
+description = "Agentic coding assistant for local and hosted LLMs (Ollama, llama.cpp, Anthropic, OpenAI)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/thoth-coder/thoth"
 

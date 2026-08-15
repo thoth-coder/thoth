@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Agentic coding assistant for local LLMs (Ollama / llama.cpp)
+/// Agentic coding assistant. Runs on your own models (Ollama, llama.cpp) or
+/// on an api you pay for (Anthropic, OpenAI, Google, OpenRouter).
 #[derive(Parser)]
 #[command(name = "thoth", version)]
 struct Args {
@@ -83,53 +84,20 @@ async fn main() -> Result<()> {
         temperature: args.temperature,
     })?;
 
-    if let (Some(key), Some(cx)) = (cfg.google_api_key.clone(), cfg.google_cx.clone()) {
-        tools::web::set_google(key, cx);
-    }
-
-    let mut client = Client::new(
-        cfg.base_url.clone(),
-        cfg.api_key.clone(),
-        cfg.temperature,
-        cfg.num_ctx,
-    );
-    client.detect_ollama().await;
-    client.think = cfg.think;
+    let mut client = Client::new(&cfg);
+    client.detect_transport(cfg.api != config::Api::Auto).await;
 
     let mut startup_note = None;
-    client.model = match cfg.model {
-        Some(m) => m,
-        None => {
-            let models = client.models().await.map_err(|e| {
-                anyhow!(
-                    "{e:#}\n\nhint: start Ollama (`ollama serve`) or llama.cpp \
-                     (`llama-server -m model.gguf --jinja`), or point thoth at it with --base-url"
-                )
-            })?;
-            match models.len() {
-                0 => bail!(
-                    "no models available on {}. pull one first, e.g. `ollama pull qwen3:8b`",
-                    cfg.base_url
-                ),
-                1 => models[0].clone(),
-                _ => {
-                    startup_note = Some(format!(
-                        "multiple models on server, using '{}'. /models to list, /model NAME to switch",
-                        models[0]
-                    ));
-                    models[0].clone()
-                }
-            }
-        }
-    };
+    if client.model.is_empty() {
+        let (model, note) = choose_model(&client).await?;
+        client.model = model;
+        startup_note = note;
+    }
 
     let model = client.model.clone();
     let base_url = client.base_url.clone();
-    let is_ollama = client.transport == client::Transport::Ollama;
-    // only Ollama tells us the real window size; compact at 2/3 of it so the
-    // summary itself still has room to generate
-    let auto_compact_at = is_ollama.then(|| client.num_ctx as u64 * 2 / 3);
-    let num_ctx_ui = is_ollama.then_some(client.num_ctx);
+    let transport = client.transport;
+    let window = agent::window_of(&client, &cfg);
     let cancel_slot = Arc::new(Mutex::new(CancellationToken::new()));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
@@ -138,20 +106,18 @@ async fn main() -> Result<()> {
         let _ = ev_tx.send(AgentEvent::Info(note));
     }
     // the TUI says this on its startup screen; -p has no screen to say it on
-    if is_ollama && args.prompt.is_some() {
+    if args.prompt.is_some() && transport != client::Transport::OpenAI {
         let _ = ev_tx.send(AgentEvent::Info(format!(
-            "ollama native api, context window {} tokens",
-            client.num_ctx
+            "{} api{}",
+            transport.name(),
+            match window {
+                Some(n) => format!(", context window {n} tokens"),
+                None => String::new(),
+            }
         )));
     }
 
-    let mut agent = Agent::new(
-        client,
-        cfg.max_turns,
-        ev_tx,
-        cancel_slot.clone(),
-        auto_compact_at,
-    );
+    let mut agent = Agent::new(client, cfg, ev_tx, cancel_slot.clone());
     if args.resume {
         agent.resume_session();
     }
@@ -159,19 +125,85 @@ async fn main() -> Result<()> {
 
     match args.prompt {
         Some(p) => run_print_mode(p, cmd_tx, ev_rx).await,
-        None => {
-            ui::run(
-                model,
-                base_url,
-                profile,
-                num_ctx_ui,
-                cmd_tx,
-                ev_rx,
-                cancel_slot,
-            )
-            .await
-        }
+        None => ui::run(model, base_url, profile, window, cmd_tx, ev_rx, cancel_slot).await,
     }
+}
+
+/// Which model to use when the profile does not name one. A local server
+/// usually holds one or two and picking for the user is a kindness; a hosted
+/// api holds hundreds and picking would spend their money on a guess, so it
+/// asks instead.
+async fn choose_model(client: &Client) -> Result<(String, Option<String>)> {
+    let models = client.models().await.map_err(|e| {
+        anyhow!(
+            "{e:#}\n\nhint: set a model with `thoth config` or -m NAME, start Ollama \
+             (`ollama serve`) or llama.cpp (`llama-server -m model.gguf --jinja`), \
+             or point thoth at a server with --base-url"
+        )
+    })?;
+    let chat: Vec<&String> = models.iter().filter(|m| looks_like_chat_model(m)).collect();
+    let pick = |list: &[&String]| list.first().map(|m| (*m).clone());
+    match (chat.len(), is_local(&client.base_url)) {
+        (0, _) => bail!(
+            "no usable models on {}. pull one first, e.g. `ollama pull qwen3:8b`",
+            client.base_url
+        ),
+        (1, _) => Ok((pick(&chat).expect("one match"), None)),
+        (_, true) => Ok((
+            pick(&chat).expect("at least one"),
+            Some(format!(
+                "several models on the server, using '{}'. /models to list, /model NAME to switch",
+                chat[0]
+            )),
+        )),
+        // hosted: never guess
+        (_, false) => bail!(
+            "this profile has no model set, and {} offers {}. pick one with \
+             `thoth config`, or -m NAME. some of what it has:\n  {}",
+            client.base_url,
+            chat.len(),
+            chat.iter()
+                .take(15)
+                .map(|m| m.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ),
+    }
+}
+
+/// Drops the obvious non-chat entries a hosted /models list is full of.
+/// Conservative on purpose: anything unrecognised stays in.
+fn looks_like_chat_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    ![
+        "embed",
+        "whisper",
+        "tts",
+        "dall-e",
+        "moderation",
+        "rerank",
+        "audio",
+        "image",
+    ]
+    .iter()
+    .any(|bad| id.contains(bad))
+}
+
+/// Same rule as the transport probe: only a local address is one we may
+/// guess about.
+fn is_local(base_url: &str) -> bool {
+    let host = base_url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(base_url)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0")
+        || host.ends_with(".local")
+        || host.starts_with("192.168.")
+        || host.starts_with("10.")
 }
 
 /// `thoth config`: the screen with no arguments, and the three things that
@@ -231,6 +263,8 @@ async fn run_print_mode(
         .map_err(|_| anyhow!("agent task died"))?;
     let mut ctx_tokens = 0u64;
     let mut out_tokens = 0u64;
+    let mut spent = 0.0f64;
+    let mut priced = false;
     while let Some(ev) = ev_rx.recv().await {
         match ev {
             AgentEvent::Content(t) => {
@@ -283,17 +317,31 @@ async fn run_print_mode(
             AgentEvent::Info(t) => eprintln!("* {t}"),
             AgentEvent::Error(t) => eprintln!("error: {t}"),
             AgentEvent::ModelChanged(_) | AgentEvent::Connected { .. } => {}
+            AgentEvent::Models(models) => {
+                for m in models {
+                    eprintln!("  {m}");
+                }
+            }
             AgentEvent::TurnStart => {}
-            AgentEvent::Usage(u) => {
-                ctx_tokens = u.prompt_tokens;
-                out_tokens += u.completion_tokens;
+            AgentEvent::Usage { usage, cost } => {
+                ctx_tokens = usage.prompt_tokens;
+                out_tokens += usage.completion_tokens;
+                spent += cost.unwrap_or(0.0);
+                priced |= cost.is_some();
             }
             AgentEvent::TurnEnd => break,
         }
     }
     println!();
     if ctx_tokens > 0 {
-        eprintln!("* context {ctx_tokens} tokens, output {out_tokens} tokens");
+        eprintln!(
+            "* context {ctx_tokens} tokens, output {out_tokens} tokens{}",
+            if priced {
+                format!(", cost ${spent:.4}")
+            } else {
+                String::new()
+            }
+        );
     }
     Ok(())
 }

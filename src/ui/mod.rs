@@ -9,8 +9,8 @@ use crate::ui::input::{
     complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
 };
 use crate::ui::render::{
-    clip, expand_tabs, fmt_elapsed, fmt_k, home_relative, render_diff_body, render_markdown,
-    short_url, wrap_into,
+    clip, expand_tabs, fmt_elapsed, fmt_k, fmt_usd, home_relative, render_diff_body,
+    render_markdown, short_url, wrap_into,
 };
 use crate::ui::theme::{PROMPT, RULE, SPINNER};
 use anyhow::Result;
@@ -126,6 +126,8 @@ struct App {
     base_url: String,
     /// Config profile this session is running, when there is one.
     profile: Option<String>,
+    /// Last answer to /models, so `/model 3` can mean something.
+    models: Vec<String>,
     /// Open config screen; while it is up it owns the frame and the keys.
     config: Option<ConfigScreen>,
     blocks: Vec<ChatBlock>,
@@ -164,6 +166,10 @@ struct App {
     ctx_tokens: u64,
     /// completion tokens accumulated over the session.
     out_tokens: u64,
+    /// input tokens the provider served from its cache, this session.
+    cached_tokens: u64,
+    /// USD spent this session, when the profile carries prices.
+    spent: Option<f64>,
     cmd_tx: mpsc::UnboundedSender<AgentCmd>,
     cancel_slot: Arc<Mutex<CancellationToken>>,
 }
@@ -266,6 +272,7 @@ impl App {
             model,
             base_url,
             profile,
+            models: Vec::new(),
             config: None,
             blocks: vec![ChatBlock::Banner],
             input: String::new(),
@@ -291,6 +298,8 @@ impl App {
             cache_width: 0,
             ctx_tokens: 0,
             out_tokens: 0,
+            cached_tokens: 0,
+            spent: None,
             cmd_tx,
             cancel_slot,
         }
@@ -479,6 +488,24 @@ impl App {
             AgentEvent::Info(t) => self.blocks.push(ChatBlock::Info(t)),
             AgentEvent::Error(t) => self.blocks.push(ChatBlock::Error(t)),
             AgentEvent::ModelChanged(m) => self.model = m,
+            AgentEvent::Models(models) => {
+                let list = models
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        format!(
+                            "{:>3}. {m}{}",
+                            i + 1,
+                            if *m == self.model { "  (current)" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.blocks.push(ChatBlock::Info(format!(
+                    "models on this server:\n{list}\n/model NAME or /model NUMBER to switch"
+                )));
+                self.models = models;
+            }
             AgentEvent::Connected {
                 profile,
                 model,
@@ -498,9 +525,13 @@ impl App {
                     self.turn_start = Some(std::time::Instant::now());
                 }
             }
-            AgentEvent::Usage(u) => {
-                self.ctx_tokens = u.prompt_tokens;
-                self.out_tokens += u.completion_tokens;
+            AgentEvent::Usage { usage, cost } => {
+                self.ctx_tokens = usage.prompt_tokens;
+                self.out_tokens += usage.completion_tokens;
+                self.cached_tokens += usage.cached_tokens;
+                if let Some(c) = cost {
+                    self.spent = Some(self.spent.unwrap_or(0.0) + c);
+                }
             }
             AgentEvent::TurnEnd => {
                 if !matches!(self.mode, Mode::Perm(_)) {
@@ -733,16 +764,28 @@ impl App {
             }
             "status" => {
                 let up = self.session_start.elapsed().as_secs();
-                self.blocks.push(ChatBlock::Info(format!(
-                    "model:    {}\nserver:   {}\ncwd:      {}\ncontext:  {} tokens (last request)\noutput:   {} tokens (session)\nuptime:   {}m {}s",
+                let mut out = format!(
+                    "profile:  {}\nmodel:    {}\nserver:   {}\ncwd:      {}\ncontext:  {} tokens (last request)\noutput:   {} tokens (session)",
+                    self.profile.as_deref().unwrap_or("(none)"),
                     self.model,
                     self.base_url,
-                    std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+                    std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
                     self.ctx_tokens,
                     self.out_tokens,
-                    up / 60,
-                    up % 60,
-                )));
+                );
+                if self.cached_tokens > 0 {
+                    out.push_str(&format!(
+                        "\ncached:   {} input tokens came from the provider's cache",
+                        self.cached_tokens
+                    ));
+                }
+                if let Some(s) = self.spent {
+                    out.push_str(&format!("\ncost:     {} this session", fmt_usd(s)));
+                }
+                out.push_str(&format!("\nuptime:   {}m {}s", up / 60, up % 60));
+                self.blocks.push(ChatBlock::Info(out));
             }
             "init" => {
                 self.blocks.push(ChatBlock::User("/init".into()));
@@ -763,12 +806,29 @@ impl App {
                 let _ = self.cmd_tx.send(AgentCmd::ListModels);
             }
             "model" => {
-                if arg.is_empty() {
-                    self.blocks
-                        .push(ChatBlock::Info(format!("current model: {}", self.model)));
-                } else {
-                    self.set_busy();
-                    let _ = self.cmd_tx.send(AgentCmd::SetModel(arg.to_string()));
+                // a number picks from the last /models listing, which is
+                // easier than retyping "qwen/qwen3-235b-a22b-thinking"
+                let picked = arg
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| self.models.get(n.wrapping_sub(1)).cloned());
+                match (arg.is_empty(), picked) {
+                    (true, _) => self
+                        .blocks
+                        .push(ChatBlock::Info(format!("current model: {}", self.model))),
+                    (false, Some(name)) => {
+                        self.set_busy();
+                        let _ = self.cmd_tx.send(AgentCmd::SetModel(name));
+                    }
+                    (false, None) if arg.parse::<usize>().is_ok() => {
+                        self.blocks.push(ChatBlock::Error(
+                            "no model with that number. /models to list them".into(),
+                        ));
+                    }
+                    (false, None) => {
+                        self.set_busy();
+                        let _ = self.cmd_tx.send(AgentCmd::SetModel(arg.to_string()));
+                    }
                 }
             }
             _ => self
@@ -1038,6 +1098,9 @@ impl App {
                 None => format!("ctx {}", fmt_k(self.ctx_tokens)),
             });
             right_parts.push(format!("out {}", fmt_k(self.out_tokens)));
+        }
+        if let Some(s) = self.spent {
+            right_parts.push(fmt_usd(s));
         }
         if let Some(s) = &self.editor_status {
             right_parts.push(s.clone());

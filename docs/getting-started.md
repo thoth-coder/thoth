@@ -60,6 +60,23 @@ thoth --base-url http://localhost:8080/v1
 Other OpenAI-compatible servers (vLLM, LM Studio, ...) work the same way,
 just point `--base-url` at them.
 
+## With a hosted api
+
+Anthropic, OpenAI, Google and the aggregators all work. Put the endpoint,
+the key and the model in a profile:
+
+```sh
+thoth config
+```
+
+then start with it: `thoth -P claude`. thoth speaks Anthropic's own api
+(with prompt caching, which cuts the bill on long sessions) and the OpenAI
+api for everyone else. [Configuration](configuration.md) has a ready-made
+profile for each provider, and how to show what a session costs.
+
+A hosted endpoint offers hundreds of models, so thoth will not pick one for
+you: set `model` in the profile, or pass `-m`.
+
 ## One-shot mode
 
 ```sh

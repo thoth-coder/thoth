@@ -9,7 +9,7 @@
 | `glob` | find files by pattern, e.g. `**/*.rs` | auto |
 | `grep` | regex search over file contents, `context` shows surrounding lines | auto |
 | `problems` | current errors/warnings from the editor (needs the VS Code extension) | auto |
-| `web_search` | web search, DuckDuckGo by default, no API key needed | auto |
+| `web_search` | web search through DuckDuckGo, no API key needed | auto |
 | `web_fetch` | fetch a URL as readable text | asks per host |
 | `remember` | save a durable fact to project memory | asks first |
 | `write_file` | create a new file | asks first |

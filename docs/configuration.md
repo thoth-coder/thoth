@@ -44,32 +44,90 @@ active = "local"
 [profiles.local]
 base_url = "http://localhost:11434/v1"
 model = "qwen3:8b"
-num_ctx = 32768
+context_window = 32768
 think = false             # disable thinking (Ollama only), saves a lot of
                           # tokens on small windows
 
 [profiles.big]
 base_url = "http://192.168.1.10:11434/v1"
 model = "qwen3.6:35b"
-num_ctx = 65536
+context_window = 65536
 
-[profiles.hosted]
-base_url = "https://openrouter.ai/api/v1"
-api_key = "..."
-model = "..."
-temperature = 0.7
-max_turns = 40            # agent steps per request before pausing
-
-# Use Google for web_search instead of DuckDuckGo. Google has no free
-# scraping, so this needs a Programmable Search Engine:
-#   1. create an engine at https://programmablesearchengine.google.com (the "cx" id)
-#   2. get an API key at https://developers.google.com/custom-search/v1/introduction
-# Free tier is 100 queries/day. If Google fails, thoth falls back to DuckDuckGo.
-# google_api_key = "..."
-# google_cx = "..."
+[profiles.claude]
+api = "anthropic"         # native api, so prompt caching works
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-5"
+context_window = 200000
+max_tokens = 8192         # cap on one reply; anthropic requires one
+price_in = 3              # usd per million tokens, for the cost readout
+price_out = 15
+price_cached = 0.3
 ```
 
 Every field is optional. A profile only records what it changes.
+
+### Fields
+
+| field | meaning |
+|---|---|
+| `api` | `auto` (default), `openai`, `ollama` or `anthropic`. Auto reads the url, and asks a local server whether it is Ollama |
+| `base_url` | the endpoint |
+| `model` | empty asks the server, which only works for a local one |
+| `api_key` | bearer token, or `x-api-key` on Anthropic |
+| `headers` | extra request headers, for endpoints that want their own |
+| `context_window` | requested per call on Ollama; elsewhere it is what auto-compact measures against. Was called `num_ctx` |
+| `max_tokens` | cap on one reply |
+| `think` | force thinking on or off (Ollama) |
+| `temperature`, `max_turns` | sampling, and tool calls allowed per request |
+| `price_in`, `price_out`, `price_cached` | usd per million tokens |
+
+## Providers
+
+```toml
+[profiles.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+model = "gpt-5"
+price_in = 1.25
+price_out = 10
+
+[profiles.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key = "..."
+model = "gemini-2.5-pro"
+
+[profiles.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key = "sk-or-..."
+model = "anthropic/claude-sonnet-4.5"
+```
+
+Groq, DeepSeek, Together, Fireworks, xAI and Mistral follow the same shape.
+Check the provider's current prices before trusting the cost readout.
+
+Endpoints that do not take a bearer token need `headers`:
+
+```toml
+[profiles.azure]
+base_url = "https://NAME.openai.azure.com/openai/deployments/DEPLOYMENT"
+model = "gpt-4o"
+headers = { "api-key" = "..." }
+```
+
+## Cost
+
+Set `price_in` and `price_out` and the status bar shows what the session has
+spent, `/status` breaks it down, and `-p` prints it at the end. Nothing is
+shown when the prices are missing, which is the sane default for a local
+model that costs nothing.
+
+`price_cached` is the discounted rate for input the provider served from its
+cache. On the Anthropic transport thoth marks the system prompt, the tool
+schemas and the end of the history as cacheable, so a long session mostly
+re-reads instead of re-paying. Cache *writes* are billed slightly above the
+normal input rate; the readout counts them as normal input, so a real bill
+can be a few percent higher than what is shown.
 
 A config file from thoth 0.2 or earlier, with the settings at the top level
 and no profiles, still works: it is read as a profile named `default`, and
@@ -81,19 +139,22 @@ CLI flags, then environment variables, then the active profile, then the
 built-in defaults.
 
 Environment variables: `THOTH_PROFILE`, `THOTH_BASE_URL`, `THOTH_MODEL`,
-`THOTH_API_KEY`, `THOTH_TEMPERATURE`, `THOTH_NUM_CTX`, `THOTH_THINK`,
-`THOTH_GOOGLE_API_KEY`, `THOTH_GOOGLE_CX`.
+`THOTH_API_KEY`, `THOTH_TEMPERATURE`, `THOTH_CONTEXT_WINDOW` (or the older
+`THOTH_NUM_CTX`), `THOTH_THINK`.
 
 CLI flags: `-P/--profile`, `--base-url`, `-m/--model`, `--api-key`,
 `--temperature`, `-p/--prompt` for one-shot mode. See `thoth --help`.
 
 ## Context window notes
 
-`num_ctx` and `think` only work with Ollama, because thoth talks to Ollama
-through its native API where those are per-request options. Other servers
-use the standard OpenAI API, which has no such fields; the window is
-whatever the server was started with (`llama-server -c 16384`).
+Only Ollama takes the window as a per-request option, so only there does
+`context_window` (and `think`) change what the server does. Everywhere else
+the window is fixed by the server or the model, and the number in the
+profile is thoth's own yardstick: it is what auto-compact measures against,
+and it is what the `ctx 12.4k/200k` readout divides by. Leave it out and
+thoth simply stops guessing when to compact, so run `/compact` yourself.
 
 If the model stalls, rambles, or forgets files it just read, the window is
-almost always too small. Raise `num_ctx` (costs RAM/VRAM; `ollama ps` shows
-the active size), or set `think = false` for reasoning models.
+almost always too small. On Ollama raise `context_window` (costs RAM/VRAM;
+`ollama ps` shows the active size), or set `think = false` for reasoning
+models.

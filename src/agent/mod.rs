@@ -62,6 +62,8 @@ pub enum AgentEvent {
     Info(String),
     Error(String),
     ModelChanged(String),
+    /// Answer to /models: what the server offers, in its own order.
+    Models(Vec<String>),
     /// The session moved to another profile, server or context window.
     Connected {
         profile: Option<String>,
@@ -69,8 +71,12 @@ pub enum AgentEvent {
         base_url: String,
         num_ctx: Option<u32>,
     },
-    /// Token usage of the latest model call.
-    Usage(Usage),
+    /// Token usage of the latest model call, and what it cost when the
+    /// profile carries prices.
+    Usage {
+        usage: Usage,
+        cost: Option<f64>,
+    },
     /// A user request (possibly queued) started processing.
     TurnStart,
     TurnEnd,
@@ -78,9 +84,10 @@ pub enum AgentEvent {
 
 pub struct Agent {
     client: Client,
+    /// Settings of the running profile: turn budget and token prices.
+    cfg: crate::config::Config,
     messages: Vec<Message>,
     always_allow: HashSet<String>,
-    max_turns: usize,
     tx: mpsc::UnboundedSender<AgentEvent>,
     /// UI cancels the current generation/tool by cancelling the token in this slot.
     cancel_slot: Arc<Mutex<CancellationToken>>,
@@ -89,23 +96,38 @@ pub struct Agent {
     auto_compact_at: Option<u64>,
 }
 
+/// The window the conversation is measured against. Ollama is told what to
+/// use per request; every other api only knows what the profile claims, and
+/// says nothing when the profile is silent.
+pub fn window_of(client: &Client, cfg: &crate::config::Config) -> Option<u32> {
+    match client.transport {
+        crate::client::Transport::Ollama => Some(client.num_ctx),
+        _ => cfg.context_window,
+    }
+}
+
+/// Compact at 2/3 of the window, so the summary itself still has room to
+/// generate.
+pub fn compact_threshold(client: &Client, cfg: &crate::config::Config) -> Option<u64> {
+    window_of(client, cfg).map(|n| n as u64 * 2 / 3)
+}
+
 impl Agent {
     pub fn new(
         client: Client,
-        max_turns: usize,
+        cfg: crate::config::Config,
         tx: mpsc::UnboundedSender<AgentEvent>,
         cancel_slot: Arc<Mutex<CancellationToken>>,
-        auto_compact_at: Option<u64>,
     ) -> Self {
         Self {
+            auto_compact_at: compact_threshold(&client, &cfg),
             client,
+            cfg,
             messages: vec![Message::system(prompt::system_prompt())],
             always_allow: crate::agent::session::load_allow(),
-            max_turns,
             tx,
             cancel_slot,
             last_editor_note: None,
-            auto_compact_at,
         }
     }
 
@@ -118,37 +140,30 @@ impl Agent {
     /// all change mid-session.
     async fn use_profile(&mut self, name: &str, cfg: &crate::config::Config) {
         let keep_model = self.client.model.clone();
-        let mut client = Client::new(
-            cfg.base_url.clone(),
-            cfg.api_key.clone(),
-            cfg.temperature,
-            cfg.num_ctx,
-        );
-        client.detect_ollama().await;
-        client.think = cfg.think;
-        client.model = match cfg.model.clone() {
-            Some(m) => m,
-            // the profile leaves the model to the server: keep the one that is
-            // already running rather than blanking it
-            None => keep_model,
-        };
-        let is_ollama = client.transport == crate::client::Transport::Ollama;
-        self.auto_compact_at = is_ollama.then(|| client.num_ctx as u64 * 2 / 3);
-        self.max_turns = cfg.max_turns;
-        if let (Some(key), Some(cx)) = (cfg.google_api_key.clone(), cfg.google_cx.clone()) {
-            crate::tools::web::set_google(key, cx);
+        let mut client = Client::new(cfg);
+        client
+            .detect_transport(cfg.api != crate::config::Api::Auto)
+            .await;
+        if client.model.is_empty() {
+            // the profile leaves the model to the server: keep the one that
+            // is already running rather than blanking it
+            client.model = keep_model;
         }
+        self.auto_compact_at = compact_threshold(&client, cfg);
+        self.cfg = cfg.clone();
         let (model, base_url) = (client.model.clone(), client.base_url.clone());
+        let window = window_of(&client, cfg);
         self.client = client;
         self.send(AgentEvent::Connected {
             profile: Some(name.to_string()),
             model: model.clone(),
             base_url: base_url.clone(),
-            num_ctx: is_ollama.then_some(self.client.num_ctx),
+            num_ctx: window,
         });
         self.send(AgentEvent::Info(format!(
-            "profile {name}: {model} at {base_url}{}",
-            match is_ollama.then_some(self.client.num_ctx) {
+            "profile {name}: {model} at {base_url} over the {} api{}",
+            self.client.transport.name(),
+            match window {
                 Some(n) => format!(", context window {n} tokens"),
                 None => String::new(),
             }
@@ -188,14 +203,7 @@ impl Agent {
                     self.send(AgentEvent::Info(format!("model set to {m}")));
                 }
                 AgentCmd::ListModels => match self.client.models().await {
-                    Ok(models) => self.send(AgentEvent::Info(format!(
-                        "available models:\n{}",
-                        models
-                            .iter()
-                            .map(|m| format!("  {m}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ))),
+                    Ok(models) => self.send(AgentEvent::Models(models)),
                     Err(e) => self.send(AgentEvent::Error(format!("{e:#}"))),
                 },
                 AgentCmd::Clear => {
@@ -375,7 +383,7 @@ impl Agent {
         let mut compact_pending = false;
         let mut truncations = 0u32;
 
-        for _ in 0..self.max_turns {
+        for _ in 0..self.cfg.max_turns {
             let token = CancellationToken::new();
             *self.cancel_slot.lock().unwrap() = token.clone();
 
@@ -396,7 +404,10 @@ impl Agent {
                 {
                     compact_pending = true;
                 }
-                self.send(AgentEvent::Usage(u));
+                self.send(AgentEvent::Usage {
+                    usage: u,
+                    cost: self.cfg.cost(&u),
+                });
             }
             let trimmed = turn.content.trim();
             let content = if trimmed.is_empty() {
@@ -520,7 +531,7 @@ impl Agent {
         self.send(AgentEvent::Info(format!(
             "paused after {} agent steps (safety limit). say \"continue\" to keep going, or \
              raise max_turns in the config",
-            self.max_turns
+            self.cfg.max_turns
         )));
         Ok(())
     }
@@ -586,13 +597,16 @@ mod tests {
     #[tokio::test]
     async fn user_command_runs_and_enters_the_conversation() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let client = Client::new("http://127.0.0.1:1".into(), None, None, None);
+        let cfg = crate::config::resolve(&crate::config::Profile {
+            base_url: Some("http://127.0.0.1:1".into()),
+            max_turns: Some(1),
+            ..Default::default()
+        });
         let mut agent = Agent::new(
-            client,
-            1,
+            Client::new(&cfg),
+            cfg,
             tx,
             Arc::new(Mutex::new(CancellationToken::new())),
-            None,
         );
         agent.run_user_command("echo hello-from-thoth").await;
 

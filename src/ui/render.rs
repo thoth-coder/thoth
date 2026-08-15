@@ -37,6 +37,16 @@ pub fn short_url(url: &str) -> String {
         .to_string()
 }
 
+/// Money, with enough decimals to be worth printing: a session that has
+/// cost half a cent should not read "$0.00".
+pub fn fmt_usd(v: f64) -> String {
+    if v < 1.0 {
+        format!("${v:.3}")
+    } else {
+        format!("${v:.2}")
+    }
+}
+
 /// Path with the home directory folded back to `~`, so the banner does not
 /// spell out the user's account name.
 pub fn home_relative(path: &std::path::Path) -> String {

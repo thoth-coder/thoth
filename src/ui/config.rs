@@ -23,56 +23,72 @@ pub enum ConfigAction {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Field {
+    Api,
     BaseUrl,
     Model,
     ApiKey,
-    NumCtx,
+    Headers,
+    ContextWindow,
+    MaxTokens,
     Think,
     Temperature,
     MaxTurns,
-    GoogleKey,
-    GoogleCx,
+    PriceIn,
+    PriceOut,
+    PriceCached,
 }
 
 use Field::*;
-const FIELDS: [Field; 9] = [
+const FIELDS: [Field; 13] = [
+    Api,
     BaseUrl,
     Model,
     ApiKey,
-    NumCtx,
+    Headers,
+    ContextWindow,
+    MaxTokens,
     Think,
     Temperature,
     MaxTurns,
-    GoogleKey,
-    GoogleCx,
+    PriceIn,
+    PriceOut,
+    PriceCached,
 ];
 
 impl Field {
     fn label(self) -> &'static str {
         match self {
+            Api => "api",
             BaseUrl => "base url",
             Model => "model",
             ApiKey => "api key",
-            NumCtx => "num_ctx",
+            Headers => "headers",
+            ContextWindow => "context window",
+            MaxTokens => "max tokens",
             Think => "think",
             Temperature => "temperature",
             MaxTurns => "max turns",
-            GoogleKey => "google key",
-            GoogleCx => "google cx",
+            PriceIn => "$ / M in",
+            PriceOut => "$ / M out",
+            PriceCached => "$ / M cached",
         }
     }
 
     fn hint(self) -> &'static str {
         match self {
-            BaseUrl => "openai-compatible endpoint, e.g. http://localhost:11434/v1",
-            Model => "empty = ask the server and take the first model",
-            ApiKey => "only if the server wants one. stored owner-only",
-            NumCtx => "context window to request. ollama native api only",
+            Api => "wire protocol. auto reads the url and asks a local server",
+            BaseUrl => "endpoint, e.g. http://localhost:11434/v1 or https://api.anthropic.com/v1",
+            Model => "empty asks the server, which only works for a local one",
+            ApiKey => "sent as a bearer token, or x-api-key on anthropic",
+            Headers => "extra request headers. edit them in the config file",
+            ContextWindow => "requested per call on ollama; elsewhere it is what auto-compact uses",
+            MaxTokens => "cap on one reply. anthropic needs one, others default",
             Think => "force thinking on or off. off helps small windows",
             Temperature => "empty = whatever the server defaults to",
             MaxTurns => "tool calls allowed in one turn before thoth stops",
-            GoogleKey => "set both google fields to use google instead of duckduckgo",
-            GoogleCx => "programmable search engine id",
+            PriceIn => "usd per million input tokens, for the running cost",
+            PriceOut => "usd per million output tokens",
+            PriceCached => "usd per million cached input tokens, when discounted",
         }
     }
 
@@ -84,35 +100,48 @@ impl Field {
             Some(s) if !s.is_empty() => (s.clone(), true),
             _ => (format!("({d})"), false),
         };
+        let number = |v: Option<String>, d: &str| match v {
+            Some(s) => (s, true),
+            None => (format!("({d})"), false),
+        };
         match self {
+            Api => match p.api.unwrap_or_default() {
+                crate::config::Api::Auto => ("(auto)".into(), false),
+                crate::config::Api::Openai => ("openai".into(), true),
+                crate::config::Api::Ollama => ("ollama".into(), true),
+                crate::config::Api::Anthropic => ("anthropic".into(), true),
+            },
             BaseUrl => or_default(&p.base_url, crate::config::DEFAULT_BASE_URL),
             Model => or_default(&p.model, "ask the server"),
             ApiKey => match &p.api_key {
                 Some(k) if !k.is_empty() => ("•".repeat(k.chars().count().min(16)), true),
                 _ => ("(not set)".into(), false),
             },
-            GoogleKey => match &p.google_api_key {
-                Some(k) if !k.is_empty() => ("•".repeat(k.chars().count().min(16)), true),
-                _ => ("(not set)".into(), false),
+            Headers => match p.headers.len() {
+                0 => ("(none)".into(), false),
+                n => (format!("{n} set in the config file"), true),
             },
-            GoogleCx => or_default(&p.google_cx, "not set"),
-            NumCtx => match p.num_ctx {
-                Some(n) => (n.to_string(), true),
-                None => (format!("({})", crate::client::DEFAULT_NUM_CTX), false),
-            },
+            ContextWindow => number(
+                p.context_window.map(|n| n.to_string()),
+                &format!(
+                    "{} on ollama, unknown elsewhere",
+                    crate::client::DEFAULT_NUM_CTX
+                ),
+            ),
+            MaxTokens => number(p.max_tokens.map(|n| n.to_string()), "server default"),
             Think => match p.think {
                 Some(true) => ("on".into(), true),
                 Some(false) => ("off".into(), true),
                 None => ("(model default)".into(), false),
             },
-            Temperature => match p.temperature {
-                Some(t) => (format!("{t}"), true),
-                None => ("(server default)".into(), false),
-            },
-            MaxTurns => match p.max_turns {
-                Some(n) => (n.to_string(), true),
-                None => (format!("({})", crate::config::DEFAULT_MAX_TURNS), false),
-            },
+            Temperature => number(p.temperature.map(|t| t.to_string()), "server default"),
+            MaxTurns => number(
+                p.max_turns.map(|n| n.to_string()),
+                &crate::config::DEFAULT_MAX_TURNS.to_string(),
+            ),
+            PriceIn => number(p.price_in.map(|v| v.to_string()), "no cost shown"),
+            PriceOut => number(p.price_out.map(|v| v.to_string()), "no cost shown"),
+            PriceCached => number(p.price_cached.map(|v| v.to_string()), "same as input"),
         }
     }
 
@@ -122,20 +151,28 @@ impl Field {
             BaseUrl => p.base_url.clone().unwrap_or_default(),
             Model => p.model.clone().unwrap_or_default(),
             ApiKey => p.api_key.clone().unwrap_or_default(),
-            GoogleKey => p.google_api_key.clone().unwrap_or_default(),
-            GoogleCx => p.google_cx.clone().unwrap_or_default(),
-            NumCtx => p.num_ctx.map(|n| n.to_string()).unwrap_or_default(),
+            ContextWindow => p.context_window.map(|n| n.to_string()).unwrap_or_default(),
+            MaxTokens => p.max_tokens.map(|n| n.to_string()).unwrap_or_default(),
             Temperature => p.temperature.map(|t| t.to_string()).unwrap_or_default(),
             MaxTurns => p.max_turns.map(|n| n.to_string()).unwrap_or_default(),
-            Think => String::new(),
+            PriceIn => p.price_in.map(|v| v.to_string()).unwrap_or_default(),
+            PriceOut => p.price_out.map(|v| v.to_string()).unwrap_or_default(),
+            PriceCached => p.price_cached.map(|v| v.to_string()).unwrap_or_default(),
+            // cycled with space, or not editable here at all
+            Api | Think | Headers => String::new(),
         }
+    }
+
+    /// Cycled with space instead of typed into.
+    fn is_toggle(self) -> bool {
+        matches!(self, Api | Think)
     }
 
     /// Writes an edited value back. An empty string unsets the field.
     fn set(self, p: &mut Profile, raw: &str) -> Result<(), String> {
         let raw = raw.trim();
         let text = (!raw.is_empty()).then(|| raw.to_string());
-        let number = |what: &str| -> Result<Option<u32>, String> {
+        let whole = |what: &str| -> Result<Option<u32>, String> {
             match text.as_deref() {
                 None => Ok(None),
                 Some(s) => s
@@ -144,14 +181,26 @@ impl Field {
                     .map_err(|_| format!("{what} must be a whole number")),
             }
         };
+        let money = |what: &str| -> Result<Option<f64>, String> {
+            match text.as_deref() {
+                None => Ok(None),
+                Some(s) => s
+                    .trim_start_matches('$')
+                    .parse::<f64>()
+                    .map(Some)
+                    .map_err(|_| format!("{what} must be a number, e.g. 3 or 0.25")),
+            }
+        };
         match self {
             BaseUrl => p.base_url = text,
             Model => p.model = text,
             ApiKey => p.api_key = text,
-            GoogleKey => p.google_api_key = text,
-            GoogleCx => p.google_cx = text,
-            NumCtx => p.num_ctx = number("num_ctx")?,
-            MaxTurns => p.max_turns = number("max turns")?.map(|n| n.max(1) as usize),
+            ContextWindow => p.context_window = whole("context window")?,
+            MaxTokens => p.max_tokens = whole("max tokens")?,
+            MaxTurns => p.max_turns = whole("max turns")?.map(|n| n.max(1) as usize),
+            PriceIn => p.price_in = money("price")?,
+            PriceOut => p.price_out = money("price")?,
+            PriceCached => p.price_cached = money("price")?,
             Temperature => {
                 p.temperature = match text.as_deref() {
                     None => None,
@@ -161,9 +210,33 @@ impl Field {
                     ),
                 }
             }
-            Think => {}
+            Api | Think | Headers => {}
         }
         Ok(())
+    }
+
+    /// Space on a toggle field: think is on/off/default, api rotates through
+    /// the protocols.
+    fn cycle(self, p: &mut Profile) {
+        match self {
+            Think => {
+                p.think = match p.think {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                }
+            }
+            Api => {
+                use crate::config::Api as A;
+                p.api = match p.api.unwrap_or_default() {
+                    A::Auto => Some(A::Openai),
+                    A::Openai => Some(A::Ollama),
+                    A::Ollama => Some(A::Anthropic),
+                    A::Anthropic => None,
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -294,7 +367,7 @@ impl ConfigScreen {
             KeyCode::Up => self.move_sel(-1),
             KeyCode::Down => self.move_sel(1),
             KeyCode::Enter => return self.enter(),
-            KeyCode::Char(' ') if self.pane == Pane::Fields => self.cycle_think(),
+            KeyCode::Char(' ') if self.pane == Pane::Fields => self.cycle_field(),
             KeyCode::Char('a') if self.pane == Pane::Profiles => {
                 if let Some(n) = self.current().cloned() {
                     self.store.active = Some(n.clone());
@@ -351,8 +424,10 @@ impl ConfigScreen {
             }
             Pane::Fields => {
                 let field = FIELDS[self.field];
-                if field == Think {
-                    self.cycle_think();
+                if field == Headers {
+                    self.fail("headers are edited in the config file");
+                } else if field.is_toggle() {
+                    self.cycle_field();
                 } else {
                     let raw = field.raw(&self.profile());
                     self.editing = Some(Editing {
@@ -375,19 +450,15 @@ impl ConfigScreen {
         });
     }
 
-    fn cycle_think(&mut self) {
-        if FIELDS[self.field] != Think {
+    fn cycle_field(&mut self) {
+        let field = FIELDS[self.field];
+        if !field.is_toggle() {
             return;
         }
         let Some(name) = self.current().cloned() else {
             return;
         };
-        let p = self.store.profiles.entry(name).or_default();
-        p.think = match p.think {
-            None => Some(true),
-            Some(true) => Some(false),
-            Some(false) => None,
-        };
+        field.cycle(self.store.profiles.entry(name).or_default());
         self.dirty = true;
     }
 
@@ -638,9 +709,9 @@ impl ConfigScreen {
             if editing_field == Some(*field) {
                 let e = self.editing.as_ref().expect("editing");
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{:<13}", field.label()), theme::muted()),
+                    Span::styled(format!("{:<15}", field.label()), theme::muted()),
                     Span::styled(
-                        clip(&e.buf, width.saturating_sub(15)),
+                        clip(&e.buf, width.saturating_sub(17)),
                         Style::default().add_modifier(Modifier::UNDERLINED),
                     ),
                     Span::styled("_", theme::accent()),
@@ -654,8 +725,8 @@ impl ConfigScreen {
                 (false, false) => theme::muted_italic(),
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<13}", field.label()), theme::muted()),
-                Span::styled(clip(&value, width.saturating_sub(14)), value_style),
+                Span::styled(format!("{:<15}", field.label()), theme::muted()),
+                Span::styled(clip(&value, width.saturating_sub(16)), value_style),
             ]));
         }
         if self.pane == Pane::Fields {
@@ -767,15 +838,20 @@ mod tests {
         s.store.profiles.insert(
             "workstation".into(),
             Profile {
-                base_url: Some("http://192.168.1.10:11434/v1".into()),
-                model: Some("qwen3.6:35b".into()),
-                num_ctx: Some(65536),
+                base_url: Some("https://api.anthropic.com/v1".into()),
+                api: Some(crate::config::Api::Anthropic),
+                api_key: Some("sk-ant-secret".into()),
+                model: Some("claude-sonnet-4-5".into()),
+                context_window: Some(200_000),
+                price_in: Some(3.0),
+                price_out: Some(15.0),
+                price_cached: Some(0.3),
                 ..Default::default()
             },
         );
         s.sel = 2;
         s.pane = Pane::Fields;
-        s.field = 3;
+        s.field = 5;
         println!("\n{}", render(&s));
     }
 
@@ -792,7 +868,8 @@ mod tests {
     #[test]
     fn editing_a_field_writes_it_back() {
         let mut s = screen(&["local"]);
-        s.on_key(key(KeyCode::Tab)); // into the fields pane, base url first
+        s.on_key(key(KeyCode::Tab)); // into the fields pane
+        s.on_key(key(KeyCode::Down)); // past the api toggle, onto base url
         s.on_key(key(KeyCode::Enter));
         for c in "http://box:11434/v1".chars() {
             s.on_key(key(KeyCode::Char(c)));
@@ -810,13 +887,13 @@ mod tests {
     fn rejects_a_number_field_that_is_not_a_number() {
         let mut s = screen(&["local"]);
         s.pane = Pane::Fields;
-        s.field = FIELDS.iter().position(|f| *f == NumCtx).unwrap();
+        s.field = FIELDS.iter().position(|f| *f == ContextWindow).unwrap();
         s.on_key(key(KeyCode::Enter));
         for c in "lots".chars() {
             s.on_key(key(KeyCode::Char(c)));
         }
         s.on_key(key(KeyCode::Enter));
-        assert_eq!(s.store.get("local").num_ctx, None);
+        assert_eq!(s.store.get("local").context_window, None);
         assert!(
             s.status.as_ref().unwrap().1,
             "should be flagged as an error"

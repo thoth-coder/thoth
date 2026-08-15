@@ -1,7 +1,8 @@
 # Thoth
 
-Agentic coding assistant (TUI) for self-hosted LLMs via Ollama or any
-OpenAI-compatible server. Rust, edition 2024.
+Agentic coding assistant (TUI). Talks to self-hosted models through Ollama
+or any OpenAI-compatible server, and to hosted apis (Anthropic natively,
+OpenAI/Google/OpenRouter over the OpenAI api). Rust, edition 2024.
 
 ## Build and test
 
@@ -31,11 +32,13 @@ cover. There is no `tests/` directory, don't add one.
   that session state and the editor bridge also use. Reads the pre-0.3 file
   (flat, in the platform config dir) as a profile called `default`. A new setting means all of `Config`, `Profile`,
   `resolve`, the field list in `ui/config.rs` and `docs/configuration.md`.
-- `client.rs`: LLM transport. Two paths: OpenAI-compatible SSE
-  (`/chat/completions`) and Ollama native (`/api/chat`, auto-detected via
-  `/api/version`) which allows setting `num_ctx` per request. Streams
-  content, thinking and tool-call deltas. `ThinkFilter` routes inline
-  `<think>` tags to reasoning.
+- `client.rs`: LLM transport. Three paths: OpenAI-compatible SSE
+  (`/chat/completions`), Ollama native (`/api/chat`, which allows setting
+  the context window per request) and Anthropic native (`/v1/messages`,
+  which allows prompt caching). `auto` picks by url, and only probes
+  `/api/version` on a local address: a paid endpoint must never see a
+  request to a path we guessed. Streams content, thinking and tool-call
+  deltas. `ThinkFilter` routes inline `<think>` tags to reasoning.
 - `agent/mod.rs`: the agentic loop (model call, tool calls, results, repeat).
   Owns conversation history, permission gating, duplicate-call breaker,
   auto-compact at 2/3 of the window, truncation recovery, /compact, /recap,
@@ -48,9 +51,9 @@ cover. There is no `tests/` directory, don't add one.
   persistent permission allowlist. Written atomically, owner-only on unix.
 - `tools/`: `fs.rs` (read/write/edit, read-coverage registry, unified
   diffs), `search.rs` (grep with optional context lines), `shell.rs`
-  (foreground with timeout, background mode), `web.rs` (DuckDuckGo or
-  Google CSE, html to text), `memory.rs` (project memory, session recap,
-  project key), `mod.rs` (tool schemas, dispatch, permission rules).
+  (foreground with timeout, background mode), `web.rs` (DuckDuckGo search,
+  html to text), `memory.rs` (project memory, session recap, project key),
+  `mod.rs` (tool schemas, dispatch, permission rules).
 - `editor.rs`: VS Code awareness. Reads state files written by the
   companion extension (thoth-for-vscode) from `~/.thoth/ide/`, falls back
   to window titles on Windows.

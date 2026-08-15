@@ -1,15 +1,11 @@
+//! web_search and web_fetch. Search goes through DuckDuckGo's html endpoint,
+//! which needs no key and no account. A pluggable search backend is worth
+//! having later; until then this is the only one.
+
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
-use std::sync::OnceLock;
 use std::time::Duration;
-
-/// (api_key, cx) for Google Programmable Search, if the user configured it.
-static GOOGLE: OnceLock<(String, String)> = OnceLock::new();
-
-pub fn set_google(api_key: String, cx: String) {
-    let _ = GOOGLE.set((api_key, cx));
-}
 
 const UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) thoth/0.1";
@@ -30,65 +26,7 @@ pub struct SearchArgs {
 }
 
 pub async fn search(a: SearchArgs) -> Result<String> {
-    if let Some((key, cx)) = GOOGLE.get() {
-        match google_search(key, cx, &a.query).await {
-            Ok(r) => return Ok(r),
-            Err(e) => {
-                // fall back to DuckDuckGo so search still works
-                let ddg = ddg_search(&a.query).await?;
-                return Ok(format!(
-                    "(google search failed: {e:#}; results below are from DuckDuckGo)\n\n{ddg}"
-                ));
-            }
-        }
-    }
     ddg_search(&a.query).await
-}
-
-async fn google_search(key: &str, cx: &str, query: &str) -> Result<String> {
-    #[derive(Deserialize)]
-    struct Item {
-        title: String,
-        link: String,
-        #[serde(default)]
-        snippet: String,
-    }
-    #[derive(Deserialize)]
-    struct R {
-        #[serde(default)]
-        items: Vec<Item>,
-    }
-    let resp = http()?
-        .get("https://www.googleapis.com/customsearch/v1")
-        .query(&[("key", key), ("cx", cx), ("q", query), ("num", "8")])
-        .send()
-        .await
-        .context("google search request failed")?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let short: String = body.chars().take(300).collect();
-        bail!("google api returned {status}: {short}");
-    }
-    let r: R = serde_json::from_str(&body).context("unexpected google api response")?;
-    if r.items.is_empty() {
-        return Ok("No results found.".into());
-    }
-    let mut out = String::new();
-    for (i, item) in r.items.iter().take(MAX_RESULTS).enumerate() {
-        out.push_str(&format!("{}. {}\n   {}\n", i + 1, item.title, item.link));
-        if !item.snippet.is_empty() {
-            out.push_str(&format!(
-                "   {}\n",
-                item.snippet
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
-        }
-    }
-    out.push_str("\nUse web_fetch with a URL to read a page.");
-    Ok(out)
 }
 
 async fn ddg_search(query: &str) -> Result<String> {
@@ -272,15 +210,6 @@ mod tests {
         let out = ddg_search("rust programming language").await.unwrap();
         assert!(out.contains("1."), "no results: {out}");
         assert!(out.contains("http"), "no links: {out}");
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn google_bad_key_reports_error() {
-        let err = google_search("bad-key", "bad-cx", "rust")
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("google"), "{err:#}");
     }
 
     #[tokio::test]
