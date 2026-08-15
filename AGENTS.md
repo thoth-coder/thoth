@@ -22,6 +22,11 @@ compiles on one side fails the matrix.
 Tests live in a `#[cfg(test)] mod tests` at the bottom of the file they
 cover. There is no `tests/` directory, don't add one.
 
+A file past roughly a thousand lines is a sign it holds two things: split it
+into a module directory (`client/`) or a sibling (`ui/screen.rs`) rather than
+letting it grow. A child module sees its parent's private items, so a split
+along those lines needs no new `pub`.
+
 ## Architecture (src/)
 
 - `main.rs`: CLI args and subcommands, config resolution, model discovery,
@@ -32,13 +37,17 @@ cover. There is no `tests/` directory, don't add one.
   that session state and the editor bridge also use. Reads the pre-0.3 file
   (flat, in the platform config dir) as a profile called `default`. A new setting means all of `Config`, `Profile`,
   `resolve`, the field list in `ui/config.rs` and `docs/configuration.md`.
-- `client.rs`: LLM transport. Three paths: OpenAI-compatible SSE
-  (`/chat/completions`), Ollama native (`/api/chat`, which allows setting
-  the context window per request) and Anthropic native (`/v1/messages`,
-  which allows prompt caching). `auto` picks by url, and only probes
-  `/api/version` on a local address: a paid endpoint must never see a
-  request to a path we guessed. Streams content, thinking and tool-call
-  deltas. `ThinkFilter` routes inline `<think>` tags to reasoning.
+- `client/`: LLM transport, one module per wire protocol. `mod.rs` holds
+  the message shape, the `Client` and the transport choice: `auto` picks by
+  url and only probes `/api/version` on a local address, because a paid
+  endpoint must never see a request to a path we guessed. `openai.rs` is
+  OpenAI-compatible SSE (`/chat/completions`), `ollama.rs` the native
+  `/api/chat` (which takes the context window per request), `anthropic.rs`
+  the native `/v1/messages` (which allows prompt caching). `stream.rs` is
+  what both text protocols need: `ThinkFilter` routes inline `<think>` tags
+  to reasoning, `ToolTextFilter` reads a tool call a model wrote as text,
+  and `TextStream` is the pair of them, so neither transport grows its own
+  copy.
 - `agent/mod.rs`: the agentic loop (model call, tool calls, results, repeat).
   Owns conversation history, permission gating, duplicate-call breaker,
   auto-compact at 2/3 of the window, truncation recovery, /compact, /recap,
@@ -56,18 +65,22 @@ cover. There is no `tests/` directory, don't add one.
 - `agent/session.rs`: per-project state under
   `~/.thoth/projects/<key>/`: saved transcript for `--continue` and the
   persistent permission allowlist. Written atomically, owner-only on unix.
-- `tools/`: `fs.rs` (read/write/edit, read-coverage registry, unified
-  diffs), `search.rs` (grep with optional context lines), `shell.rs`
-  (foreground with timeout, background mode), `web.rs` (DuckDuckGo search,
-  html to text), `memory.rs` (project memory, session recap, project key),
-  `mod.rs` (tool schemas, dispatch, permission rules).
+- `tools/`: `fs.rs` (read/write/edit/multi_edit/move/delete, read-coverage
+  registry, unified diffs, line-ending alignment), `search.rs` (grep with
+  optional context lines), `shell.rs` (foreground with timeout, background
+  mode), `web.rs` (DuckDuckGo search, html to text), `memory.rs` (project
+  memory, session recap, project key), `todo.rs` (the plan for the task),
+  `mod.rs` (tool schemas, dispatch, permission rules, `output_cap`).
 - `editor.rs`: VS Code awareness. Reads state files written by the
   companion extension (thoth-for-vscode) from `~/.thoth/ide/`, falls back
   to window titles on Windows.
-- `ui/mod.rs`: ratatui interface. Transcript with an incremental wrap cache,
-  streaming, permission prompts, input history, mouse scroll, ctrl+o.
-  `ui/render.rs` turns blocks into styled lines, `ui/theme.rs` holds colors
-  and glyphs, `ui/input.rs` handles `@path` attachments and completion.
+- `ui/mod.rs`: ratatui interface. The state and everything that changes it:
+  terminal and agent events, keys, slash commands, the transcript blocks.
+  `ui/screen.rs` is the other half, the drawing, including the incremental
+  wrap cache; it is a child module, so it reads `App`'s private fields
+  without any of them being made public. `ui/render.rs` turns text into
+  styled lines (markdown, diffs, wrapping), `ui/theme.rs` holds colors and
+  glyphs, `ui/input.rs` handles `@path` attachments and completion.
 - `ui/config.rs`: the profile screen. One struct drives both `thoth config`
   (its own event loop) and `/config` (the App holds it and forwards keys),
   so the two cannot drift. Saving hands back a `Config` that the agent

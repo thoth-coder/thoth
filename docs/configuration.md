@@ -14,20 +14,20 @@ and from inside a session, `/config` (or `/cfg`). Saving there applies the
 profile to the running session right away: the model, server, context
 window and turn budget change, the conversation stays.
 
-The screen is one column: every profile, a row to add one, then the settings
-of whichever profile you last stood on (the divider says which). `up`/`down`
-moves through all of it, `tab` jumps from the list straight to the settings,
-and the row you are on decides what the keys do, which the bottom line
-always spells out.
+The screen has two pages. The first is the profiles and nothing else:
+`up`/`down` moves, `enter` opens the one you are on, `n` adds one, `r`
+renames, `d` deletes, `a` makes it the active profile, the one thoth starts
+with. `enter` on the last row (`+ new profile`) adds one too.
 
+The second page is that profile's settings, one row each, the essential four
+first and the rest under an `advanced` divider. `esc` goes back to the list.
 On a setting: **type to replace it**, or `enter` to edit what is there.
 `enter` keeps the value, `tab` keeps it and moves down, `esc` throws the
 edit away. `space` flips the ones that are a choice rather than text (`api`,
 `think`). Api keys show as dots until you open them.
 
-In the profile list: `n` adds one, `r` renames, `d` deletes, `a` makes it
-the active one, the profile thoth starts with. `←`/`→` also switches
-profile from anywhere on the screen.
+The row you are on decides what the keys do, and the bottom line always
+spells it out.
 
 `ctrl+s` saves. `esc` leaves, and asks first if anything is unsaved. A new
 profile starts by asking which endpoint it talks to, so the url is filled

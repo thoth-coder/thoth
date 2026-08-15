@@ -15,7 +15,8 @@ example.com).
 
 ## Before opening a PR
 
-- `cargo clippy -- -D warnings` passes. CI fails on any warning.
+- `cargo fmt`, then `cargo clippy -- -D warnings` passes. CI fails on any
+  warning.
 - `cargo test` passes. Run the ignored tests too if you touched
   `tools/web.rs`.
 - If you changed agent behavior, try it against a real local model at least
@@ -31,8 +32,10 @@ before write, permission gating), enforce it in Rust.
 Everything the agent does to the user's machine has to be visible: full
 shell command lines, full diffs, even when auto-approved.
 
-Tool output is budgeted for 16-32k context windows. Don't add unbounded
-output paths.
+Everything sent on every request is budgeted against the context window,
+not against a number someone once picked. Don't add an unbounded output
+path, and a tool that cuts its own output has to say what it cut and how to
+get the rest.
 
 Windows, Linux and macOS all matter. Prefer runtime `cfg!(windows)` branches
 so both sides get compile-checked everywhere.

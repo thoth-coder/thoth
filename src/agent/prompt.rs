@@ -314,8 +314,6 @@ mod budget {
     #[test]
     #[ignore]
     fn prompt_budget() {
-        let prompt = super::system_prompt(None, 40);
-        let tools = crate::tools::definitions(crate::editor::connected()).to_string();
         let est = |s: &str| s.len() / 4;
         let situational = super::situational_rules(true, true).len()
             - super::situational_rules(false, false).len()
@@ -326,7 +324,6 @@ mod budget {
              ~{} tokens, dropped when they do not apply",
             situational / 4
         );
-        let _ = (&prompt, &tools);
         println!("\n window   prompt   tools   fixed total   share of the window");
         for w in [8_192u32, 16_384, 32_768, 200_000] {
             let prompt = est(&super::system_prompt(Some(w), 40));

@@ -10,6 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// How long extension state stays valid. The extension heartbeats every 60s.
 const STATE_TTL_SECS: u64 = 300;
 const MAX_NOTE_DIAGNOSTICS: usize = 15;
+/// The note goes into every single request, so it is budgeted like anything
+/// else that does. A selection can be a whole file, and one diagnostic can be
+/// a page of a type error.
+const MAX_SELECTED_CHARS: usize = 2_000;
+const MAX_DIAGNOSTIC_CHARS: usize = 200;
 
 pub struct EditorContext {
     /// Full context injected into the model prompt.
@@ -184,6 +189,18 @@ pub fn diagnostics_report() -> String {
     out
 }
 
+/// Text with a ceiling, saying so when it hits one.
+fn cut(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!(
+        "{head}\n... (cut, {} characters in total)",
+        s.chars().count()
+    )
+}
+
 fn context_from_state(s: &IdeState) -> EditorContext {
     let ide = s.ide.as_deref().unwrap_or("the editor");
     let mut note = format!("The user is working in {ide}.");
@@ -207,7 +224,10 @@ fn context_from_state(s: &IdeState) -> EditorContext {
     if let Some(t) = &s.selected_text
         && !t.trim().is_empty()
     {
-        note.push_str(&format!("\nSelected text:\n```\n{t}\n```"));
+        note.push_str(&format!(
+            "\nSelected text:\n```\n{}\n```",
+            cut(t, MAX_SELECTED_CHARS)
+        ));
     }
     if !s.diagnostics.is_empty() {
         let total = s.diagnostics.len();
@@ -215,13 +235,19 @@ fn context_from_state(s: &IdeState) -> EditorContext {
         for d in s.diagnostics.iter().take(MAX_NOTE_DIAGNOSTICS) {
             note.push_str(&format!(
                 "\n- {}:{} {}: {}",
-                d.file, d.line, d.severity, d.message
+                d.file,
+                d.line,
+                d.severity,
+                cut(&d.message, MAX_DIAGNOSTIC_CHARS)
             ));
         }
         if total > MAX_NOTE_DIAGNOSTICS {
             note.push_str(&format!("\n- ... +{} more", total - MAX_NOTE_DIAGNOSTICS));
         }
-        label_parts.push(format!("{total} problems"));
+        label_parts.push(match total {
+            1 => "1 problem".to_string(),
+            n => format!("{n} problems"),
+        });
     }
     let label = if label_parts.is_empty() {
         ide.to_string()
@@ -429,6 +455,30 @@ mod tests {
         assert!(ctx.note.contains("src/main.rs (lines 5-10 selected)"));
         assert!(ctx.note.contains("fn main() {}"));
         assert!(ctx.note.contains("src/lib.rs:3 error: mismatched types"));
-        assert_eq!(ctx.label, "src/main.rs (5-10), 1 problems");
+        assert_eq!(ctx.label, "src/main.rs (5-10), 1 problem");
+    }
+
+    /// The note rides along on every request, so a selected file and a
+    /// page-long type error cannot be allowed to take the window with them.
+    #[test]
+    fn a_huge_selection_is_cut_before_it_reaches_the_prompt() {
+        let big = "x".repeat(50_000);
+        let state = IdeState {
+            ide: None,
+            workspace: None,
+            updated: None,
+            active_file: Some("a.rs".into()),
+            selection: None,
+            selected_text: Some(big),
+            diagnostics: vec![Diag {
+                file: "a.rs".into(),
+                line: 1,
+                severity: "error".into(),
+                message: "y".repeat(5_000),
+            }],
+        };
+        let note = context_from_state(&state).note;
+        assert!(note.len() < 4_000, "note is {} chars", note.len());
+        assert!(note.contains("50000 characters in total"), "{note}");
     }
 }

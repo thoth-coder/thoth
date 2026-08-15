@@ -100,6 +100,15 @@ All notable changes to thoth are documented here. The format follows
   `/clear` shows it again.
 
 ### Fixed
+- `glob` stopped at 500 matches and said nothing about it, so a truncated
+  list read like the whole answer. It says what it stopped at now.
+- The editor context (active file, selected text, the Problems panel) went
+  into every request unbudgeted: a large selection or one page-long type
+  error could take a good part of a small window. Both are capped, and say
+  when they were cut.
+- The permission preview for overwriting a file with CRLF line endings
+  showed every line of it as changed. It now previews what will actually be
+  written.
 - Every multi-line `edit_file` failed on a file with CRLF line endings,
   which is most files on a Windows checkout. `read_file` shows lines with
   the carriage return stripped, so the text the model copies back could
@@ -138,6 +147,16 @@ All notable changes to thoth are documented here. The format follows
 - `inside_project` said "outside" for any path that did not exist yet on
   Windows, where the canonical form of the working directory carries a
   `\\?\` prefix that a plain joined path does not.
+
+### Internal
+- `client.rs` was 1600 lines holding three wire protocols; it is a module
+  directory now, one file per protocol (`openai`, `ollama`, `anthropic`)
+  with the shared message shape and transport choice in `mod.rs`. The two
+  text protocols shared 50 lines of copied stream handling, which is now one
+  `TextStream` in `client/stream.rs`.
+- The drawing half of the interface moved out of `ui/mod.rs` into
+  `ui/screen.rs`. A child module sees its parent's private fields, so
+  nothing had to be made public to split it.
 
 ### Removed
 - Google Programmable Search. `web_search` goes through DuckDuckGo, which

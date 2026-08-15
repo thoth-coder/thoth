@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/inst
 irm https://raw.githubusercontent.com/thoth-coder/thoth/main/scripts/install.ps1 | iex
 ```
 
-Pin a version with `THOTH_VERSION=v0.1.0`, change the location with
+Pin a version with `THOTH_VERSION=v0.2.0`, change the location with
 `THOTH_INSTALL_DIR`. Uninstall with the matching `uninstall.sh` /
 `uninstall.ps1` from the same directory (add `--purge` / `THOTH_PURGE=1`
 to also remove config and state).

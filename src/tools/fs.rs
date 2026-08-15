@@ -620,20 +620,28 @@ pub fn glob_files(a: GlobArgs, cap: usize) -> Result<String> {
         .with_context(|| format!("invalid glob pattern: {}", a.pattern))?
         .compile_matcher();
     let mut results: Vec<String> = Vec::new();
+    let mut more = false;
     for entry in walk(&root) {
         let rel = rel_slash_path(entry.path(), &root);
         if matcher.is_match(&rel) {
-            results.push(rel);
             if results.len() >= MAX_ENTRIES {
+                // stopping is fine, stopping quietly is not: the caller would
+                // read a full-looking list and believe that is all there is
+                more = true;
                 break;
             }
+            results.push(rel);
         }
     }
     if results.is_empty() {
         return Ok(format!("No files matching '{}'", a.pattern));
     }
     results.sort();
-    Ok(fit_entries(results, cap))
+    let out = fit_entries(results, cap);
+    Ok(match more {
+        true => format!("{out}\n… (stopped at {MAX_ENTRIES} matches; narrow the pattern)"),
+        false => out,
+    })
 }
 
 /// Walk `root` yielding files only, skipping ignored directories.
@@ -704,7 +712,12 @@ pub fn preview_write(args: &Value) -> String {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
     match std::fs::read_to_string(resolve(path)) {
-        Ok(old) => format!("Overwrite {path}:\n{}", unified_diff(&old, content)),
+        // through the same alignment write_file uses, or a CRLF file would
+        // preview as every single line changed
+        Ok(old) => format!(
+            "Overwrite {path}:\n{}",
+            unified_diff(&old, &align_newlines(&old, content))
+        ),
         Err(_) => {
             let n = content.lines().count();
             let mut s = format!("Create {path} ({n} lines):\n");
@@ -1052,6 +1065,42 @@ mod tests {
     /// the caller cut the text at a fixed 12k characters, which threw away
     /// read_file's own footer. Losing that footer is what left the model not
     /// knowing there was more of the file, or how to ask for it.
+    /// A cut-off list that says nothing reads exactly like a complete one.
+    #[test]
+    fn glob_says_when_it_stopped_counting() {
+        let dir = std::env::temp_dir().join("thoth-fs-tests/many");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..MAX_ENTRIES + 20 {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let out = glob_files(
+            GlobArgs {
+                pattern: "*.txt".into(),
+                path: Some(dir.to_string_lossy().into_owned()),
+            },
+            100_000,
+        )
+        .unwrap();
+        assert!(out.contains("stopped at"), "{}", &out[out.len() - 200..]);
+    }
+
+    /// The preview is what the user approves, so it has to be the change
+    /// that will actually be made, not one line-ending style against another.
+    #[test]
+    fn overwriting_a_crlf_file_previews_only_the_real_change() {
+        let p = tmp("preview-crlf.txt", 3);
+        std::fs::write(&p, "one\r\ntwo\r\nthree\r\n").unwrap();
+        let preview = preview_write(&serde_json::json!({
+            "path": p.to_string_lossy(),
+            "content": "one\ntwo and a half\nthree\n",
+        }));
+        assert!(preview.contains("+    2 two and a half"), "{preview}");
+        assert!(
+            !preview.contains("-    1 one"),
+            "unchanged lines must not show as changed:\n{preview}"
+        );
+    }
+
     /// read_file strips the `\r`, so a multi-line old_string copied from it
     /// is LF while the file is CRLF, and every multi-line edit on a Windows
     /// checkout fails to match. The tool has to meet the file where it is.
