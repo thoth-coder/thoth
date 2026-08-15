@@ -100,6 +100,19 @@ All notable changes to thoth are documented here. The format follows
   `/clear` shows it again.
 
 ### Fixed
+- Security: one "always allow" for a file outside the working directory
+  covered every file everywhere for the life of the project. Reads and
+  writes outside it are now scoped to the directory the file is in; inside
+  the working directory one answer still covers the project.
+- `multi_edit`, `move_file` and `delete_file` showed nothing once they were
+  always-allowed, unlike `write_file`, `edit_file` and `shell`. Every one of
+  them now prints what it does whether or not it had to ask.
+- `/undo` said nothing about a file it had not snapshotted because the
+  request was too large, so a request could come back looking complete while
+  one file was still changed. That file is now named and reported.
+- An undone checkpoint is kept, marked, instead of being deleted. For a file
+  that had been edited since and was therefore left alone, the copy in that
+  checkpoint was the only one left of what was in it before.
 - Security: `move_file` could carry a file in from anywhere or out to
   anywhere, and needed no read first, which made renaming a way around
   having to read a file before overwriting it. Both endpoints must now be

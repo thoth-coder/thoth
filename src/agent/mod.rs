@@ -76,7 +76,10 @@ pub enum AgentEvent {
         model: String,
         base_url: String,
         api: &'static str,
-        num_ctx: Option<u32>,
+        /// Context window this conversation is measured against, when one
+        /// is known: what Ollama is told per request, or what the profile
+        /// declares for any other api.
+        window: Option<u32>,
     },
     /// Token usage of the latest model call, and what it cost when the
     /// profile carries prices.
@@ -175,7 +178,7 @@ impl Agent {
             model: model.clone(),
             base_url: base_url.clone(),
             api: self.client.transport.name(),
-            num_ctx: window,
+            window,
         });
         self.send(AgentEvent::Info(format!(
             "profile {name}: {model} at {base_url} over the {} api{}",
@@ -680,7 +683,12 @@ impl Agent {
         let must_ask = tools::needs_permission(name, &args) && !self.always_allow.contains(&key);
         // permission skipped (always-allowed): still show exactly what runs —
         // the full diff for file changes, the full command line for shell
-        if !must_ask && matches!(name, "write_file" | "edit_file" | "shell") {
+        if !must_ask
+            && matches!(
+                name,
+                "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file" | "shell"
+            )
+        {
             self.send(AgentEvent::Diff(tools::preview(name, &args)));
         }
         if must_ask {

@@ -22,7 +22,8 @@
 
 Permission prompt answers: `y` this once, `a` always, `n` deny. On deny the
 model is told and adjusts. An `a` answer is scoped to what you saw: the
-program for a shell command, the host for a fetch. It is saved per project
+program for a shell command, the host for a fetch, and one directory for a
+file outside the project. It is saved per project
 in `~/.thoth/projects/<key>/allow.json`; `/allow` reviews it and
 `/allow reset` clears it.
 
@@ -41,7 +42,8 @@ blocking. The model kills the pid when it is done.
   peek at the first and last line counts as having read the file.
 - `read_file` refuses files over 2 MB; use `grep` or offset/limit instead.
 - Every file change is shown as a unified diff with line numbers, and every
-  shell command line is shown in full, even after "always allow".
+  shell command line, move and delete is shown in full, even after
+  "always allow".
 - `delete_file` needs the whole file read first, the same condition as
   overwriting it, and only works inside the working directory. That also
   shuts the back door of deleting a file and writing a fresh one in its
@@ -58,8 +60,10 @@ blocking. The model kills the pid when it is done.
 Every file a request changes is snapshotted first, and `/undo` puts the
 whole request back. A file that was edited by someone else after thoth
 touched it is reported and left alone: undo is not a second way to lose
-work. The last 20 checkpoints are kept in
-`~/.thoth/projects/<key>/undo/`, so they survive a crash.
+work, so an undone checkpoint is marked rather than deleted, and what it
+held for a file it could not put back is still readable in it. The last 20
+checkpoints are kept in `~/.thoth/projects/<key>/undo/`, so they survive a
+crash.
 
 The system prompt adds rules on top: no file I/O through the shell, no
 destructive git commands unless you asked for exactly that, and nothing from

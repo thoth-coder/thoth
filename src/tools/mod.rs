@@ -182,18 +182,41 @@ pub fn needs_permission(name: &str, args: &Value) -> bool {
 
 /// What an "always allow" answer covers. Granting every future shell command
 /// from one prompt is too much, so shell is keyed by its program (`shell:git`)
-/// and web_fetch by host; the rest are keyed by tool name.
+/// and web_fetch by host.
+///
+/// Reading and writing are keyed by the working directory as a whole, because
+/// that is what the session is for, but a path outside it is keyed by its own
+/// directory: approving one look at a dotfile in the home directory must not
+/// hand over the rest of the disk for the rest of the project's life.
 pub fn permission_key(name: &str, args: &Value) -> String {
     let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
     match name {
         "shell" => format!("shell:{}", program_of(get("command"))),
         "web_fetch" => format!("web_fetch:{}", host_of(get("url"))),
+        "read_file" | "write_file" | "edit_file" | "multi_edit" => {
+            let path = get("path");
+            if fs::inside_project(path) {
+                name.to_string()
+            } else {
+                format!("{name}@{}", parent_dir(path))
+            }
+        }
         _ => name.to_string(),
     }
 }
 
+/// The directory a path sits in, as the unit an "always" answer covers.
+fn parent_dir(path: &str) -> String {
+    let p = fs::resolve(path);
+    let dir = p.parent().unwrap_or(p.as_path());
+    dir.to_string_lossy().replace('\\', "/")
+}
+
 /// Human wording for what an "always" answer will allow.
 pub fn permission_scope(key: &str) -> String {
+    if let Some((tool, dir)) = key.split_once('@') {
+        return format!("the {tool} tool under {dir}");
+    }
     match key.split_once(':') {
         Some(("shell", prog)) => format!("`{prog}` commands"),
         Some(("web_fetch", host)) => format!("fetching from {host}"),
@@ -378,6 +401,27 @@ mod tests {
         assert!(names(true).contains(&"problems".to_string()));
         assert!(!names(false).contains(&"problems".to_string()));
         assert_eq!(names(true).len(), names(false).len() + 1);
+    }
+
+    /// One "always" for a file outside the project must not become a
+    /// standing permission for the whole disk.
+    #[test]
+    fn always_allow_outside_the_project_covers_one_directory() {
+        let key = |name: &str, path: &str| permission_key(name, &json!({ "path": path }));
+        // inside the working directory: one answer covers the project, and
+        // the key is the plain tool name that older allowlists already hold
+        assert_eq!(key("read_file", "src/main.rs"), "read_file");
+        assert_eq!(key("edit_file", "src/main.rs"), "edit_file");
+
+        let home = key("read_file", "/etc/hosts");
+        assert_ne!(home, "read_file", "outside paths must be scoped");
+        assert_eq!(key("read_file", "/etc/passwd"), home, "same directory");
+        assert_ne!(
+            key("read_file", "/etc/ssh/sshd_config"),
+            home,
+            "another directory must ask again"
+        );
+        assert!(permission_scope(&home).contains("/etc"), "{home}");
     }
 
     #[test]

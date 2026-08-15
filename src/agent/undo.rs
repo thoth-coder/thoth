@@ -7,7 +7,7 @@
 //! under `~/.thoth/projects/<key>/undo/`, so they survive a crash, which is
 //! exactly when they are wanted.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,10 @@ pub enum Before {
     /// Something was there that could not be read back as text. Undo leaves
     /// it alone rather than guessing.
     Unreadable,
+    /// The request had already spent its snapshot budget when this file was
+    /// changed. Recorded anyway, so `/undo` says the file is still changed
+    /// instead of quietly leaving it out of the report.
+    TooLarge,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -45,6 +49,11 @@ pub struct Checkpoint {
     /// are undoing.
     pub label: String,
     pub changes: Vec<Change>,
+    /// Already undone. A spent checkpoint stays on disk instead of being
+    /// deleted: for a file that had changed since and was left alone, this
+    /// is the only copy of what was in it before.
+    #[serde(default)]
+    pub spent: bool,
 }
 
 fn pending() -> &'static Mutex<Vec<Change>> {
@@ -95,9 +104,13 @@ pub fn record(path: &Path, before: Before) {
         return;
     }
     let mut p = pending().lock().unwrap();
-    if !fits(&p, &before) {
-        return;
-    }
+    // over budget: keep the entry, drop the content. An undo that silently
+    // leaves one file changed is worse than one that says it did
+    let before = if fits(&p, &before) {
+        before
+    } else {
+        Before::TooLarge
+    };
     p.push(Change {
         path: path.to_path_buf(),
         before,
@@ -142,6 +155,7 @@ fn write_checkpoint(label: &str, changes: Vec<Change>) -> usize {
     let cp = Checkpoint {
         label: label.chars().take(60).collect(),
         changes,
+        spent: false,
     };
     let dir = undo_dir();
     if std::fs::create_dir_all(&dir).is_err() {
@@ -207,12 +221,9 @@ pub struct Restored {
 /// Puts the newest checkpoint back. A file that changed after thoth wrote it
 /// is left alone and reported: someone else's edit is not ours to discard.
 pub fn undo_last() -> Result<Restored> {
-    let files = checkpoint_files();
-    let Some(newest) = files.last() else {
+    let Some((newest, mut cp)) = newest_unspent() else {
         bail!("nothing to undo in this project");
     };
-    let text = std::fs::read_to_string(newest).context("cannot read the checkpoint")?;
-    let cp: Checkpoint = serde_json::from_str(&text).context("the checkpoint is unreadable")?;
     let mut out = Restored {
         label: cp.label.clone(),
         restored: Vec::new(),
@@ -230,6 +241,9 @@ pub fn undo_last() -> Result<Restored> {
             Before::Unreadable => out
                 .skipped
                 .push(format!("{shown} (was not text, left alone)")),
+            Before::TooLarge => out
+                .skipped
+                .push(format!("{shown} (too large to snapshot, still changed)")),
             Before::Missing => match std::fs::remove_file(&c.path) {
                 Ok(()) => out.restored.push(format!("{shown} (removed again)")),
                 Err(e) => out.skipped.push(format!("{shown} ({e})")),
@@ -243,8 +257,27 @@ pub fn undo_last() -> Result<Restored> {
             },
         }
     }
-    let _ = std::fs::remove_file(newest);
+    // spent, not deleted: what a skipped file held before is only in here
+    cp.spent = true;
+    match serde_json::to_string(&cp) {
+        Ok(json) => {
+            let _ = std::fs::write(&newest, json);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&newest);
+        }
+    }
     Ok(out)
+}
+
+/// The newest checkpoint that has not been undone yet, with its file. A
+/// checkpoint that will not parse is stepped over rather than blocking undo.
+fn newest_unspent() -> Option<(PathBuf, Checkpoint)> {
+    checkpoint_files().iter().rev().find_map(|p| {
+        let text = std::fs::read_to_string(p).ok()?;
+        let cp: Checkpoint = serde_json::from_str(&text).ok()?;
+        (!cp.spent).then(|| (p.clone(), cp))
+    })
 }
 
 /// Newest first, for `/undo list`.
@@ -254,7 +287,14 @@ pub fn list() -> Vec<String> {
         .rev()
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .filter_map(|t| serde_json::from_str::<Checkpoint>(&t).ok())
-        .map(|c| format!("{} file(s)  {}", c.changes.len(), c.label))
+        .map(|c| {
+            format!(
+                "{} file(s)  {}{}",
+                c.changes.len(),
+                c.label,
+                if c.spent { "  (undone)" } else { "" }
+            )
+        })
         .collect();
     out.truncate(KEEP);
     out
@@ -347,8 +387,15 @@ mod tests {
             "{r:?}",
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "first\n");
-        // and the checkpoint is spent: undoing again finds nothing of ours
-        assert!(!list().iter().any(|l| l.contains("change the file")));
+        // the checkpoint is spent: still listed, but nothing left to undo
+        assert!(
+            list()
+                .iter()
+                .any(|l| l.contains("change the file") && l.contains("undone")),
+            "{:?}",
+            list()
+        );
+        assert!(undo_last().is_err());
     }
 
     /// A file created by thoth goes away again; the point is that undo does
@@ -386,6 +433,54 @@ mod tests {
             "the user then edited it\n",
             "someone else's edit is not ours to discard"
         );
+    }
+
+    /// Undo walks back a request at a time, and a spent checkpoint is kept:
+    /// for a file that was left alone, the copy in it is the only one.
+    #[test]
+    fn undo_walks_back_and_keeps_what_it_could_not_restore() {
+        let _g = guard();
+        let p = tmp("history.txt");
+        std::fs::write(&p, "one\n").unwrap();
+        let first = snapshot(&p);
+        std::fs::write(&p, "two\n").unwrap();
+        write_checkpoint("first request", vec![change(&p, first)]);
+        let second = snapshot(&p);
+        std::fs::write(&p, "three\n").unwrap();
+        write_checkpoint("second request", vec![change(&p, second)]);
+        // the user edits it themselves, so the newest checkpoint cannot apply
+        std::fs::write(&p, "mine\n").unwrap();
+
+        let r = undo_last().unwrap();
+        assert_eq!(r.label, "second request");
+        assert!(r.restored.is_empty(), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n");
+        // what that request would have put back is still on disk
+        let kept = checkpoint_files()
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .any(|t| t.contains("second request") && t.contains("two"));
+        assert!(kept, "the spent checkpoint was thrown away");
+        // and the next undo is the request before it, not the same one again
+        assert_eq!(undo_last().unwrap().label, "first request");
+        assert!(undo_last().is_err(), "nothing should be left");
+    }
+
+    /// A request too big to snapshot must still be reported as changed
+    /// rather than dropped out of the checkpoint without a word.
+    #[test]
+    fn a_file_too_big_to_snapshot_is_still_named() {
+        let _g = guard();
+        let p = tmp("huge.txt");
+        std::fs::write(&p, "current\n").unwrap();
+        record(&p, Before::Text("x".repeat(MAX_SNAPSHOT_BYTES + 1)));
+        assert_eq!(commit("write something enormous"), 1);
+
+        let r = undo_last().unwrap();
+        assert!(r.restored.is_empty(), "{r:?}");
+        assert_eq!(r.skipped.len(), 1);
+        assert!(r.skipped[0].contains("too large"), "{:?}", r.skipped);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "current\n");
     }
 
     #[test]

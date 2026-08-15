@@ -158,7 +158,7 @@ struct App {
     editor_status: Option<String>,
     tick_count: u64,
     /// Context window, when the api or the profile says what it is.
-    num_ctx: Option<u32>,
+    window: Option<u32>,
     /// Show tool outputs in full instead of a short preview (ctrl+o).
     expanded: bool,
     /// Wrapped-line cache for all blocks except the last (see ensure_cache).
@@ -299,7 +299,7 @@ impl App {
             turn_start: None,
             editor_status: crate::editor::live_status(),
             tick_count: 0,
-            num_ctx: session.window,
+            window: session.window,
             expanded: false,
             cache: Vec::new(),
             cached_blocks: 0,
@@ -519,13 +519,13 @@ impl App {
                 model,
                 base_url,
                 api,
-                num_ctx,
+                window,
             } => {
                 self.profile = profile;
                 self.model = model;
                 self.base_url = base_url;
                 self.api = api;
-                self.num_ctx = num_ctx;
+                self.window = window;
                 // another server, another list: /model 3 must not resolve
                 // against what the previous one offered
                 self.models.clear();
@@ -1100,7 +1100,7 @@ impl App {
         };
         let mut right_parts: Vec<String> = Vec::new();
         if self.ctx_tokens > 0 {
-            right_parts.push(match self.num_ctx {
+            right_parts.push(match self.window {
                 Some(max) => format!(
                     "ctx {}/{} ({}%)",
                     fmt_k(self.ctx_tokens),
@@ -1236,7 +1236,7 @@ impl App {
         )));
         // which api, and the window it is measured against when one is known
         out.push(Line::from(Span::styled(
-            match self.num_ctx {
+            match self.window {
                 Some(n) => format!("  {} api  ·  {} context window", self.api, fmt_k(n as u64)),
                 None => format!("  {} api", self.api),
             },
@@ -1426,13 +1426,13 @@ mod tests {
         // the api on the banner is the one actually in use, not a guess
         assert!(s.contains("ollama native api"), "{s}");
         a.api = "anthropic native";
-        a.num_ctx = Some(200_000);
+        a.window = Some(200_000);
         a.invalidate_cache();
         let s = screen(&mut a, 80, 24).join("\n");
         assert!(s.contains("anthropic native api  ·  200.0k"), "{s}");
         assert!(!s.contains("ollama"), "{s}");
         a.api = "ollama native";
-        a.num_ctx = Some(32768);
+        a.window = Some(32768);
         a.invalidate_cache();
 
         // narrow terminal: the art goes, and the tagline gives its room to the

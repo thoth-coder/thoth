@@ -51,7 +51,9 @@ reading a file from outside the working directory all ask first. Reads
 inside the project do not.
 
 Answering `a` (always) is scoped, not a blanket grant: for shell it allows
-that one program (`cargo`, `git`, ...), for `web_fetch` that one host. The
+that one program (`cargo`, `git`, ...), for `web_fetch` that one host, and
+for reading or writing a file outside the working directory the directory
+it sits in, so one look at a dotfile does not open the whole disk. The
 grant is saved in `~/.thoth/projects/<key>/allow.json` and survives
 restarts, so review it with `/allow` now and then. Auto-approved actions
 still print the full command line and the full diff.
