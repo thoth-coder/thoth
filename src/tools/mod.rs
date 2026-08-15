@@ -67,6 +67,21 @@ pub fn definitions(with_problems: bool) -> Value {
             }, "required": ["path", "edits"]}
         }},
         {"type": "function", "function": {
+            "name": "move_file",
+            "description": "Rename or move a file. The destination must not exist.",
+            "parameters": {"type": "object", "properties": {
+                "from": {"type": "string"},
+                "to": {"type": "string"}
+            }, "required": ["from", "to"]}
+        }},
+        {"type": "function", "function": {
+            "name": "delete_file",
+            "description": "Delete one file inside the working directory. You must have read the whole file first. Never use it to get around the read-before-write rule.",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"}
+            }, "required": ["path"]}
+        }},
+        {"type": "function", "function": {
             "name": "todo",
             "description": "The plan for the task you are on. Send the whole list every time, exactly one item marked doing. Use it for anything with more than about three steps, before starting.",
             "parameters": {"type": "object", "properties": {
@@ -157,7 +172,8 @@ The command already runs in the working directory, no need to cd first.";
 
 pub fn needs_permission(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "edit_file" | "multi_edit" | "shell" | "remember" | "web_fetch" => true,
+        "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file" | "shell"
+        | "remember" | "web_fetch" => true,
         // reading inside the project is free; reaching outside it is not
         "read_file" => !fs::inside_project(args.get("path").and_then(|v| v.as_str()).unwrap_or("")),
         _ => false,
@@ -228,6 +244,8 @@ pub fn summarize(name: &str, args: &Value) -> String {
                 .unwrap_or(0)
         ),
         "todo" => todo::summary(args),
+        "move_file" => format!("{} -> {}", get("from"), get("to")),
+        "delete_file" => get("path").to_string(),
         "list_dir" => {
             let p = get("path");
             if p.is_empty() {
@@ -263,6 +281,12 @@ pub fn preview(name: &str, args: &Value) -> String {
         "write_file" => fs::preview_write(args),
         "edit_file" => fs::preview_edit(args),
         "multi_edit" => fs::preview_multi_edit(args),
+        "delete_file" => fs::preview_delete(args),
+        "move_file" => format!(
+            "Move {} to {}",
+            args.get("from").and_then(|v| v.as_str()).unwrap_or("?"),
+            args.get("to").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
         "read_file" => format!(
             "read {} (outside this project)",
             args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
@@ -290,6 +314,8 @@ pub async fn execute(
         "write_file" => fs::write_file(serde_json::from_value(args)?)?,
         "edit_file" => fs::edit_file(serde_json::from_value(args)?)?,
         "multi_edit" => fs::multi_edit(serde_json::from_value(args)?)?,
+        "move_file" => fs::move_file(serde_json::from_value(args)?)?,
+        "delete_file" => fs::delete_file(serde_json::from_value(args)?)?,
         "todo" => todo::write(serde_json::from_value(args)?)?,
         "list_dir" => fs::list_dir(serde_json::from_value(args)?)?,
         "glob" => fs::glob_files(serde_json::from_value(args)?)?,

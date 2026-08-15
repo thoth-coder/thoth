@@ -377,6 +377,100 @@ pub fn preview_multi_edit(args: &Value) -> String {
 }
 
 #[derive(Deserialize)]
+pub struct MoveArgs {
+    pub from: String,
+    pub to: String,
+}
+
+/// Renaming keeps the content, so the read record moves with the file: a
+/// file you had read stays editable under its new name.
+pub fn move_file(a: MoveArgs) -> Result<String> {
+    let from = resolve(&a.from);
+    let to = resolve(&a.to);
+    if !from.is_file() {
+        bail!("{} is not a file", from.display());
+    }
+    if to.exists() {
+        bail!(
+            "{} already exists. delete it first if that is really what you want",
+            to.display()
+        );
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create directory {}", parent.display()))?;
+    }
+    // the key has to be taken while the file is still there: canonicalize
+    // fails on a path that no longer exists, and the fallback would not
+    // match what was stored
+    let old_key = registry_key(&from);
+    std::fs::rename(&from, &to)
+        .with_context(|| format!("cannot move {} to {}", from.display(), to.display()))?;
+    let mut r = read_registry().lock().unwrap();
+    if let Some(state) = r.remove(&old_key) {
+        r.insert(registry_key(&to), state);
+    }
+    Ok(format!("Moved {} to {}", from.display(), to.display()))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteArgs {
+    pub path: String,
+}
+
+/// Deleting a file you have not read is exactly as destructive as
+/// overwriting one, so it carries the same condition: the whole file must
+/// have been read this session. That also closes the back door of deleting a
+/// file and writing a fresh one over it to dodge the read rule.
+pub fn delete_file(a: DeleteArgs) -> Result<String> {
+    let path = resolve(&a.path);
+    if path.is_dir() {
+        bail!(
+            "{} is a directory. thoth only deletes single files; ask the user to remove a \
+             directory themselves",
+            path.display()
+        );
+    }
+    if !path.is_file() {
+        bail!("{} does not exist", path.display());
+    }
+    if !inside_project(&a.path) {
+        bail!(
+            "{} is outside the working directory. thoth does not delete files there",
+            path.display()
+        );
+    }
+    if !was_fully_read(&path) {
+        bail!(
+            "you have not read all of {} in this session. read it first: deleting a file you \
+             have not seen is not something to do on a guess",
+            path.display()
+        );
+    }
+    std::fs::remove_file(&path).with_context(|| format!("cannot delete {}", path.display()))?;
+    read_registry().lock().unwrap().remove(&registry_key(&path));
+    Ok(format!("Deleted {}", path.display()))
+}
+
+/// What is about to be lost, so the answer to the prompt is an informed one.
+pub fn preview_delete(args: &Value) -> String {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+    let head = match std::fs::read_to_string(resolve(path)) {
+        Ok(c) => {
+            let lines = c.lines().count();
+            let first: String = c
+                .lines()
+                .take(5)
+                .map(|l| format!("  {l}\n"))
+                .collect::<String>();
+            format!("({lines} lines)\n{first}")
+        }
+        Err(_) => "(cannot read it)\n".to_string(),
+    };
+    format!("Delete {path} {head}")
+}
+
+#[derive(Deserialize)]
 pub struct ListArgs {
     pub path: Option<String>,
 }
@@ -600,6 +694,86 @@ mod tests {
             12_000,
         )
         .unwrap();
+    }
+
+    /// delete_file only works inside the working directory, so this one
+    /// cannot use the shared temp dir. `target/` is ignored by git.
+    fn tmp_in_project(name: &str, lines: usize) -> PathBuf {
+        let dir = std::env::current_dir().unwrap().join("target/fs-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        let body: String = (1..=lines)
+            .map(|i| {
+                format!(
+                    "line {i}
+"
+                )
+            })
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// Deleting a file is as destructive as overwriting it, and it used to be
+    /// the way around the read rule: remove the file, then write a fresh one
+    /// where it stood. Both need the file to have been read.
+    #[test]
+    fn deleting_needs_the_file_to_have_been_read() {
+        let p = tmp_in_project("del.txt", 5);
+        let args = || DeleteArgs {
+            path: p.to_string_lossy().into_owned(),
+        };
+        let err = delete_file(args()).unwrap_err();
+        assert!(format!("{err:#}").contains("read"), "{err:#}");
+        assert!(p.exists(), "nothing may be deleted on a guess");
+
+        read(&p, 1, 600);
+        delete_file(args()).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn a_directory_is_never_deleted() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target/fs-tests/a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = delete_file(DeleteArgs {
+            path: dir.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("directory"), "{err:#}");
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn moving_takes_the_read_record_with_it() {
+        let from = tmp("before.txt", 4);
+        let to = from.with_file_name("after.txt");
+        let _ = std::fs::remove_file(&to);
+        read(&from, 1, 600);
+        move_file(MoveArgs {
+            from: from.to_string_lossy().into_owned(),
+            to: to.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        assert!(!from.exists() && to.exists());
+        // the content is the same content, so it stays editable
+        assert!(was_fully_read(&to), "the read record did not follow");
+        assert!(!was_read(&from));
+    }
+
+    #[test]
+    fn moving_never_overwrites() {
+        let from = tmp("src.txt", 2);
+        let to = tmp("dst.txt", 2);
+        let err = move_file(MoveArgs {
+            from: from.to_string_lossy().into_owned(),
+            to: to.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+        assert!(from.exists() && to.exists());
     }
 
     fn steps(v: &[(&str, &str)]) -> Vec<EditStep> {
