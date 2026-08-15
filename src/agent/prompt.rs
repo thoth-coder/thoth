@@ -254,3 +254,28 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod budget {
+    /// What every single request carries before the conversation starts:
+    /// cargo test prompt_budget -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn prompt_budget() {
+        let prompt = super::system_prompt();
+        let tools = crate::tools::definitions().to_string();
+        let est = |s: &str| s.len() / 4;
+        println!(
+            "\nsystem prompt {:>6} chars  ~{:>5} tokens\ntools schema  {:>6} chars  ~{:>5} tokens\n\
+             fixed total   {:>6} chars  ~{:>5} tokens  = {:.0}% of a 16k window, {:.0}% of 32k",
+            prompt.len(),
+            est(&prompt),
+            tools.len(),
+            est(&tools),
+            prompt.len() + tools.len(),
+            est(&prompt) + est(&tools),
+            (est(&prompt) + est(&tools)) as f64 / 16384.0 * 100.0,
+            (est(&prompt) + est(&tools)) as f64 / 32768.0 * 100.0,
+        );
+    }
+}
