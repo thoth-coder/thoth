@@ -1,6 +1,6 @@
 [package]
 name = "thoth"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Agentic coding assistant for local and hosted LLMs (Ollama, llama.cpp, Anthropic, OpenAI)"
 license = "MIT OR Apache-2.0"
