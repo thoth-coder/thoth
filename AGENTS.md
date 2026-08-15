@@ -42,7 +42,9 @@ cover. There is no `tests/` directory, don't add one.
 - `agent/mod.rs`: the agentic loop (model call, tool calls, results, repeat).
   Owns conversation history, permission gating, duplicate-call breaker,
   auto-compact at 2/3 of the window, truncation recovery, /compact, /recap,
-  editor-context injection, `!command` runs.
+  editor-context injection, `!command` runs. Also keeps the history from
+  growing copies of itself: an identical read-only call drops the older
+  result (`drop_stale_copy`), and identical is the whole safety condition.
 - `agent/prompt.rs`: system prompt. Environment (cwd, os, date, git branch),
   project scan, guardrail rules, instruction file (THOTH.md/AGENTS.md/
   CLAUDE.md, pointers followed), project memory.

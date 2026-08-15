@@ -39,6 +39,13 @@ All notable changes to thoth are documented here. The format follows
 - `read_file` does its own cutting, so its "showing lines 1-240 of 900, read
   on with offset=241" survives. It used to be replaced by a blind truncation
   that left the model with no idea there was more, or how to ask for it.
+- Repeating a read-only call with the exact same arguments replaces the
+  older result in the context with a one-line note. Two copies of the same
+  file are one copy of dead weight; a read of a different range, or a search
+  with a different pattern, is left alone because it says something else.
+- The style rules now say what not to write: no listing the edits again, no
+  repeating the plan just carried out, no explaining code that was not asked
+  about, and an answer as long as the question deserves.
 - Rules about git and about the editor's `problems` tool are only sent when
   there is a repo and an editor to use them on, and the tool itself is only
   offered then: 800 characters of every request that was buying nothing.

@@ -95,6 +95,9 @@ pub struct Agent {
     last_editor_note: Option<String>,
     /// Said once, the first time a tool call has to be read out of the text.
     warned_text_calls: bool,
+    /// Read-only call (name + arguments) to the id of the message holding
+    /// its latest result, so an older identical one can be dropped.
+    repeated: std::collections::HashMap<String, String>,
     /// Auto-compact when the prompt reaches this many tokens (None = never).
     auto_compact_at: Option<u64>,
 }
@@ -133,6 +136,7 @@ impl Agent {
             cancel_slot,
             last_editor_note: None,
             warned_text_calls: false,
+            repeated: std::collections::HashMap::new(),
         }
     }
 
@@ -213,6 +217,7 @@ impl Agent {
                     // rebuild the system prompt so memory saved this session
                     // (and any project changes) are picked up immediately
                     self.messages.clear();
+                    self.repeated.clear();
                     self.messages
                         .push(Message::system(prompt::system_prompt(window_of(
                             &self.client,
@@ -328,6 +333,7 @@ impl Agent {
                 let summary = turn.content.trim().to_string();
                 tools::memory::save_recap(&summary);
                 self.messages.truncate(1);
+                self.repeated.clear();
                 self.messages.push(Message::user(format!(
                     "(conversation continued from a compacted summary)\n{summary}"
                 )));
@@ -539,6 +545,9 @@ impl Agent {
                     tc.function.name.clone(),
                     content,
                 ));
+                if !is_error {
+                    self.drop_stale_copy(tc);
+                }
             }
             if token.is_cancelled() {
                 self.send(AgentEvent::Info("interrupted".into()));
@@ -556,6 +565,35 @@ impl Agent {
             self.cfg.max_turns
         )));
         Ok(())
+    }
+
+    /// A model that reads the same thing twice leaves two copies of it in the
+    /// context, and the older one is dead weight. When a read-only call is
+    /// repeated with the exact same arguments, the earlier result is replaced
+    /// by a one-line note. Identical arguments is the whole safety condition:
+    /// a read of another range, or a search with another pattern, says
+    /// something the newer one does not, and is left alone.
+    fn drop_stale_copy(&mut self, tc: &ToolCall) {
+        if !matches!(
+            tc.function.name.as_str(),
+            "read_file" | "grep" | "glob" | "list_dir" | "problems" | "web_fetch" | "web_search"
+        ) {
+            return;
+        }
+        let key = format!("{}:{}", tc.function.name, tc.function.arguments);
+        let Some(old_id) = self.repeated.insert(key, tc.id.clone()) else {
+            return;
+        };
+        if old_id == tc.id {
+            return;
+        }
+        if let Some(m) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(old_id.as_str()))
+        {
+            m.content = Some("(the same call was made again later; see that result)".into());
+        }
     }
 
     async fn run_tool(
@@ -618,6 +656,90 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::client::Client;
+
+    /// Reading the same thing twice leaves two copies in the context. The
+    /// older one is dropped, but only when the call was identical: a read of
+    /// another range says something the newer one does not.
+    #[tokio::test]
+    async fn an_identical_read_replaces_the_older_copy() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cfg = crate::config::resolve(&crate::config::Profile::default());
+        let mut agent = Agent::new(
+            Client::new(&cfg),
+            cfg,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+        let call = |id: &str, args: &str| ToolCall {
+            id: id.to_string(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: "read_file".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let body = |a: &Agent, id: &str| {
+            a.messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id))
+                .and_then(|m| m.content.clone())
+                .unwrap()
+        };
+
+        let first = call("a", "{\"path\":\"src/main.rs\"}");
+        agent
+            .messages
+            .push(Message::tool("a".into(), "read_file".into(), "one".into()));
+        agent.drop_stale_copy(&first);
+
+        // a different range keeps both
+        let ranged = call("b", "{\"path\":\"src/main.rs\",\"offset\":40}");
+        agent
+            .messages
+            .push(Message::tool("b".into(), "read_file".into(), "two".into()));
+        agent.drop_stale_copy(&ranged);
+        assert_eq!(body(&agent, "a"), "one", "a different call must survive");
+
+        // the same call again supersedes the first
+        let again = call("c", "{\"path\":\"src/main.rs\"}");
+        agent.messages.push(Message::tool(
+            "c".into(),
+            "read_file".into(),
+            "three".into(),
+        ));
+        agent.drop_stale_copy(&again);
+        assert!(
+            body(&agent, "a").starts_with("(the same call"),
+            "not replaced"
+        );
+        assert_eq!(body(&agent, "b"), "two");
+        assert_eq!(body(&agent, "c"), "three");
+
+        // an edit is never dropped: its result is not a copy of anything
+        let edit = ToolCall {
+            id: "d".into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: "edit_file".into(),
+                arguments: "{\"path\":\"x\"}".into(),
+            },
+        };
+        agent.messages.push(Message::tool(
+            "d".into(),
+            "edit_file".into(),
+            "edited".into(),
+        ));
+        agent.drop_stale_copy(&edit);
+        agent.messages.push(Message::tool(
+            "e".into(),
+            "edit_file".into(),
+            "edited".into(),
+        ));
+        let mut second = edit.clone();
+        second.id = "e".into();
+        agent.drop_stale_copy(&second);
+        assert_eq!(body(&agent, "d"), "edited");
+    }
 
     /// `!cmd` runs without a model or a permission prompt, and its output
     /// lands in the conversation for the next turn to use.
