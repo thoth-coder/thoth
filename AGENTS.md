@@ -8,15 +8,27 @@ OpenAI-compatible server. Rust, edition 2024.
 ```sh
 cargo build                 # debug build
 cargo build --release       # -> target/release/thoth
+cargo fmt                   # rustfmt defaults, no config
 cargo test                  # unit tests
 cargo test -- --ignored     # network tests (need internet)
 cargo clippy -- -D warnings # CI enforces zero warnings
 ```
 
+Stable Rust 1.85+ (edition 2024). CI runs `build --release`, `test` and
+`clippy` on Linux, macOS and Windows, so a `cfg!(windows)` branch that only
+compiles on one side fails the matrix.
+
+Tests live in a `#[cfg(test)] mod tests` at the bottom of the file they
+cover. There is no `tests/` directory, don't add one.
+
 ## Architecture (src/)
 
 - `main.rs`: CLI args and subcommands, config resolution, model discovery,
   spawns the agent task, picks TUI or one-shot print mode (`-p`).
+- `config.rs`: settings resolution, in precedence order: CLI flag, then
+  `THOTH_*` env var, then `config.toml` in the user config dir, then the
+  built-in default. A new setting means all of `Config`, `FileConfig`, the
+  env lookup and `docs/configuration.md`.
 - `client.rs`: LLM transport. Two paths: OpenAI-compatible SSE
   (`/chat/completions`) and Ollama native (`/api/chat`, auto-detected via
   `/api/version`) which allows setting `num_ctx` per request. Streams
@@ -46,6 +58,19 @@ cargo clippy -- -D warnings # CI enforces zero warnings
   and glyphs, `ui/input.rs` handles `@path` attachments and completion.
 - `upgrade.rs`: `thoth upgrade`, replacing the running binary with the
   latest verified GitHub release.
+
+## Everything else
+
+- `docs/`: the user-facing docs (getting-started, usage, configuration,
+  tools). A new flag, tool or slash command is not done until the matching
+  page says so.
+- `CHANGELOG.md`: one line under Unreleased for anything user-visible.
+- `scripts/`: install and uninstall, sh and PowerShell. They must stay in
+  step with the release asset names in `.github/workflows/release.yml` and
+  with `upgrade.rs`.
+- `THOTH.md` and `CLAUDE.md` are pointers to this file. Keep them that way,
+  put the content here.
+- `note.txt` is gitignored personal notes. Leave it alone.
 
 ## Conventions
 
