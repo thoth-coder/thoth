@@ -27,7 +27,7 @@ pub enum Api {
 }
 
 /// What a run actually uses, after profile, env and flags are layered.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub api: Api,
     pub base_url: String,

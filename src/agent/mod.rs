@@ -141,10 +141,7 @@ impl Agent {
     /// all change mid-session.
     async fn use_profile(&mut self, name: &str, cfg: &crate::config::Config) {
         let keep_model = self.client.model.clone();
-        let mut client = Client::new(cfg);
-        client
-            .detect_transport(cfg.api != crate::config::Api::Auto)
-            .await;
+        let mut client = Client::connect(cfg).await;
         if client.model.is_empty() {
             // the profile leaves the model to the server: keep the one that
             // is already running rather than blanking it

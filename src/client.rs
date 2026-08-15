@@ -282,6 +282,16 @@ impl Client {
         }
     }
 
+    /// Builds a client and settles its transport. Startup and a mid-session
+    /// profile switch both go through here, so the two cannot drift.
+    pub async fn connect(cfg: &crate::config::Config) -> Self {
+        let mut client = Self::new(cfg);
+        client
+            .detect_transport(cfg.api != crate::config::Api::Auto)
+            .await;
+        client
+    }
+
     /// Finishes what `guess_transport` could not decide from the url alone:
     /// a local OpenAI-compatible endpoint might be Ollama, which is worth
     /// knowing because its native API takes a context window per request
@@ -289,7 +299,7 @@ impl Client {
     ///
     /// Only ever probes a local address. A hosted endpoint must never see a
     /// stray request to a path that is not part of its api.
-    pub async fn detect_transport(&mut self, explicit: bool) {
+    async fn detect_transport(&mut self, explicit: bool) {
         if explicit || self.transport != Transport::OpenAI || !is_local(&self.base_url) {
             return;
         }
@@ -572,11 +582,8 @@ impl Client {
         if let Some(t) = self.think {
             body["think"] = json!(t);
         }
-        let mut req = self.http.post(format!("{origin}/api/chat")).json(&body);
-        if let Some(k) = &self.api_key {
-            req = req.bearer_auth(k);
-        }
-        let resp = req
+        let resp = self
+            .auth(self.http.post(format!("{origin}/api/chat")).json(&body))
             .send()
             .await
             .with_context(|| format!("cannot reach {origin}. is Ollama running?"))?;

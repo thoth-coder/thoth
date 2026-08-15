@@ -76,6 +76,14 @@ fn inside(base: &std::path::Path, path: &std::path::Path) -> bool {
     }
 }
 
+/// Byte offset of a char index, for editing a string by cursor position.
+pub fn byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
 /// The `@path` word the cursor sits in, as (index of the `@`, text typed
 /// after it). `None` when the cursor is not inside a mention. A bare `@`
 /// counts, so the picker opens as soon as it is typed.

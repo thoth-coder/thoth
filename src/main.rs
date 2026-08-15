@@ -84,8 +84,7 @@ async fn main() -> Result<()> {
         temperature: args.temperature,
     })?;
 
-    let mut client = Client::new(&cfg);
-    client.detect_transport(cfg.api != config::Api::Auto).await;
+    let mut client = Client::connect(&cfg).await;
 
     let mut startup_note = None;
     if client.model.is_empty() {

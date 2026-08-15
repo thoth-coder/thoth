@@ -6,7 +6,7 @@ pub mod theme;
 use crate::agent::{AgentCmd, AgentEvent, PermReply};
 use crate::ui::config::{ConfigAction, ConfigScreen};
 use crate::ui::input::{
-    complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
+    byte_idx, complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
 };
 use crate::ui::render::{
     clip, expand_tabs, fmt_elapsed, fmt_k, fmt_usd, home_relative, render_diff_body,
@@ -42,7 +42,7 @@ const HELP: &str = "commands:
   /memory        show project memory (/memory clear to wipe)
   /config        edit the config profiles and switch between them (/cfg)
   /allow         tools always allowed here (/allow reset to clear)
-  /status        session info: model, tokens, uptime
+  /status        session info: profile, model, api, tokens, cost, uptime
   /init          analyze the project and generate THOTH.md
   /model NAME    switch model
   /models        list models available on the server
@@ -156,7 +156,7 @@ struct App {
     /// Live "In file.rs, N lines selected" label from the IDE extension.
     editor_status: Option<String>,
     tick_count: u64,
-    /// Context window size, when known (Ollama native).
+    /// Context window, when the api or the profile says what it is.
     num_ctx: Option<u32>,
     /// Show tool outputs in full instead of a short preview (ctrl+o).
     expanded: bool,
@@ -430,11 +430,11 @@ impl App {
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
-                let i = self.byte_idx(self.cursor);
+                let i = byte_idx(&self.input, self.cursor);
                 self.input.remove(i);
             }
             KeyCode::Delete if self.cursor < self.input.chars().count() => {
-                let i = self.byte_idx(self.cursor);
+                let i = byte_idx(&self.input, self.cursor);
                 self.input.remove(i);
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
@@ -525,6 +525,9 @@ impl App {
                 self.base_url = base_url;
                 self.api = api;
                 self.num_ctx = num_ctx;
+                // another server, another list: /model 3 must not resolve
+                // against what the previous one offered
+                self.models.clear();
             }
             AgentEvent::TurnStart => {
                 if !matches!(self.mode, Mode::Perm(_)) {
@@ -849,22 +852,14 @@ impl App {
 
     // ---- input editing ----
 
-    fn byte_idx(&self, char_idx: usize) -> usize {
-        self.input
-            .char_indices()
-            .nth(char_idx)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
-    }
-
     fn insert_char(&mut self, ch: char) {
-        let i = self.byte_idx(self.cursor);
+        let i = byte_idx(&self.input, self.cursor);
         self.input.insert(i, ch);
         self.cursor += 1;
     }
 
     fn insert_str(&mut self, s: &str) {
-        let i = self.byte_idx(self.cursor);
+        let i = byte_idx(&self.input, self.cursor);
         self.input.insert_str(i, s);
         self.cursor += s.chars().count();
     }

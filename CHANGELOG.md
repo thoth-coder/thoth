@@ -34,6 +34,9 @@ All notable changes to thoth are documented here. The format follows
   and asks.
 - The Ollama probe only fires at a local address. A hosted endpoint never
   sees a request to a path thoth guessed at.
+- `stream_options` is an OpenAI extension that not every compatible server
+  takes. When one rejects it, thoth drops the field and retries instead of
+  failing the turn: losing the token counts beats losing the answer.
 - The config file moved to `~/.thoth/config.toml` on every OS, next to the
   state thoth already kept there, instead of the platform config directory
   (`%APPDATA%\thoth` on Windows, `~/.config/thoth` elsewhere). The old path

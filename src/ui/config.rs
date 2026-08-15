@@ -3,6 +3,7 @@
 //! over a session, so both go through the same struct and cannot drift.
 
 use crate::config::{Config, Profile, Store, load_store, resolve, save_store};
+use crate::ui::input::byte_idx;
 use crate::ui::render::clip;
 use crate::ui::theme;
 use anyhow::Result;
@@ -275,6 +276,9 @@ pub struct ConfigScreen {
     /// Set when esc was pressed with unsaved changes: a second one discards.
     quit_armed: bool,
     status: Option<(String, bool)>,
+    /// The active profile and its settings when the screen opened. Saving an
+    /// edit to some other profile must not restart the session for nothing.
+    opened_as: Option<(String, Config)>,
 }
 
 impl ConfigScreen {
@@ -287,6 +291,7 @@ impl ConfigScreen {
             .and_then(|a| names.iter().position(|n| n == a))
             .unwrap_or(0);
         Self {
+            opened_as: live_config(&store),
             store,
             names,
             sel,
@@ -497,6 +502,8 @@ impl ConfigScreen {
         ConfigAction::Stay
     }
 
+    /// Applies an edit. Anything the user has to fix leaves the editor open
+    /// with what they typed still in it.
     fn commit(&mut self, e: Editing) {
         match e.target {
             Target::Field(field) => {
@@ -509,17 +516,28 @@ impl ConfigScreen {
                         self.store.profiles.insert(name, p);
                         self.dirty = true;
                     }
-                    Err(msg) => self.fail(&msg),
+                    Err(msg) => {
+                        self.fail(&msg);
+                        self.editing = Some(e);
+                    }
                 }
             }
             Target::Name { was } => {
                 let name = e.buf.trim().to_string();
-                if name.is_empty() || name.contains(['/', '\\', ' ', '.', '"']) {
-                    self.fail("name must be one word, without / \\ . or quotes");
-                    return;
-                }
-                if Some(&name) != was.as_ref() && self.store.profiles.contains_key(&name) {
-                    self.fail(&format!("there is already a profile called {name}"));
+                let problem = if name.is_empty() || name.contains(['/', '\\', ' ', '.', '"']) {
+                    Some("name must be one word, without / \\ . or quotes".to_string())
+                } else if Some(&name) != was.as_ref() && self.store.profiles.contains_key(&name) {
+                    Some(format!("there is already a profile called {name}"))
+                } else {
+                    None
+                };
+                if let Some(msg) = problem {
+                    self.fail(&msg);
+                    self.editing = Some(Editing {
+                        target: Target::Name { was },
+                        cursor: e.cursor,
+                        buf: e.buf,
+                    });
                     return;
                 }
                 let profile = match &was {
@@ -555,12 +573,29 @@ impl ConfigScreen {
             return ConfigAction::Stay;
         }
         self.dirty = false;
-        let Some(name) = self.store.active.clone() else {
+        self.applied()
+    }
+
+    /// What the host should do now that the file is written. Kept apart from
+    /// the write so it can be tested without touching the real config.
+    fn applied(&mut self) -> ConfigAction {
+        let now = live_config(&self.store);
+        if now == self.opened_as {
+            // nothing the running session cares about moved
             self.note("saved");
             return ConfigAction::Stay;
-        };
-        self.note(&format!("saved. using {name}"));
-        ConfigAction::Apply(name.clone(), Box::new(resolve(&self.store.get(&name))))
+        }
+        self.opened_as = now.clone();
+        match now {
+            Some((name, cfg)) => {
+                self.note(&format!("saved. using {name}"));
+                ConfigAction::Apply(name, Box::new(cfg))
+            }
+            None => {
+                self.note("saved");
+                ConfigAction::Stay
+            }
+        }
     }
 
     pub fn draw(&self, f: &mut Frame) {
@@ -751,6 +786,16 @@ fn edit_line(e: &Editing, width: usize) -> Line<'static> {
     ])
 }
 
+/// The active profile and what it resolves to: what a running session would
+/// actually be using.
+fn live_config(store: &Store) -> Option<(String, Config)> {
+    let name = store.active.clone()?;
+    if !store.profiles.contains_key(&name) {
+        return None;
+    }
+    Some((name.clone(), resolve(&store.get(&name))))
+}
+
 fn keys(pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
     for (k, what) in pairs {
@@ -758,13 +803,6 @@ fn keys(pairs: &[(&str, &str)]) -> Line<'static> {
         spans.push(Span::styled(format!(" {what}   "), theme::muted()));
     }
     Line::from(spans)
-}
-
-fn byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
 }
 
 /// `thoth config`: the same screen with its own terminal and event loop.
@@ -894,6 +932,8 @@ mod tests {
         }
         s.on_key(key(KeyCode::Enter));
         assert_eq!(s.store.get("local").context_window, None);
+        // and what was typed is still there to be corrected
+        assert!(s.editing.is_some(), "the editor closed on a bad value");
         assert!(
             s.status.as_ref().unwrap().1,
             "should be flagged as an error"
@@ -942,6 +982,31 @@ mod tests {
         s.on_key(key(KeyCode::Char('y')));
         assert!(!s.store.profiles.contains_key("local"));
         assert_eq!(s.store.active, None, "the active profile is gone with it");
+    }
+
+    #[test]
+    fn saving_only_restarts_the_session_when_the_live_profile_moved() {
+        // applied() rather than save(), which would write the real file
+        let mut s = screen(&["local", "other"]);
+        s.opened_as = live_config(&s.store);
+        // an edit to a profile that is not the active one changes nothing
+        // about what is running
+        s.sel = 1;
+        Model
+            .set(s.store.profiles.get_mut("other").unwrap(), "m")
+            .unwrap();
+        assert!(matches!(s.applied(), ConfigAction::Stay));
+        // editing the active one does restart it
+        Model
+            .set(s.store.profiles.get_mut("local").unwrap(), "m2")
+            .unwrap();
+        match s.applied() {
+            ConfigAction::Apply(name, cfg) => {
+                assert_eq!(name, "local");
+                assert_eq!(cfg.model.as_deref(), Some("m2"));
+            }
+            _ => panic!("the running profile changed and was not applied"),
+        }
     }
 
     #[test]
