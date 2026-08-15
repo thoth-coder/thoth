@@ -285,8 +285,11 @@ impl ToolTextFilter {
                         self.holding = true;
                     }
                     None => {
-                        // keep a tail that could be the start of a split tag
-                        let hold = longest_suffix_prefix(&self.buf, TOOL_OPEN);
+                        // keep back only what could still grow into the start
+                        // of a call. Holding a whole `{...}` on the chance it
+                        // turns out to be one would stall the display of every
+                        // code block until its braces balanced
+                        let hold = tail_hold(&self.buf);
                         let emit = self.buf.len() - hold;
                         out.push_str(&self.buf[..emit]);
                         self.buf.drain(..emit);
@@ -377,21 +380,39 @@ fn candidate_start(s: &str) -> Option<usize> {
     }
 }
 
+/// A confirmed `{` + `"name"`. Anything less certain is not held as a
+/// candidate, only kept back by `tail_hold` until the next chunk says.
 fn json_name_start(s: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(rel) = s[from..].find('{') {
         let at = from + rel;
-        let rest = s[at + 1..].trim_start();
-        // "name" may still be arriving one chunk at a time
-        if rest.starts_with("\"name\"") || (!rest.is_empty() && "\"name\"".starts_with(rest)) {
-            return Some(at);
-        }
-        if rest.is_empty() {
+        if s[at + 1..].trim_start().starts_with("\"name\"") {
             return Some(at);
         }
         from = at + 1;
     }
     None
+}
+
+/// How many bytes at the end of the buffer could still turn into the start
+/// of a call once more of the stream arrives: part of a `<tool_call>` tag,
+/// or a trailing `{` that has not said what follows it yet. A handful of
+/// bytes, never a whole object.
+fn tail_hold(s: &str) -> usize {
+    let tag = longest_suffix_prefix(s, TOOL_OPEN);
+    let json = s
+        .rfind('{')
+        .map(|at| {
+            let rest = &s[at + 1..];
+            let trimmed = rest.trim_start();
+            if rest.len() <= 8 && "\"name\"".starts_with(trimmed) {
+                s.len() - at
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    tag.max(json)
 }
 
 /// Index just past the `}` that closes the object the text starts with.
@@ -1404,6 +1425,42 @@ mod tests {
         let (_, calls) =
             run("<tool_call>{\"name\": \"grep\", \"arguments\": {\"pattern\": \"x\"}}");
         assert_eq!(calls.len(), 1);
+    }
+
+    /// Chunks land wherever the model's tokens land, often right on a `{`.
+    /// The filter must not hold a whole code block back waiting to see
+    /// whether it is a call: the text has to keep flowing.
+    #[test]
+    fn a_chunk_ending_on_a_brace_does_not_stall_the_stream() {
+        let mut f = filter();
+        let mut calls = Vec::new();
+        let shown = f.push("here you go:\n\nfn main() {", &mut calls);
+        assert!(
+            shown.starts_with("here you go:"),
+            "the text before the brace must go out at once: {shown:?}"
+        );
+        assert!(shown.contains("fn main()"), "{shown:?}");
+        // at most the brace itself is held back
+        assert!(
+            f.buf.len() <= 1,
+            "held back more than the brace: {:?}",
+            f.buf
+        );
+        let rest = f.push("\n    let x = 1;\n}\n", &mut calls);
+        let all = format!("{shown}{rest}{}", f.flush(&mut calls));
+        assert_eq!(all, "here you go:\n\nfn main() {\n    let x = 1;\n}\n");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_call_split_right_after_the_brace_is_still_read() {
+        let (shown, calls) = run_chunked(&[
+            "{",
+            "\"name\": \"grep\", ",
+            "\"arguments\": {\"pattern\": \"x\"}}",
+        ]);
+        assert_eq!(calls.len(), 1, "{shown:?}");
+        assert_eq!(shown, "");
     }
 
     #[test]

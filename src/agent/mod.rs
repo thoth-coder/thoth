@@ -101,6 +101,8 @@ pub struct Agent {
     last_editor_note: Option<String>,
     /// Said once, the first time a tool call has to be read out of the text.
     warned_text_calls: bool,
+    /// Said once, the first time a request leaves something to undo.
+    said_undo: bool,
     /// Read-only call (name + arguments) to the id of the message holding
     /// its latest result, so an older identical one can be dropped.
     repeated: std::collections::HashMap<String, String>,
@@ -143,6 +145,7 @@ impl Agent {
             cancel_slot,
             last_editor_note: None,
             warned_text_calls: false,
+            said_undo: false,
             repeated: std::collections::HashMap::new(),
         }
     }
@@ -192,17 +195,10 @@ impl Agent {
                 self.send(AgentEvent::Info("nothing to undo in this project".into()));
                 return;
             }
+            let lines: Vec<String> = items.iter().map(|i| format!("  {i}")).collect();
             self.send(AgentEvent::Info(format!(
-                "undo history, newest first:
-{}",
-                items
-                    .iter()
-                    .map(|i| format!("  {i}"))
-                    .collect::<Vec<_>>()
-                    .join(
-                        "
-"
-                    )
+                "undo history, newest first:\n{}",
+                lines.join("\n")
             )));
             return;
         }
@@ -211,27 +207,19 @@ impl Agent {
             Ok(r) => {
                 let mut out = format!("undid \"{}\"", r.label);
                 for f in &r.restored {
-                    out.push_str(&format!(
-                        "
-  restored {f}"
-                    ));
+                    out.push_str(&format!("\n  restored {f}"));
                 }
                 for f in &r.skipped {
-                    out.push_str(&format!(
-                        "
-  kept {f}"
-                    ));
+                    out.push_str(&format!("\n  kept {f}"));
                 }
                 if r.restored.is_empty() {
-                    out.push_str(
-                        "
-  (nothing was put back)",
-                    );
+                    out.push_str("\n  (nothing was put back)");
                 }
                 self.send(AgentEvent::Info(out));
                 // the model's picture of those files is stale now
                 self.messages.push(Message::user(format!(
-                    "(the user ran /undo: {} file(s) were restored to how they were before your                      last changes. Read them again before editing.)",
+                    "(the user ran /undo: {} file(s) were restored to how they were before \
+                     your last changes. Read them again before editing.)",
                     r.restored.len()
                 )));
             }
@@ -264,12 +252,16 @@ impl Agent {
                     if let Err(e) = self.run_turn(&input).await {
                         self.send(AgentEvent::Error(format!("{e:#}")));
                     }
-                    // everything this request changed becomes one checkpoint
+                    // everything this request changed becomes one checkpoint.
+                    // Worth saying once: after that the diffs speak for
+                    // themselves and a line per request is just noise
                     let n = undo::commit(input.lines().next().unwrap_or(""));
-                    if n > 0 {
-                        self.send(AgentEvent::Info(format!(
-                            "{n} file change(s) saved. /undo puts them back"
-                        )));
+                    if n > 0 && !self.said_undo {
+                        self.said_undo = true;
+                        self.send(AgentEvent::Info(
+                            "the files this changed are saved: /undo puts a whole request back"
+                                .into(),
+                        ));
                     }
                 }
                 AgentCmd::Undo { list } => self.undo(list),

@@ -95,18 +95,7 @@ pub fn record(path: &Path, before: Before) {
         return;
     }
     let mut p = pending().lock().unwrap();
-    let used: usize = p
-        .iter()
-        .map(|c| match &c.before {
-            Before::Text(t) => t.len(),
-            _ => 0,
-        })
-        .sum();
-    let size = match &before {
-        Before::Text(t) => t.len(),
-        _ => 0,
-    };
-    if used + size > MAX_SNAPSHOT_BYTES {
+    if !fits(&p, &before) {
         return;
     }
     p.push(Change {
@@ -114,6 +103,17 @@ pub fn record(path: &Path, before: Before) {
         before,
         after: hash_of_file(path),
     });
+}
+
+/// Whether one more snapshot still fits in a request's budget. A request
+/// that rewrites half a repository stops being snapshotted rather than
+/// filling the disk with copies of it.
+fn fits(taken: &[Change], next: &Before) -> bool {
+    let size = |b: &Before| match b {
+        Before::Text(t) => t.len(),
+        _ => 0,
+    };
+    taken.iter().map(|c| size(&c.before)).sum::<usize>() + size(next) <= MAX_SNAPSHOT_BYTES
 }
 
 /// Reads a file the way `record` wants it, before the change happens.
@@ -396,18 +396,19 @@ mod tests {
 
     #[test]
     fn a_snapshot_that_would_be_enormous_is_not_taken() {
-        let _g = guard();
-        let p = tmp("big.txt");
-        std::fs::write(&p, "x").unwrap();
-        record(&p, Before::Text("x".repeat(MAX_SNAPSHOT_BYTES / 2)));
-        record(&p, Before::Text("y".repeat(MAX_SNAPSHOT_BYTES / 2)));
-        record(&p, Before::Text("z".repeat(MAX_SNAPSHOT_BYTES)));
-        let mine = pending()
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|c| c.path == p)
-            .count();
-        assert_eq!(mine, 2, "the third is too much");
+        let half = |n: usize| Before::Text("x".repeat(MAX_SNAPSHOT_BYTES / n));
+        let taken = vec![
+            change(Path::new("a"), half(2)),
+            change(Path::new("b"), half(2)),
+        ];
+        // the budget is spent, so a big one is refused
+        assert!(!fits(&taken, &Before::Text("y".repeat(1000))));
+        // but a file that did not exist costs nothing to remember
+        assert!(fits(&taken, &Before::Missing));
+        assert!(fits(&[], &half(1)));
+        assert!(!fits(
+            &[],
+            &Before::Text("y".repeat(MAX_SNAPSHOT_BYTES + 1))
+        ));
     }
 }

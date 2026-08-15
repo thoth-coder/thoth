@@ -761,14 +761,7 @@ mod tests {
         let dir = std::env::current_dir().unwrap().join("target/fs-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
-        let body: String = (1..=lines)
-            .map(|i| {
-                format!(
-                    "line {i}
-"
-                )
-            })
-            .collect();
+        let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&p, body).unwrap();
         p
     }
@@ -841,13 +834,7 @@ mod tests {
     #[test]
     fn the_delete_preview_does_not_read_outside_the_project() {
         let outside = tmp("secret.txt", 3);
-        std::fs::write(
-            &outside,
-            "line 1
-sensitive
-",
-        )
-        .unwrap();
+        std::fs::write(&outside, "line 1\nsensitive\n").unwrap();
         let out = preview_delete(&serde_json::json!({
             "path": outside.to_string_lossy()
         }));
