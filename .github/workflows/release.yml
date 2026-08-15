@@ -63,12 +63,61 @@ jobs:
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      # the release itself is created once, by the publish job. Five build
+      # jobs each writing it is what put five "Full Changelog" lines in the
+      # notes of v0.3.0
+      - uses: actions/upload-artifact@v4
         with:
-          generate_release_notes: true
-          files: |
+          name: ${{ matrix.target }}
+          path: |
             thoth-*.tar.gz
             thoth-*.tar.gz.sha256
             thoth-*.zip
             thoth-*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for the compare link
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Notes for this version, out of the changelog
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          # everything under "## [1.2.3]" up to the next "## [" heading.
+          # index(...) == 1 is "starts with", which needs no escaping: as a
+          # regex the version's dots and brackets would not mean themselves
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && index($0, "## [") == 1 { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+          prev="$(git tag --sort=-v:refname | grep -vFx "$GITHUB_REF_NAME" | head -1)"
+          if [ -n "$prev" ]; then
+            printf '\n**Full changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME" >> notes.md
+          fi
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          # the notes are the changelog entry, written on purpose. Generated
+          # ones would add a commit list nobody reads and a second compare link
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: dist/*

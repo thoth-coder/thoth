@@ -5,6 +5,12 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Release notes are the changelog entry for the tag, put there by one
+  publish job instead of by all five build jobs at once. Each of them was
+  generating notes of its own, which is where the repeated
+  "**Full Changelog**" lines in v0.3.0 came from.
+
 ## [0.3.0] - 2026-08-16
 
 ### Added
