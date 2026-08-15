@@ -17,6 +17,9 @@ All notable changes to thoth are documented here. The format follows
 - Running cost. Set `price_in` / `price_out` / `price_cached` on a profile
   and the status bar, `/status` and `-p` show what the session has spent.
 - `/models` numbers the list, and `/model 3` picks from it.
+- The config screen asks which endpoint a new profile talks to (anthropic,
+  openai, gemini, openrouter, ollama) and fills in the url, so only the
+  model and the key are left to type.
 - Named config profiles. `thoth config` (or `thoth cfg`) opens a screen to
   edit them, `/config` does the same inside a session and applies the saved
   profile to the running conversation. `thoth -P NAME` runs one profile

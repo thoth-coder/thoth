@@ -14,10 +14,24 @@ and from inside a session, `/config` (or `/cfg`). Saving there applies the
 profile to the running session right away: the model, server, context
 window and turn budget change, the conversation stays.
 
-On the screen: `up`/`down` moves, `tab` switches between the profile list
-and the settings, `enter` edits, `space` toggles, `a` makes a profile
-active, `n` adds one, `r` renames, `d` deletes, `ctrl+s` saves, `esc`
-leaves. Api keys show as dots until you open the field.
+The screen is one column: every profile, a row to add one, then the settings
+of whichever profile you last stood on (the divider says which). `up`/`down`
+moves through all of it, `tab` jumps from the list straight to the settings,
+and the row you are on decides what the keys do, which the bottom line
+always spells out.
+
+On a setting: **type to replace it**, or `enter` to edit what is there.
+`enter` keeps the value, `tab` keeps it and moves down, `esc` throws the
+edit away. `space` flips the ones that are a choice rather than text (`api`,
+`think`). Api keys show as dots until you open them.
+
+In the profile list: `n` adds one, `r` renames, `d` deletes, `a` makes it
+the active one, the profile thoth starts with. `←`/`→` also switches
+profile from anywhere on the screen.
+
+`ctrl+s` saves. `esc` leaves, and asks first if anything is unsaved. A new
+profile starts by asking which endpoint it talks to, so the url is filled
+in for you and only the model and key are left.
 
 Without the screen:
 
