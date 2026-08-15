@@ -20,6 +20,11 @@ All notable changes to thoth are documented here. The format follows
 - `multi_edit`: several replacements in one file in a single call, applied in
   order, all of them or none. One round trip instead of one per change, one
   diff to approve, and no way to leave a file half edited.
+- `move_file` and `delete_file`. Renaming and deleting used to mean reaching
+  for the shell, which skips the read registry, shows no diff, and turns one
+  "always allow" into a standing permission to run `rm`. Deleting needs the
+  whole file read first (the same condition as overwriting it), only works
+  inside the working directory, and never touches a directory.
 - `todo`: the plan for the task, written before starting and rewritten as it
   goes. It keeps a model from losing track of step three of five, and lets
   you see the plan is wrong before the work is done. Only the latest version
@@ -50,6 +55,9 @@ All notable changes to thoth are documented here. The format follows
   older result in the context with a one-line note. Two copies of the same
   file are one copy of dead weight; a read of a different range, or a search
   with a different pattern, is left alone because it says something else.
+- The prompt ends with one worked example of a small task from grep to final
+  answer, and says how many tool calls are left for the request. Small models
+  follow an example better than another rule.
 - The style rules now say what not to write: no listing the edits again, no
   repeating the plan just carried out, no explaining code that was not asked
   about, and an answer as long as the question deserves.

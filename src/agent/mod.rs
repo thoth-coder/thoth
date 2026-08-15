@@ -126,11 +126,12 @@ impl Agent {
         cancel_slot: Arc<Mutex<CancellationToken>>,
     ) -> Self {
         let window = window_of(&client, &cfg);
+        let turns = cfg.max_turns;
         Self {
             auto_compact_at: compact_threshold(&client, &cfg),
             client,
             cfg,
-            messages: vec![Message::system(prompt::system_prompt(window))],
+            messages: vec![Message::system(prompt::system_prompt(window, turns))],
             always_allow: crate::agent::session::load_allow(),
             tx,
             cancel_slot,
@@ -218,11 +219,11 @@ impl Agent {
                     // (and any project changes) are picked up immediately
                     self.messages.clear();
                     self.repeated.clear();
-                    self.messages
-                        .push(Message::system(prompt::system_prompt(window_of(
-                            &self.client,
-                            &self.cfg,
-                        ))));
+                    let window = window_of(&self.client, &self.cfg);
+                    self.messages.push(Message::system(prompt::system_prompt(
+                        window,
+                        self.cfg.max_turns,
+                    )));
                     crate::agent::session::clear();
                     self.send(AgentEvent::Info("conversation context cleared".into()));
                 }

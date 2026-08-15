@@ -160,7 +160,7 @@ fast), then verify with the shell tool (build/tests) when practical."
     out
 }
 
-pub fn system_prompt(window: Option<u32>) -> String {
+pub fn system_prompt(window: Option<u32>, max_turns: usize) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
@@ -194,6 +194,7 @@ file with write_file is rejected unless you read it first, and even then it is t
 for small changes. write_file is for brand-new files.
 - old_string in edit_file must be copied exactly from the file, without the line-number prefix \
 that read_file shows.
+- Several changes to the same file go in ONE multi_edit call, not one edit_file after another.
 - NEVER delete, rename or move a file to get around the read-before-write rule. If write_file \
 is rejected because the file exists, read_file it, then edit_file or rewrite it. Deleting user \
 files without being asked is destructive.
@@ -247,15 +248,24 @@ timeout. Use shell with background=true, test it (e.g. with curl), then kill the
 given when done.
 
 Working on larger tasks (multiple files, restructuring):
-- First reply with a short numbered plan (max 6 steps, one line each), then execute it one step \
-at a time. Do not touch files outside the plan.
+- More than about three steps: call the todo tool with the plan before starting, keep exactly \
+one item marked doing, and update it as you go. Do not touch files outside the plan.
 - Change one file at a time and run the build/typecheck after each meaningful change, not only \
 at the end.
 - Never repeat a tool call that already succeeded, or that already failed the same way. If you \
 notice you are not making progress, stop and tell the user what is blocking you.
 
+A small task, from start to finish:
+  grep \"healthz\" context 4          -> src/server.ts:41 has the handler
+  read_file src/server.ts offset 30 limit 40
+  edit_file src/server.ts            one exact snippet, nothing else touched
+  shell \"npm test\"                   -> passes
+  \"Fixed: the handler returned before the promise resolved. npm test passes.\"
+
 Keep calling tools until the task is done, then stop calling tools and give the short final \
-answer. If a tool returns an error, read it and adjust. Do not repeat the same failing call."
+answer. You have at most {max_turns} tool calls for this request, so do not spend them looking \
+at things you do not need. If a tool returns an error, read it and adjust. Do not repeat the \
+same failing call."
     )
 }
 
@@ -304,7 +314,7 @@ mod budget {
     #[test]
     #[ignore]
     fn prompt_budget() {
-        let prompt = super::system_prompt(None);
+        let prompt = super::system_prompt(None, 40);
         let tools = crate::tools::definitions(crate::editor::connected()).to_string();
         let est = |s: &str| s.len() / 4;
         let situational = super::situational_rules(true, true).len()
@@ -319,7 +329,7 @@ mod budget {
         let _ = (&prompt, &tools);
         println!("\n window   prompt   tools   fixed total   share of the window");
         for w in [8_192u32, 16_384, 32_768, 200_000] {
-            let prompt = est(&super::system_prompt(Some(w)));
+            let prompt = est(&super::system_prompt(Some(w), 40));
             let tools = est(&crate::tools::definitions(crate::editor::connected()).to_string());
             println!(
                 "{w:>7}   {prompt:>6}   {tools:>5}   {:>11}   {:.0}%",
