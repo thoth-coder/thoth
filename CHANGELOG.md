@@ -17,6 +17,13 @@ All notable changes to thoth are documented here. The format follows
 - Running cost. Set `price_in` / `price_out` / `price_cached` on a profile
   and the status bar, `/status` and `-p` show what the session has spent.
 - `/models` numbers the list, and `/model 3` picks from it.
+- `multi_edit`: several replacements in one file in a single call, applied in
+  order, all of them or none. One round trip instead of one per change, one
+  diff to approve, and no way to leave a file half edited.
+- `todo`: the plan for the task, written before starting and rewritten as it
+  goes. It keeps a model from losing track of step three of five, and lets
+  you see the plan is wrong before the work is done. Only the latest version
+  of the list stays in the context.
 - The config screen asks which endpoint a new profile talks to (anthropic,
   openai, gemini, openrouter, ollama) and fills in the url, so only the
   model and the key are left to type.

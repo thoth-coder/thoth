@@ -8,12 +8,14 @@
 | `list_dir` | list a directory | auto |
 | `glob` | find files by pattern, e.g. `**/*.rs` | auto |
 | `grep` | regex search over file contents, `context` shows surrounding lines | auto |
-| `problems` | current errors/warnings from the editor (needs the VS Code extension) | auto |
+| `problems` | current errors/warnings from the editor (only offered when the VS Code extension is connected) | auto |
+| `todo` | the plan for the task, rewritten as it goes | auto |
 | `web_search` | web search through DuckDuckGo, no API key needed | auto |
 | `web_fetch` | fetch a URL as readable text | asks per host |
 | `remember` | save a durable fact to project memory | asks first |
 | `write_file` | create a new file | asks first |
 | `edit_file` | exact string replacement in a file | asks first |
+| `multi_edit` | several replacements in one file, all or nothing | asks first |
 | `shell` | run a command (PowerShell on Windows, sh elsewhere) | asks per program |
 
 Permission prompt answers: `y` this once, `a` always, `n` deny. On deny the

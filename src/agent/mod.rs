@@ -572,15 +572,19 @@ impl Agent {
     /// repeated with the exact same arguments, the earlier result is replaced
     /// by a one-line note. Identical arguments is the whole safety condition:
     /// a read of another range, or a search with another pattern, says
-    /// something the newer one does not, and is left alone.
+    /// something the newer one does not, and is left alone. The todo list is
+    /// the exception that needs no arguments to match: it is one list.
     fn drop_stale_copy(&mut self, tc: &ToolCall) {
-        if !matches!(
-            tc.function.name.as_str(),
-            "read_file" | "grep" | "glob" | "list_dir" | "problems" | "web_fetch" | "web_search"
-        ) {
-            return;
-        }
-        let key = format!("{}:{}", tc.function.name, tc.function.arguments);
+        let key = match tc.function.name.as_str() {
+            // the plan is one thing that keeps being rewritten: only the
+            // latest version of it means anything
+            "todo" => "todo".to_string(),
+            "read_file" | "grep" | "glob" | "list_dir" | "problems" | "web_fetch"
+            | "web_search" => {
+                format!("{}:{}", tc.function.name, tc.function.arguments)
+            }
+            _ => return,
+        };
         let Some(old_id) = self.repeated.insert(key, tc.id.clone()) else {
             return;
         };

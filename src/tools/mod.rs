@@ -2,6 +2,7 @@ pub mod fs;
 pub mod memory;
 pub mod search;
 pub mod shell;
+pub mod todo;
 pub mod web;
 
 use anyhow::{Result, bail};
@@ -52,6 +53,28 @@ pub fn definitions(with_problems: bool) -> Value {
                 "new_string": {"type": "string", "description": "Replacement text"},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
             }, "required": ["path", "old_string", "new_string"]}
+        }},
+        {"type": "function", "function": {
+            "name": "multi_edit",
+            "description": "Several exact replacements in ONE file, in order, all of them or none. Same rules as edit_file. Use this instead of calling edit_file twice on the same file.",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+                "edits": {"type": "array", "description": "In order; a later edit sees what the earlier ones did", "items": {"type": "object", "properties": {
+                    "old_string": {"type": "string", "description": "Exact existing text to find"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
+                }, "required": ["old_string", "new_string"]}}
+            }, "required": ["path", "edits"]}
+        }},
+        {"type": "function", "function": {
+            "name": "todo",
+            "description": "The plan for the task you are on. Send the whole list every time, exactly one item marked doing. Use it for anything with more than about three steps, before starting.",
+            "parameters": {"type": "object", "properties": {
+                "items": {"type": "array", "items": {"type": "object", "properties": {
+                    "text": {"type": "string"},
+                    "status": {"type": "string", "enum": ["todo", "doing", "done"]}
+                }, "required": ["text"]}}
+            }, "required": ["items"]}
         }},
         {"type": "function", "function": {
             "name": "list_dir",
@@ -134,7 +157,7 @@ The command already runs in the working directory, no need to cd first.";
 
 pub fn needs_permission(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "edit_file" | "shell" | "remember" | "web_fetch" => true,
+        "write_file" | "edit_file" | "multi_edit" | "shell" | "remember" | "web_fetch" => true,
         // reading inside the project is free; reaching outside it is not
         "read_file" => !fs::inside_project(args.get("path").and_then(|v| v.as_str()).unwrap_or("")),
         _ => false,
@@ -196,6 +219,15 @@ pub fn summarize(name: &str, args: &Value) -> String {
     let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let s = match name {
         "read_file" | "write_file" | "edit_file" => get("path").to_string(),
+        "multi_edit" => format!(
+            "{} ({} edits)",
+            get("path"),
+            args.get("edits")
+                .and_then(|e| e.as_array())
+                .map(|e| e.len())
+                .unwrap_or(0)
+        ),
+        "todo" => todo::summary(args),
         "list_dir" => {
             let p = get("path");
             if p.is_empty() {
@@ -230,6 +262,7 @@ pub fn preview(name: &str, args: &Value) -> String {
         }
         "write_file" => fs::preview_write(args),
         "edit_file" => fs::preview_edit(args),
+        "multi_edit" => fs::preview_multi_edit(args),
         "read_file" => format!(
             "read {} (outside this project)",
             args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
@@ -256,6 +289,8 @@ pub async fn execute(
         "read_file" => fs::read_file(serde_json::from_value(args)?, cap)?,
         "write_file" => fs::write_file(serde_json::from_value(args)?)?,
         "edit_file" => fs::edit_file(serde_json::from_value(args)?)?,
+        "multi_edit" => fs::multi_edit(serde_json::from_value(args)?)?,
+        "todo" => todo::write(serde_json::from_value(args)?)?,
         "list_dir" => fs::list_dir(serde_json::from_value(args)?)?,
         "glob" => fs::glob_files(serde_json::from_value(args)?)?,
         "grep" => search::grep(serde_json::from_value(args)?)?,

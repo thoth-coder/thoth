@@ -281,6 +281,101 @@ pub fn edit_file(a: EditArgs) -> Result<String> {
     Ok(format!("Edited {} ({n} replacement(s))", path.display()))
 }
 
+#[derive(Deserialize, Clone)]
+pub struct EditStep {
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Deserialize)]
+pub struct MultiEditArgs {
+    pub path: String,
+    pub edits: Vec<EditStep>,
+}
+
+/// Every edit to one file, or none of them. One call instead of one per
+/// change saves a model round trip each time, which on a local model is the
+/// difference between seconds and minutes, and it cannot leave the file half
+/// edited the way a third call that fails would.
+pub fn multi_edit(a: MultiEditArgs) -> Result<String> {
+    let path = resolve(&a.path);
+    if !was_read(&path) {
+        bail!(
+            "you have not read {} in this session. read it with read_file before editing",
+            path.display()
+        );
+    }
+    if a.edits.is_empty() {
+        bail!("edits is empty: nothing to do");
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let (new_content, n) = apply_edits(&content, &a.edits, &path.display().to_string())?;
+    std::fs::write(&path, new_content)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(format!(
+        "Edited {} ({} edits, {n} replacement(s))",
+        path.display(),
+        a.edits.len()
+    ))
+}
+
+/// Shared by the tool and its preview, so what the user approves is exactly
+/// what gets written. Fails on the first edit that does not apply, having
+/// changed nothing on disk.
+fn apply_edits(content: &str, edits: &[EditStep], name: &str) -> Result<(String, usize)> {
+    let mut out = content.to_string();
+    let mut total = 0usize;
+    for (i, e) in edits.iter().enumerate() {
+        let step = i + 1;
+        if e.old_string == e.new_string {
+            bail!("edit {step}: old_string and new_string are identical");
+        }
+        let count = out.matches(&e.old_string).count();
+        if count == 0 {
+            bail!(
+                "edit {step}: old_string not found in {name}. copy the exact text, and remember \
+                 that an earlier edit in this same call may have changed it"
+            );
+        }
+        if !e.replace_all && count > 1 {
+            bail!(
+                "edit {step}: old_string appears {count} times in {name}. add surrounding \
+                 context to make it unique, or set replace_all"
+            );
+        }
+        out = if e.replace_all {
+            total += count;
+            out.replace(&e.old_string, &e.new_string)
+        } else {
+            total += 1;
+            out.replacen(&e.old_string, &e.new_string, 1)
+        };
+    }
+    Ok((out, total))
+}
+
+/// The whole set of edits as one diff: what the user approves is the file
+/// they will end up with, not a list of snippets to apply in their head.
+pub fn preview_multi_edit(args: &Value) -> String {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+    let edits: Vec<EditStep> = args
+        .get("edits")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let header = format!("Edit {path} ({} edits):\n", edits.len());
+    let Ok(content) = std::fs::read_to_string(resolve(path)) else {
+        return header + "(cannot read file)\n";
+    };
+    match apply_edits(&content, &edits, path) {
+        Ok((new_content, _)) => header + &unified_diff(&content, &new_content),
+        Err(e) => format!("{header}({e:#}, this call will fail)\n"),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ListArgs {
     pub path: Option<String>,
@@ -505,6 +600,98 @@ mod tests {
             12_000,
         )
         .unwrap();
+    }
+
+    fn steps(v: &[(&str, &str)]) -> Vec<EditStep> {
+        v.iter()
+            .map(|(o, n)| EditStep {
+                old_string: (*o).to_string(),
+                new_string: (*n).to_string(),
+                replace_all: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn several_edits_land_in_one_pass() {
+        let p = tmp("multi.txt", 0);
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        read(&p, 1, 600);
+        let out = multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("one", "1"), ("three", "3")]),
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1\ntwo\n3\n");
+        assert!(out.contains("2 edits"), "{out}");
+    }
+
+    /// The point of doing them together: a set that cannot be applied leaves
+    /// the file exactly as it was, instead of half changed the way three
+    /// separate calls would when the third one fails.
+    #[test]
+    fn one_bad_edit_writes_nothing() {
+        let p = tmp("atomic.txt", 0);
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        read(&p, 1, 600);
+        let err = multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("alpha", "A"), ("nowhere", "X")]),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("edit 2"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "alpha\nbeta\n",
+            "the file must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_later_edit_sees_what_an_earlier_one_did() {
+        let p = tmp("chain.txt", 0);
+        std::fs::write(&p, "value = 1\n").unwrap();
+        read(&p, 1, 600);
+        multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("value = 1", "value = 2"), ("value = 2", "value = 3")]),
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "value = 3\n");
+    }
+
+    #[test]
+    fn it_obeys_read_before_write_like_every_other_edit() {
+        let p = tmp("unread.txt", 0);
+        std::fs::write(&p, "hello\n").unwrap();
+        let err = multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("hello", "bye")]),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("read"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn the_preview_is_the_whole_change_as_one_diff() {
+        let p = tmp("preview.txt", 0);
+        std::fs::write(&p, "a\nb\n").unwrap();
+        let out = preview_multi_edit(&serde_json::json!({
+            "path": p.to_string_lossy(),
+            "edits": [
+                {"old_string": "a", "new_string": "A"},
+                {"old_string": "b", "new_string": "B"}
+            ]
+        }));
+        assert!(out.contains("2 edits"), "{out}");
+        assert!(out.contains('A') && out.contains('B'), "{out}");
+        // and a set that cannot apply says so instead of showing a lie
+        let bad = preview_multi_edit(&serde_json::json!({
+            "path": p.to_string_lossy(),
+            "edits": [{"old_string": "zzz", "new_string": "!"}]
+        }));
+        assert!(bad.contains("will fail"), "{bad}");
     }
 
     /// The hole found in review: peeking at the first and the last line used
