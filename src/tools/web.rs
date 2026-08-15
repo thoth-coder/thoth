@@ -10,7 +10,6 @@ use std::time::Duration;
 const UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) thoth/0.1";
 const MAX_RESULTS: usize = 8;
-const MAX_FETCH_CHARS: usize = 15_000;
 
 fn http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -72,7 +71,9 @@ pub struct FetchArgs {
     pub url: String,
 }
 
-pub async fn fetch(a: FetchArgs) -> Result<String> {
+/// `cap` is the caller's budget: cutting here keeps the "(page truncated)"
+/// line, which a blind cut by the caller would take off the end.
+pub async fn fetch(a: FetchArgs, cap: usize) -> Result<String> {
     if !a.url.starts_with("http://") && !a.url.starts_with("https://") {
         bail!("url must start with http:// or https://");
     }
@@ -99,8 +100,9 @@ pub async fn fetch(a: FetchArgs) -> Result<String> {
         body
     };
     let mut text = text.trim().to_string();
-    if text.chars().count() > MAX_FETCH_CHARS {
-        text = text.chars().take(MAX_FETCH_CHARS).collect();
+    let room = cap.saturating_sub(40);
+    if text.chars().count() > room {
+        text = text.chars().take(room).collect();
         text.push_str("\n... (page truncated)");
     }
     if text.is_empty() {
@@ -215,9 +217,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn fetch_extracts_text() {
-        let out = fetch(FetchArgs {
-            url: "https://example.com".into(),
-        })
+        let out = fetch(
+            FetchArgs {
+                url: "https://example.com".into(),
+            },
+            12_000,
+        )
         .await
         .unwrap();
         assert!(out.to_lowercase().contains("example domain"), "{out}");

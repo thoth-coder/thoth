@@ -9,7 +9,9 @@ const MAX_FILE_BYTES: u64 = 2_000_000;
 const MAX_MATCH_CHARS: usize = 250;
 const MAX_CONTEXT: usize = 10;
 // Stop early so the global tool-output cap does not cut a file mid-block.
-const MAX_OUT_CHARS: usize = 11_000;
+/// Room left for the note at the end, which is the part that tells the
+/// model what to do about a truncated search.
+const OUT_FOOTER: usize = 120;
 
 #[derive(Deserialize)]
 pub struct GrepArgs {
@@ -19,7 +21,11 @@ pub struct GrepArgs {
     pub context: Option<usize>,
 }
 
-pub fn grep(a: GrepArgs) -> Result<String> {
+/// `cap` is the caller's budget for the whole result. Stopping here rather
+/// than letting the caller cut the text keeps the closing note, which is the
+/// only part that says the search was incomplete.
+pub fn grep(a: GrepArgs, cap: usize) -> Result<String> {
+    let out_chars = cap.saturating_sub(OUT_FOOTER);
     let re = Regex::new(&a.pattern).with_context(|| format!("invalid regex: {}", a.pattern))?;
     let root = resolve(a.path.as_deref().unwrap_or("."));
     let glob_matcher = match &a.glob {
@@ -63,7 +69,7 @@ pub fn grep(a: GrepArgs) -> Result<String> {
                     let line: String = line.chars().take(MAX_MATCH_CHARS).collect();
                     out.push_str(&format!("{rel}:{}: {line}\n", i + 1));
                     matches += 1;
-                    if matches >= MAX_MATCHES || out.chars().count() >= MAX_OUT_CHARS {
+                    if matches >= MAX_MATCHES || out.chars().count() >= out_chars {
                         return false;
                     }
                 }
@@ -102,7 +108,7 @@ pub fn grep(a: GrepArgs) -> Result<String> {
                 }
                 // check inside the loop: a file where everything matches
                 // would otherwise build megabytes before anyone looks
-                if matches >= MAX_MATCHES || out.chars().count() >= MAX_OUT_CHARS {
+                if matches >= MAX_MATCHES || out.chars().count() >= out_chars {
                     return false;
                 }
             }
@@ -134,7 +140,7 @@ pub fn grep(a: GrepArgs) -> Result<String> {
     }
     if matches >= MAX_MATCHES {
         out.push_str(&format!("… (stopped at {MAX_MATCHES} matches)\n"));
-    } else if out.chars().count() >= MAX_OUT_CHARS {
+    } else if out.chars().count() >= out_chars {
         out.push_str("… (stopped, output limit reached; narrow the pattern or path)\n");
     }
     Ok(out)
@@ -153,12 +159,15 @@ mod tests {
     }
 
     fn run(pattern: &str, path: &Path, context: Option<usize>) -> String {
-        grep(GrepArgs {
-            pattern: pattern.into(),
-            path: Some(path.to_string_lossy().into_owned()),
-            glob: None,
-            context,
-        })
+        grep(
+            GrepArgs {
+                pattern: pattern.into(),
+                path: Some(path.to_string_lossy().into_owned()),
+                glob: None,
+                context,
+            },
+            12_000,
+        )
         .unwrap()
     }
 

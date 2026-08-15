@@ -54,6 +54,11 @@ All notable changes to thoth are documented here. The format follows
   fixed at numbers tuned for 16k: how much of a tool result is kept, how much
   of a file `read_file` returns, and how much of the instruction file goes
   into the prompt. A small window keeps its room, a large one gets to use it.
+- `grep`, `web_fetch`, `list_dir` and `glob` cut their own output to the
+  budget too, the same way `read_file` does, so the line that says the
+  result was incomplete is not itself the thing that gets cut off. They had
+  fixed limits of their own (11k characters, 15k, 500 entries) that ignored
+  how much room there actually was.
 - `read_file` does its own cutting, so its "showing lines 1-240 of 900, read
   on with offset=241" survives. It used to be replaced by a blind truncation
   that left the model with no idea there was more, or how to ask for it.

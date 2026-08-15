@@ -89,11 +89,16 @@ directory to wipe it.
 
 ## Context management
 
-thoth auto-compacts at 2/3 of the window (when the window size is known,
-i.e. Ollama). If generation hits the limit mid-answer it compacts and
-continues. Identical repeated tool calls get blocked. After 40 agent steps
-it pauses and asks you to say "continue"; raise `max_turns` in the config if
-your tasks routinely need more.
+thoth auto-compacts at 2/3 of the window. On Ollama it knows the window
+because it sets it; on every other api it goes by `context_window` in the
+profile, and without one it never compacts on its own, so run `/compact`
+yourself. If generation hits the limit mid-answer it compacts and continues.
+
+Identical repeated tool calls get blocked, and a read-only call repeated
+with the same arguments replaces the older copy in the context rather than
+adding a second one. After 40 agent steps it pauses and asks you to say
+"continue"; raise `max_turns` in the profile if your tasks routinely need
+more.
 
 ## Project instructions
 

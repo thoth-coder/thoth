@@ -534,7 +534,7 @@ pub struct ListArgs {
     pub path: Option<String>,
 }
 
-pub fn list_dir(a: ListArgs) -> Result<String> {
+pub fn list_dir(a: ListArgs, cap: usize) -> Result<String> {
     let path = resolve(a.path.as_deref().unwrap_or("."));
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
@@ -555,16 +555,31 @@ pub fn list_dir(a: ListArgs) -> Result<String> {
     if all.is_empty() {
         return Ok("(empty directory)".into());
     }
+    Ok(fit_entries(all, cap))
+}
+
+/// As many entries as fit the budget, with a line saying what was left out.
+/// Counting entries alone is not enough: 500 long paths overrun a small
+/// window, and the note explaining that would be the first thing cut.
+fn fit_entries(all: Vec<String>, cap: usize) -> String {
+    let room = cap.saturating_sub(40);
     let total = all.len();
-    let mut out = all
-        .into_iter()
-        .take(MAX_ENTRIES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if total > MAX_ENTRIES {
-        out.push_str(&format!("\n… ({} more entries)", total - MAX_ENTRIES));
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for e in all.into_iter().take(MAX_ENTRIES) {
+        if out.len() + e.len() + 1 > room && shown > 0 {
+            break;
+        }
+        if shown > 0 {
+            out.push('\n');
+        }
+        out.push_str(&e);
+        shown += 1;
     }
-    Ok(out)
+    if total > shown {
+        out.push_str(&format!("\n… ({} more entries)", total - shown));
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -573,7 +588,7 @@ pub struct GlobArgs {
     pub path: Option<String>,
 }
 
-pub fn glob_files(a: GlobArgs) -> Result<String> {
+pub fn glob_files(a: GlobArgs, cap: usize) -> Result<String> {
     let root = resolve(a.path.as_deref().unwrap_or("."));
     let matcher = GlobBuilder::new(&a.pattern)
         .literal_separator(false)
@@ -594,7 +609,7 @@ pub fn glob_files(a: GlobArgs) -> Result<String> {
         return Ok(format!("No files matching '{}'", a.pattern));
     }
     results.sort();
-    Ok(results.join("\n"))
+    Ok(fit_entries(results, cap))
 }
 
 /// Walk `root` yielding files only, skipping ignored directories.
@@ -1009,6 +1024,23 @@ mod tests {
     /// the caller cut the text at a fixed 12k characters, which threw away
     /// read_file's own footer. Losing that footer is what left the model not
     /// knowing there was more of the file, or how to ask for it.
+    /// The same double-cap trap read_file had: a listing that overran the
+    /// caller's budget got cut blind, taking the "there is more" note with
+    /// it. It has to fit and still say what was left out.
+    #[test]
+    fn a_listing_fits_the_budget_and_says_what_it_left_out() {
+        let many: Vec<String> = (0..300)
+            .map(|i| format!("some/long/path/file-{i}.rs"))
+            .collect();
+        let out = fit_entries(many.clone(), 400);
+        assert!(out.len() <= 400, "over budget: {}", out.len());
+        assert!(out.contains("more entries"), "{out}");
+        // room for everything: no note, nothing dropped
+        let out = fit_entries(many, 100_000);
+        assert!(!out.contains("more entries"), "{out}");
+        assert_eq!(out.lines().count(), 300);
+    }
+
     #[test]
     fn a_small_budget_still_says_where_to_carry_on() {
         let p = tmp("budget.txt", 1000);
