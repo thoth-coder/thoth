@@ -64,6 +64,13 @@ fn state_dir() -> Option<PathBuf> {
 }
 
 /// Short live label for the TUI, e.g. "In Cargo.toml, 7 lines selected".
+/// True when the companion extension is writing state we can read. The
+/// `problems` tool and the prompt rules about it are only worth their tokens
+/// when there is an editor on the other end.
+pub fn connected() -> bool {
+    freshest_state().is_some()
+}
+
 pub fn live_status() -> Option<String> {
     let state = freshest_state()?;
     status_from_state(&state)

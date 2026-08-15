@@ -122,11 +122,12 @@ impl Agent {
         tx: mpsc::UnboundedSender<AgentEvent>,
         cancel_slot: Arc<Mutex<CancellationToken>>,
     ) -> Self {
+        let window = window_of(&client, &cfg);
         Self {
             auto_compact_at: compact_threshold(&client, &cfg),
             client,
             cfg,
-            messages: vec![Message::system(prompt::system_prompt())],
+            messages: vec![Message::system(prompt::system_prompt(window))],
             always_allow: crate::agent::session::load_allow(),
             tx,
             cancel_slot,
@@ -212,7 +213,11 @@ impl Agent {
                     // rebuild the system prompt so memory saved this session
                     // (and any project changes) are picked up immediately
                     self.messages.clear();
-                    self.messages.push(Message::system(prompt::system_prompt()));
+                    self.messages
+                        .push(Message::system(prompt::system_prompt(window_of(
+                            &self.client,
+                            &self.cfg,
+                        ))));
                     crate::agent::session::clear();
                     self.send(AgentEvent::Info("conversation context cleared".into()));
                 }
@@ -274,7 +279,8 @@ impl Agent {
         let token = CancellationToken::new();
         *self.cancel_slot.lock().unwrap() = token.clone();
         let args = serde_json::json!({ "command": command });
-        let (content, is_error) = match tools::execute("shell", args, token).await {
+        let cap = tools::output_cap(window_of(&self.client, &self.cfg));
+        let (content, is_error) = match tools::execute("shell", args, token, cap).await {
             Ok(s) => (s, false),
             Err(e) => (format!("Error: {e:#}"), true),
         };
@@ -378,7 +384,10 @@ impl Agent {
             ));
         }
         self.messages.push(Message::user(full_input));
-        let tools_def = tools::definitions();
+        // both depend on where this turn is running: how much room a result
+        // may take, and whether there is an editor to ask about problems
+        let cap = tools::output_cap(window_of(&self.client, &self.cfg));
+        let tools_def = tools::definitions(crate::editor::connected());
         // breaks infinite loops: counts identical tool calls within this task
         let mut call_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
@@ -516,7 +525,7 @@ impl Agent {
                     ));
                     continue;
                 }
-                let result = self.run_tool(tc, &token).await;
+                let result = self.run_tool(tc, &token, cap).await;
                 let (content, is_error) = match result {
                     Ok(s) => (s, false),
                     Err(e) => (format!("Error: {e:#}"), true),
@@ -549,7 +558,12 @@ impl Agent {
         Ok(())
     }
 
-    async fn run_tool(&mut self, tc: &ToolCall, token: &CancellationToken) -> Result<String> {
+    async fn run_tool(
+        &mut self,
+        tc: &ToolCall,
+        token: &CancellationToken,
+        cap: usize,
+    ) -> Result<String> {
         let name = tc.function.name.as_str();
         let args: Value = serde_json::from_str(&tc.function.arguments)
             .map_err(|e| anyhow!("invalid JSON in tool arguments: {e}"))?;
@@ -596,7 +610,7 @@ impl Agent {
             }
         }
 
-        tools::execute(name, args, token.clone()).await
+        tools::execute(name, args, token.clone(), cap).await
     }
 }
 

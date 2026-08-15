@@ -8,12 +8,24 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-// Sized for local-model context windows (~16k tokens): one tool result
-// should never eat more than ~3k tokens.
-pub const MAX_OUTPUT_CHARS: usize = 12_000;
+/// How many characters of a tool result are worth keeping, for a context
+/// window of this many tokens. One result should not crowd out the
+/// conversation, but a large window is allowed to use the room it has: the
+/// old fixed 12k was tuned for 16k windows and made a 200k one useless.
+pub fn output_cap(window: Option<u32>) -> usize {
+    match window {
+        Some(w) => (w as usize * 3 / 4).clamp(4_000, 80_000),
+        // nobody said how big the window is: keep the number that was tuned
+        // for 16k, because guessing high is how a small server gets its
+        // context eaten by one grep
+        None => 12_000,
+    }
+}
 
-pub fn definitions() -> Value {
-    json!([
+/// `with_problems` drops the editor tool when no editor is connected: a tool
+/// that cannot work is schema tokens spent on a wrong turn waiting to happen.
+pub fn definitions(with_problems: bool) -> Value {
+    let mut defs = json!([
         {"type": "function", "function": {
             "name": "read_file",
             "description": "Read a text file from disk. Returns the content with line numbers. For large files use offset (1-based start line) and limit (max lines).",
@@ -67,11 +79,6 @@ pub fn definitions() -> Value {
             }, "required": ["pattern"]}
         }},
         {"type": "function", "function": {
-            "name": "problems",
-            "description": "Get the current errors and warnings from the user's editor (the IDE Problems panel, live from the language server). Cheap and fast. Use it after editing files to check whether problems are fixed, before falling back to a full build. Diagnostics may lag a moment behind edits.",
-            "parameters": {"type": "object", "properties": {}}
-        }},
-        {"type": "function", "function": {
             "name": "remember",
             "description": "Save one durable fact to project memory (persists across sessions and /clear). Use for: project conventions discovered the hard way, decisions the user made, gotchas that cost time. One short sentence per call. Do NOT save things already visible in the code.",
             "parameters": {"type": "object", "properties": {
@@ -101,7 +108,15 @@ pub fn definitions() -> Value {
                 "timeout_secs": {"type": "integer", "description": "Foreground timeout in seconds (default 120, max 600). Raise it for slow builds."}
             }, "required": ["command"]}
         }}
-    ])
+    ]);
+    if with_problems && let Some(list) = defs.as_array_mut() {
+        list.push(json!({"type": "function", "function": {
+            "name": "problems",
+            "description": "Get the current errors and warnings from the user's editor (the IDE Problems panel, live from the language server). Cheap and fast. Use it after editing files to check whether problems are fixed, before falling back to a full build. Diagnostics may lag a moment behind edits.",
+            "parameters": {"type": "object", "properties": {}}
+        }}));
+    }
+    defs
 }
 
 fn shell_description() -> String {
@@ -231,9 +246,14 @@ pub fn preview(name: &str, args: &Value) -> String {
     }
 }
 
-pub async fn execute(name: &str, args: Value, cancel: CancellationToken) -> Result<String> {
+pub async fn execute(
+    name: &str,
+    args: Value,
+    cancel: CancellationToken,
+    cap: usize,
+) -> Result<String> {
     let out = match name {
-        "read_file" => fs::read_file(serde_json::from_value(args)?)?,
+        "read_file" => fs::read_file(serde_json::from_value(args)?, cap)?,
         "write_file" => fs::write_file(serde_json::from_value(args)?)?,
         "edit_file" => fs::edit_file(serde_json::from_value(args)?)?,
         "list_dir" => fs::list_dir(serde_json::from_value(args)?)?,
@@ -246,7 +266,7 @@ pub async fn execute(name: &str, args: Value, cancel: CancellationToken) -> Resu
         "shell" => shell::run(serde_json::from_value(args)?, cancel).await?,
         _ => bail!("unknown tool: {name}"),
     };
-    Ok(truncate_output(out))
+    Ok(truncate_output(out, cap))
 }
 
 pub fn truncate_line(s: &str, max: usize) -> String {
@@ -259,10 +279,51 @@ pub fn truncate_line(s: &str, max: usize) -> String {
     }
 }
 
-pub fn truncate_output(s: String) -> String {
-    if s.chars().count() <= MAX_OUTPUT_CHARS {
+pub fn truncate_output(s: String, cap: usize) -> String {
+    if s.chars().count() <= cap {
         return s;
     }
-    let cut: String = s.chars().take(MAX_OUTPUT_CHARS).collect();
-    format!("{cut}\n… (output truncated at {MAX_OUTPUT_CHARS} characters)")
+    let cut: String = s.chars().take(cap).collect();
+    format!("{cut}\n… (output truncated at {cap} characters. narrow the search, or read a range)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_output_cap_follows_the_window() {
+        // what a 16k window used to get, kept as the reference point
+        assert_eq!(output_cap(Some(16_384)), 12_288);
+        // a big window is allowed to use its room, a tiny one is protected
+        assert!(output_cap(Some(200_000)) > output_cap(Some(32_768)));
+        assert_eq!(output_cap(Some(200_000)), 80_000);
+        assert_eq!(output_cap(Some(2_000)), 4_000);
+        // an unknown window must not be treated as a generous one
+        assert_eq!(output_cap(None), 12_000);
+        assert!(output_cap(None) < output_cap(Some(32_768)));
+    }
+
+    #[test]
+    fn the_editor_tool_is_only_offered_with_an_editor() {
+        let names = |with: bool| {
+            definitions(with)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(true).contains(&"problems".to_string()));
+        assert!(!names(false).contains(&"problems".to_string()));
+        assert_eq!(names(true).len(), names(false).len() + 1);
+    }
+
+    #[test]
+    fn truncation_says_where_the_limit_came_from() {
+        let out = truncate_output("x".repeat(100), 20);
+        assert!(out.starts_with(&"x".repeat(20)));
+        assert!(out.contains("truncated at 20 characters"), "{out}");
+        assert_eq!(truncate_output("short".into(), 20), "short");
+    }
 }

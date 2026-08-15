@@ -138,7 +138,11 @@ pub struct ReadArgs {
     pub limit: Option<usize>,
 }
 
-pub fn read_file(a: ReadArgs) -> Result<String> {
+/// `cap` is the same budget the caller would truncate the result at. Doing
+/// the cutting here instead means the reader still gets told which lines it
+/// got and how to ask for the rest, which a blind truncation would take away
+/// exactly when it matters most.
+pub fn read_file(a: ReadArgs, cap: usize) -> Result<String> {
     let path = resolve(&a.path);
     if let Ok(meta) = std::fs::metadata(&path)
         && meta.len() > MAX_FILE_BYTES
@@ -155,14 +159,17 @@ pub fn read_file(a: ReadArgs) -> Result<String> {
     let offset = a.offset.unwrap_or(1).max(1);
     let limit = a.limit.unwrap_or(MAX_READ_LINES).min(MAX_READ_LINES);
 
+    // leave room for the footer that says where to carry on from
+    let budget = cap.saturating_sub(80);
     let mut out = String::new();
     let mut shown = 0usize;
     let mut total = 0usize;
     let mut last_shown = 0usize;
+    let mut full = false;
     for (i, line) in text.lines().enumerate() {
         let n = i + 1;
         total = n;
-        if n < offset || shown >= limit {
+        if n < offset || shown >= limit || full {
             continue;
         }
         let line = if line.chars().count() > MAX_LINE_CHARS {
@@ -171,6 +178,10 @@ pub fn read_file(a: ReadArgs) -> Result<String> {
         } else {
             line.to_string()
         };
+        if out.len() + line.len() + 8 > budget && shown > 0 {
+            full = true;
+            continue;
+        }
         out.push_str(&format!("{n:>6}\t{line}\n"));
         shown += 1;
         last_shown = n;
@@ -182,10 +193,11 @@ pub fn read_file(a: ReadArgs) -> Result<String> {
     mark_read(&path, offset.min(total), last_shown, total);
     if offset > 1 || last_shown < total {
         out.push_str(&format!(
-            "(showing lines {}-{} of {}, use offset/limit to read more)\n",
+            "(showing lines {}-{} of {}. read on with offset={})\n",
             offset.min(total),
             last_shown,
-            total
+            total,
+            last_shown + 1
         ));
     }
     Ok(out)
@@ -484,11 +496,14 @@ mod tests {
     }
 
     fn read(p: &Path, offset: usize, limit: usize) {
-        read_file(ReadArgs {
-            path: p.to_string_lossy().into_owned(),
-            offset: Some(offset),
-            limit: Some(limit),
-        })
+        read_file(
+            ReadArgs {
+                path: p.to_string_lossy().into_owned(),
+                offset: Some(offset),
+                limit: Some(limit),
+            },
+            12_000,
+        )
         .unwrap();
     }
 
@@ -518,6 +533,36 @@ mod tests {
         assert!(was_fully_read(&p), "sequential pages cover the file");
     }
 
+    /// The budget used to be applied twice: read_file cut at 600 lines and
+    /// the caller cut the text at a fixed 12k characters, which threw away
+    /// read_file's own footer. Losing that footer is what left the model not
+    /// knowing there was more of the file, or how to ask for it.
+    #[test]
+    fn a_small_budget_still_says_where_to_carry_on() {
+        let p = tmp("budget.txt", 1000);
+        let out = read_file(
+            ReadArgs {
+                path: p.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            },
+            600,
+        )
+        .unwrap();
+        assert!(out.len() <= 600, "the cap was not respected: {}", out.len());
+        assert!(out.contains("of 1000"), "no footer: {out}");
+        assert!(out.contains("read on with offset="), "{out}");
+        // and what it says is true: reading on from there works
+        let next: usize = out
+            .rsplit("read on with offset=")
+            .next()
+            .unwrap()
+            .trim_end_matches([')', '\n'])
+            .parse()
+            .expect("the offset it prints has to be a number");
+        assert!(next > 1 && next <= 1000, "{next}");
+    }
+
     #[test]
     fn edits_to_the_file_reset_coverage() {
         let p = tmp("changed.txt", 10);
@@ -537,11 +582,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("big.bin");
         std::fs::write(&p, vec![b'x'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
-        let err = read_file(ReadArgs {
-            path: p.to_string_lossy().into_owned(),
-            offset: None,
-            limit: None,
-        })
+        let err = read_file(
+            ReadArgs {
+                path: p.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            },
+            12_000,
+        )
         .unwrap_err();
         assert!(format!("{err:#}").contains("too large"), "{err:#}");
     }

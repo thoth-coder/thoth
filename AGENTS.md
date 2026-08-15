@@ -91,8 +91,14 @@ cover. There is no `tests/` directory, don't add one.
 - "Always allow" is scoped, never a blanket grant: shell is keyed by
   program (`shell:cargo`), web_fetch by host. See `permission_key` in
   `tools/mod.rs`.
-- Tool output sizes are budgeted for 16-32k token windows. Keep the caps in
-  `tools/mod.rs` and `tools/fs.rs` in that spirit.
+- Context is the scarce resource. Everything sent on every request is
+  budgeted against the window: `tools::output_cap` sizes tool results,
+  `prompt::situational_rules` drops rules for things that are not there, and
+  the instruction file is capped the same way. `cargo test prompt_budget --
+  --ignored --nocapture` prints what a request costs before the conversation
+  starts; check it after touching the prompt or the tool schemas.
+- A tool that truncates its own output says what was cut and how to get the
+  rest. Never let a caller blindly cut a result that had a footer.
 - Anything parsed from the network or from a file can be hostile: no
   slicing by byte offset, no unvalidated value in a filesystem path.
 - Prefer runtime `cfg!(windows)` over `#[cfg]` so both branches compile on

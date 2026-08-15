@@ -28,6 +28,20 @@ All notable changes to thoth are documented here. The format follows
   are read as a profile named `default`.
 
 ### Changed
+- Tool calls the model writes as text (`<tool_call>{...}</tool_call>`, or a
+  bare json object) are read and run instead of printed. A json object only
+  counts when it names a tool that exists, and anything that does not parse
+  comes back to the transcript untouched.
+- What a request costs is now budgeted against the context window instead of
+  fixed at numbers tuned for 16k: how much of a tool result is kept, how much
+  of a file `read_file` returns, and how much of the instruction file goes
+  into the prompt. A small window keeps its room, a large one gets to use it.
+- `read_file` does its own cutting, so its "showing lines 1-240 of 900, read
+  on with offset=241" survives. It used to be replaced by a blind truncation
+  that left the model with no idea there was more, or how to ask for it.
+- Rules about git and about the editor's `problems` tool are only sent when
+  there is a repo and an editor to use them on, and the tool itself is only
+  offered then: 800 characters of every request that was buying nothing.
 - Auto-compact works on every api, not just Ollama: it measures against the
   profile's `context_window`. The field used to be called `num_ctx`, which
   is still read.
