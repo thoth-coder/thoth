@@ -100,6 +100,10 @@ All notable changes to thoth are documented here. The format follows
   `/clear` shows it again.
 
 ### Fixed
+- The directory an "always allow" covered for a file outside the working
+  directory was recorded as the model spelled it, so reading `../notes.txt`
+  saved a grant ending in `/..`: no later path matched it, and `/allow`
+  showed the user something they could not place. Found by running it.
 - `glob` stopped at 500 matches and said nothing about it, so a truncated
   list read like the whole answer. It says what it stopped at now.
 - The editor context (active file, selected text, the Problems panel) went

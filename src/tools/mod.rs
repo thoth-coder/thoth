@@ -206,10 +206,16 @@ pub fn permission_key(name: &str, args: &Value) -> String {
 }
 
 /// The directory a path sits in, as the unit an "always" answer covers.
+/// Resolved, so that `../notes` and the absolute path to the same directory
+/// are one grant and not two, and so `/allow` lists somewhere a person can
+/// recognise instead of `<project>/..`.
 fn parent_dir(path: &str) -> String {
     let p = fs::resolve(path);
     let dir = p.parent().unwrap_or(p.as_path());
-    dir.to_string_lossy().replace('\\', "/")
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let s = dir.to_string_lossy().replace('\\', "/");
+    // canonicalize hands back a \\?\ prefix on Windows
+    s.trim_start_matches("//?/").to_string()
 }
 
 /// Human wording for what an "always" answer will allow.
@@ -412,6 +418,22 @@ mod tests {
         // the key is the plain tool name that older allowlists already hold
         assert_eq!(key("read_file", "src/main.rs"), "read_file");
         assert_eq!(key("edit_file", "src/main.rs"), "edit_file");
+
+        // one directory is one grant, however the path was spelled: a real
+        // run produced the key "<project>/..", which no later path matches
+        // and which tells the user nothing in /allow
+        let up = key("read_file", "../outside.txt");
+        assert!(!up.contains(".."), "unresolved path in the key: {up}");
+        let cwd = std::env::current_dir().unwrap();
+        let same = key(
+            "read_file",
+            &cwd.parent()
+                .unwrap()
+                .join("outside.txt")
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
+        assert_eq!(up, same, "the same directory must be one key");
 
         let home = key("read_file", "/etc/hosts");
         assert_ne!(home, "read_file", "outside paths must be scoped");
