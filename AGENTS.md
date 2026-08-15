@@ -48,6 +48,11 @@ cover. There is no `tests/` directory, don't add one.
 - `agent/prompt.rs`: system prompt. Environment (cwd, os, date, git branch),
   project scan, guardrail rules, instruction file (THOTH.md/AGENTS.md/
   CLAUDE.md, pointers followed), project memory.
+- `agent/undo.rs`: what a file looked like before thoth changed it. Each
+  request is one checkpoint under `~/.thoth/projects/<key>/undo/`; `/undo`
+  puts the newest one back and leaves alone anything that changed since.
+  Recording is armed by `main.rs`, so the file tools stay inert outside a
+  real session (which also keeps the tests off the user's state).
 - `agent/session.rs`: per-project state under
   `~/.thoth/projects/<key>/`: saved transcript for `--continue` and the
   persistent permission allowlist. Written atomically, owner-only on unix.

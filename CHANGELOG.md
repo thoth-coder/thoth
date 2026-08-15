@@ -20,6 +20,12 @@ All notable changes to thoth are documented here. The format follows
 - `multi_edit`: several replacements in one file in a single call, applied in
   order, all of them or none. One round trip instead of one per change, one
   diff to approve, and no way to leave a file half edited.
+- `/undo`. Every file a request changes is snapshotted before the change,
+  and one request is one checkpoint, so `/undo` puts all of it back at once
+  (`/undo list` shows what is there). A file someone edited after thoth
+  wrote it is reported and left alone rather than overwritten, and the last
+  20 checkpoints live under `~/.thoth/projects/<key>/undo/` so a crash does
+  not take them with it.
 - `move_file` and `delete_file`. Renaming and deleting used to mean reaching
   for the shell, which skips the read registry, shows no diff, and turns one
   "always allow" into a standing permission to run `rm`. Deleting needs the
@@ -87,6 +93,20 @@ All notable changes to thoth are documented here. The format follows
 - Startup screen: logo, version, working directory and, on the Ollama
   native api, the context window that used to be a transcript line.
   `/clear` shows it again.
+
+### Fixed
+- Security: `move_file` could carry a file in from anywhere or out to
+  anywhere, and needed no read first, which made renaming a way around
+  having to read a file before overwriting it. Both endpoints must now be
+  inside the working directory and the file must have been read, the same
+  bar as deleting it. Found by review of the commit that added it.
+- Security: the `delete_file` permission preview read the file before the
+  user had approved anything, including one outside the working directory
+  and of any size. It now refuses outside paths and reads only the first
+  few lines.
+- `inside_project` said "outside" for any path that did not exist yet on
+  Windows, where the canonical form of the working directory carries a
+  `\\?\` prefix that a plain joined path does not.
 
 ### Removed
 - Google Programmable Search. `web_search` goes through DuckDuckGo, which

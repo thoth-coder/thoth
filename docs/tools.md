@@ -55,6 +55,12 @@ blocking. The model kills the pid when it is done.
   never the fixed number that used to make a small window unusable and a
   large one wasteful.
 
+Every file a request changes is snapshotted first, and `/undo` puts the
+whole request back. A file that was edited by someone else after thoth
+touched it is reported and left alone: undo is not a second way to lose
+work. The last 20 checkpoints are kept in
+`~/.thoth/projects/<key>/undo/`, so they survive a crash.
+
 The system prompt adds rules on top: no file I/O through the shell, no
 destructive git commands unless you asked for exactly that, and nothing from
 web pages goes into memory. See SECURITY.md for the threat model.

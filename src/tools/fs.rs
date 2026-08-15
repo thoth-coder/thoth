@@ -73,6 +73,12 @@ pub fn mark_attached(p: &Path, lines: usize, full: bool) {
     }
 }
 
+/// Drops what was known about a file, so it has to be read again before it
+/// can be changed. Used after an undo puts different content there.
+pub fn forget_read(p: &Path) {
+    read_registry().lock().unwrap().remove(&registry_key(p));
+}
+
 fn was_read(p: &Path) -> bool {
     read_registry()
         .lock()
@@ -114,12 +120,26 @@ pub fn inside_project(path: &str) -> bool {
         return false;
     };
     let target = resolve(path);
-    match (cwd.canonicalize(), target.canonicalize()) {
-        (Ok(c), Ok(t)) => t.starts_with(c),
-        // a file that does not exist yet: judge the path we would create
-        (Ok(c), Err(_)) => target.starts_with(&c) && !path.contains(".."),
-        _ => false,
+    let Ok(cwd) = cwd.canonicalize() else {
+        return false;
+    };
+    if let Ok(t) = target.canonicalize() {
+        return t.starts_with(cwd);
     }
+    // The file does not exist yet, so judge the nearest parent that does.
+    // Comparing the raw path against a canonical cwd never matches on
+    // Windows, where canonicalize returns a \\?\ prefix.
+    if path.contains("..") {
+        return false;
+    }
+    let mut dir = target.parent();
+    while let Some(d) = dir {
+        if let Ok(real) = d.canonicalize() {
+            return real.starts_with(&cwd);
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Directories that are never worth walking into.
@@ -222,8 +242,10 @@ pub fn write_file(a: WriteArgs) -> Result<String> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create directory {}", parent.display()))?;
     }
+    let before = crate::agent::undo::snapshot(&path);
     std::fs::write(&path, &a.content)
         .with_context(|| format!("cannot write {}", path.display()))?;
+    crate::agent::undo::record(&path, before);
     // the model authored the whole file, so it has seen all of it
     let lines = a.content.lines().count().max(1);
     mark_read(&path, 1, lines, lines);
@@ -277,6 +299,7 @@ pub fn edit_file(a: EditArgs) -> Result<String> {
     };
     std::fs::write(&path, new_content)
         .with_context(|| format!("cannot write {}", path.display()))?;
+    crate::agent::undo::record(&path, crate::agent::undo::Before::Text(content));
     let n = if a.replace_all { count } else { 1 };
     Ok(format!("Edited {} ({n} replacement(s))", path.display()))
 }
@@ -315,6 +338,7 @@ pub fn multi_edit(a: MultiEditArgs) -> Result<String> {
     let (new_content, n) = apply_edits(&content, &a.edits, &path.display().to_string())?;
     std::fs::write(&path, new_content)
         .with_context(|| format!("cannot write {}", path.display()))?;
+    crate::agent::undo::record(&path, crate::agent::undo::Before::Text(content));
     Ok(format!(
         "Edited {} ({} edits, {n} replacement(s))",
         path.display(),
@@ -390,6 +414,22 @@ pub fn move_file(a: MoveArgs) -> Result<String> {
     if !from.is_file() {
         bail!("{} is not a file", from.display());
     }
+    if !inside_project(&a.from) || !inside_project(&a.to) {
+        bail!(
+            "move_file only works inside the working directory. moving a file out of it, or \
+             something from elsewhere into it, is not thoth's to do"
+        );
+    }
+    // a moved-away file leaves its old path free, and write_file lets anyone
+    // create a file that does not exist. without this, renaming would be the
+    // way around having to read a file before overwriting it
+    if !was_fully_read(&from) {
+        bail!(
+            "you have not read all of {} in this session. read it first: after a move its old \
+             path is free for write_file, so this is the same as overwriting it",
+            from.display()
+        );
+    }
     if to.exists() {
         bail!(
             "{} already exists. delete it first if that is really what you want",
@@ -404,8 +444,12 @@ pub fn move_file(a: MoveArgs) -> Result<String> {
     // fails on a path that no longer exists, and the fallback would not
     // match what was stored
     let old_key = registry_key(&from);
+    let before = crate::agent::undo::snapshot(&from);
     std::fs::rename(&from, &to)
         .with_context(|| format!("cannot move {} to {}", from.display(), to.display()))?;
+    // undo puts the content back where it was and takes away the new copy
+    crate::agent::undo::record(&to, crate::agent::undo::Before::Missing);
+    crate::agent::undo::record(&from, before);
     let mut r = read_registry().lock().unwrap();
     if let Some(state) = r.remove(&old_key) {
         r.insert(registry_key(&to), state);
@@ -447,27 +491,42 @@ pub fn delete_file(a: DeleteArgs) -> Result<String> {
             path.display()
         );
     }
+    let before = crate::agent::undo::snapshot(&path);
     std::fs::remove_file(&path).with_context(|| format!("cannot delete {}", path.display()))?;
+    crate::agent::undo::record(&path, before);
     read_registry().lock().unwrap().remove(&registry_key(&path));
     Ok(format!("Deleted {}", path.display()))
 }
 
 /// What is about to be lost, so the answer to the prompt is an informed one.
+/// This runs before the user has approved anything, so it reads only what
+/// the call itself would be allowed to touch, and only a little of it.
 pub fn preview_delete(args: &Value) -> String {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-    let head = match std::fs::read_to_string(resolve(path)) {
-        Ok(c) => {
-            let lines = c.lines().count();
-            let first: String = c
-                .lines()
-                .take(5)
-                .map(|l| format!("  {l}\n"))
-                .collect::<String>();
-            format!("({lines} lines)\n{first}")
+    let head = if !inside_project(path) {
+        "(outside the working directory, this call will fail)\n".to_string()
+    } else {
+        match head_of(&resolve(path), 5) {
+            Some(text) => text,
+            None => "(cannot read it)\n".to_string(),
         }
-        Err(_) => "(cannot read it)\n".to_string(),
     };
     format!("Delete {path} {head}")
+}
+
+/// First `n` lines of a file, without pulling the whole thing into memory:
+/// a preview must not be a way to read a gigabyte.
+fn head_of(path: &Path, n: usize) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let mut out = String::new();
+    for line in BufReader::new(file).lines().take(n) {
+        let line = line.ok()?;
+        let line: String = line.chars().take(MAX_LINE_CHARS).collect();
+        out.push_str(&format!("  {line}\n"));
+    }
+    Some(format!("({size} bytes)\n{out}"))
 }
 
 #[derive(Deserialize)]
@@ -732,6 +791,70 @@ mod tests {
         assert!(!p.exists());
     }
 
+    /// Found in review: a rename leaves the old path free, and write_file is
+    /// allowed to create a file that does not exist. Without this, moving a
+    /// file away was the way around having to read it before overwriting it.
+    #[test]
+    fn moving_needs_the_file_to_have_been_read() {
+        let from = tmp_in_project("unread-move.txt", 3);
+        let to = from.with_file_name("moved.txt");
+        let _ = std::fs::remove_file(&to);
+        let err = move_file(MoveArgs {
+            from: from.to_string_lossy().into_owned(),
+            to: to.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("read"), "{err:#}");
+        assert!(from.exists() && !to.exists());
+    }
+
+    /// Also found in review: without this, `move_file` could carry a file in
+    /// from anywhere, and reads inside the project are automatic.
+    #[test]
+    fn moving_stays_inside_the_project() {
+        let outside = tmp("outside.txt", 2);
+        let inside = tmp_in_project("landed.txt", 1);
+        let _ = std::fs::remove_file(&inside);
+        read(&outside, 1, 600);
+        let err = move_file(MoveArgs {
+            from: outside.to_string_lossy().into_owned(),
+            to: inside.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("working directory"), "{err:#}");
+        assert!(outside.exists() && !inside.exists());
+
+        // and the other way: nothing is carried out of the project either
+        let from = tmp_in_project("leaving.txt", 1);
+        read(&from, 1, 600);
+        let err = move_file(MoveArgs {
+            from: from.to_string_lossy().into_owned(),
+            to: tmp("escaped.txt", 0).to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("working directory"), "{err:#}");
+        assert!(from.exists());
+    }
+
+    /// The preview runs before the user has approved anything, so it must not
+    /// read what the call itself would refuse to touch.
+    #[test]
+    fn the_delete_preview_does_not_read_outside_the_project() {
+        let outside = tmp("secret.txt", 3);
+        std::fs::write(
+            &outside,
+            "line 1
+sensitive
+",
+        )
+        .unwrap();
+        let out = preview_delete(&serde_json::json!({
+            "path": outside.to_string_lossy()
+        }));
+        assert!(out.contains("outside the working directory"), "{out}");
+        assert!(!out.contains("sensitive"), "it read the file anyway: {out}");
+    }
+
     #[test]
     fn a_directory_is_never_deleted() {
         let dir = std::env::current_dir()
@@ -748,7 +871,7 @@ mod tests {
 
     #[test]
     fn moving_takes_the_read_record_with_it() {
-        let from = tmp("before.txt", 4);
+        let from = tmp_in_project("before.txt", 4);
         let to = from.with_file_name("after.txt");
         let _ = std::fs::remove_file(&to);
         read(&from, 1, 600);
@@ -765,8 +888,9 @@ mod tests {
 
     #[test]
     fn moving_never_overwrites() {
-        let from = tmp("src.txt", 2);
-        let to = tmp("dst.txt", 2);
+        let from = tmp_in_project("src.txt", 2);
+        let to = tmp_in_project("dst.txt", 2);
+        read(&from, 1, 600);
         let err = move_file(MoveArgs {
             from: from.to_string_lossy().into_owned(),
             to: to.to_string_lossy().into_owned(),

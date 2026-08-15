@@ -116,6 +116,10 @@ async fn main() -> Result<()> {
         )));
     }
 
+    // from here on every file change is snapshotted, so /undo has something
+    // to put back. Arming it here rather than in Agent keeps the file tools
+    // inert for anything that is not a real session
+    agent::undo::arm();
     let mut agent = Agent::new(client, cfg, ev_tx, cancel_slot.clone());
     if args.resume {
         agent.resume_session();

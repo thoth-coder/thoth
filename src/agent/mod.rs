@@ -1,5 +1,6 @@
 pub mod prompt;
 pub mod session;
+pub mod undo;
 
 use crate::client::{Client, Message, StreamEvent, ToolCall, Usage};
 use crate::tools;
@@ -26,6 +27,11 @@ pub enum AgentCmd {
     /// Show the persistent allowlist, or clear it (`/allow reset`).
     Permissions {
         reset: bool,
+    },
+    /// Put the files back the way they were before the last request that
+    /// changed any, or list what could be undone.
+    Undo {
+        list: bool,
     },
     /// Point the session at another config profile, keeping the conversation.
     UseProfile {
@@ -178,6 +184,60 @@ impl Agent {
         )));
     }
 
+    /// `/undo`: the files thoth changed, back the way they were.
+    fn undo(&mut self, list: bool) {
+        if list {
+            let items = undo::list();
+            if items.is_empty() {
+                self.send(AgentEvent::Info("nothing to undo in this project".into()));
+                return;
+            }
+            self.send(AgentEvent::Info(format!(
+                "undo history, newest first:
+{}",
+                items
+                    .iter()
+                    .map(|i| format!("  {i}"))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+"
+                    )
+            )));
+            return;
+        }
+        match undo::undo_last() {
+            Err(e) => self.send(AgentEvent::Error(format!("{e:#}"))),
+            Ok(r) => {
+                let mut out = format!("undid \"{}\"", r.label);
+                for f in &r.restored {
+                    out.push_str(&format!(
+                        "
+  restored {f}"
+                    ));
+                }
+                for f in &r.skipped {
+                    out.push_str(&format!(
+                        "
+  kept {f}"
+                    ));
+                }
+                if r.restored.is_empty() {
+                    out.push_str(
+                        "
+  (nothing was put back)",
+                    );
+                }
+                self.send(AgentEvent::Info(out));
+                // the model's picture of those files is stale now
+                self.messages.push(Message::user(format!(
+                    "(the user ran /undo: {} file(s) were restored to how they were before your                      last changes. Read them again before editing.)",
+                    r.restored.len()
+                )));
+            }
+        }
+    }
+
     /// Loads the saved transcript of this project's last run. The system
     /// prompt stays the fresh one built at startup.
     pub fn resume_session(&mut self) {
@@ -204,7 +264,15 @@ impl Agent {
                     if let Err(e) = self.run_turn(&input).await {
                         self.send(AgentEvent::Error(format!("{e:#}")));
                     }
+                    // everything this request changed becomes one checkpoint
+                    let n = undo::commit(input.lines().next().unwrap_or(""));
+                    if n > 0 {
+                        self.send(AgentEvent::Info(format!(
+                            "{n} file change(s) saved. /undo puts them back"
+                        )));
+                    }
                 }
+                AgentCmd::Undo { list } => self.undo(list),
                 AgentCmd::SetModel(m) => {
                     self.client.model = m.clone();
                     self.send(AgentEvent::ModelChanged(m.clone()));

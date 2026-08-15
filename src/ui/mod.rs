@@ -41,6 +41,7 @@ const HELP: &str = "commands:
   /recap         load the previous session's summary into context
   /memory        show project memory (/memory clear to wipe)
   /config        edit the config profiles and switch between them (/cfg)
+  /undo          put back the files the last request changed (/undo list)
   /allow         tools always allowed here (/allow reset to clear)
   /status        session info: profile, model, api, tokens, cost, uptime
   /init          analyze the project and generate THOTH.md
@@ -740,6 +741,12 @@ impl App {
                 self.ctx_tokens = 0;
                 self.set_busy();
                 let _ = self.cmd_tx.send(AgentCmd::Clear);
+            }
+            "undo" => {
+                let _ = self.cmd_tx.send(AgentCmd::Undo {
+                    list: arg == "list",
+                });
+                self.scroll = None;
             }
             "compact" => {
                 self.set_busy();
