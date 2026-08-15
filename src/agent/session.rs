@@ -92,7 +92,43 @@ pub fn load() -> Option<Vec<Message>> {
             })
         })
         .collect();
+    let msgs = repair(msgs);
     if msgs.is_empty() { None } else { Some(msgs) }
+}
+
+/// A transcript that stops between a tool call and its result is rejected by
+/// every api that checks: "an assistant message with tool_calls must be
+/// followed by tool messages". A run killed mid-turn can leave one behind,
+/// and the user would have no way past it but `/clear`. Half a turn is
+/// dropped rather than resumed.
+fn repair(mut msgs: Vec<Message>) -> Vec<Message> {
+    let answered: HashSet<String> = msgs
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    for m in msgs.iter_mut() {
+        if let Some(calls) = &m.tool_calls
+            && !calls.iter().all(|c| answered.contains(&c.id))
+        {
+            m.tool_calls = None;
+        }
+    }
+    // and the other way round: a result whose call is gone is just as bad
+    let called: HashSet<String> = msgs
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| c.id.clone())
+        .collect();
+    msgs.retain(|m| {
+        m.role != "tool"
+            || m.tool_call_id
+                .as_ref()
+                .is_some_and(|id| called.contains(id))
+    });
+    msgs.retain(|m| m.content.is_some() || m.tool_calls.is_some());
+    msgs
 }
 
 pub fn clear() {
@@ -154,6 +190,37 @@ mod tests {
         assert_eq!(static_role(&back[0].role), Some("user"));
         assert_eq!(back[1].name.as_deref(), Some("grep"));
         assert_eq!(back[1].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    /// What a run killed between the call and its result leaves behind.
+    /// Resuming that transcript is a 400 from every api that checks.
+    #[test]
+    fn half_a_turn_is_not_resumed() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: "grep".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let msgs = vec![
+            Message::user("find it"),
+            Message::assistant(Some("looking".into()), Some(vec![call("a")])),
+            Message::tool("a".into(), "grep".into(), "found".into()),
+            // the run died here, after the call went out and before the result
+            Message::assistant(None, Some(vec![call("b")])),
+        ];
+        let out = repair(msgs);
+        assert_eq!(out.len(), 3, "the unanswered call must go");
+        assert!(out[1].tool_calls.is_some(), "the answered one stays");
+
+        // and a result with nothing that asked for it
+        let orphan = vec![
+            Message::user("hello"),
+            Message::tool("gone".into(), "grep".into(), "result".into()),
+        ];
+        assert_eq!(repair(orphan).len(), 1);
     }
 
     #[test]

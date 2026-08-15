@@ -474,7 +474,15 @@ mod tests {
         let p = tmp("huge.txt");
         std::fs::write(&p, "current\n").unwrap();
         record(&p, Before::Text("x".repeat(MAX_SNAPSHOT_BYTES + 1)));
-        assert_eq!(commit("write something enormous"), 1);
+        // only what this test recorded: the fs tests run beside it and push
+        // to the same pending list
+        let mine: Vec<Change> = std::mem::take(&mut *pending().lock().unwrap())
+            .into_iter()
+            .filter(|c| c.path == p)
+            .collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].before, Before::TooLarge);
+        assert_eq!(write_checkpoint("write something enormous", mine), 1);
 
         let r = undo_last().unwrap();
         assert!(r.restored.is_empty(), "{r:?}");

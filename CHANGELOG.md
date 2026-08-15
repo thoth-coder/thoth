@@ -106,6 +106,9 @@ All notable changes to thoth are documented here. The format follows
   never match the file byte for byte. Edits are now matched in the file's
   own line endings, and a full overwrite keeps them instead of turning
   every line into a change.
+- `--continue` on a session that was killed between a tool call and its
+  result sent a transcript every api rejects, and nothing but `/clear` got
+  past it. Half a turn is dropped when the transcript is loaded.
 - The `todo` tool refused a status it understood perfectly well: a model
   writing "in_progress" or "Completed" instead of "doing" and "done" lost a
   turn to a validation error. Those spellings are read as what they mean; a
