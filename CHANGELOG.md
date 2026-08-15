@@ -6,6 +6,19 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Named config profiles. `thoth config` (or `thoth cfg`) opens a screen to
+  edit them, `/config` does the same inside a session and applies the saved
+  profile to the running conversation. `thoth -P NAME` runs one profile
+  once, `thoth config use NAME` makes it the default, `thoth config list`
+  shows what exists. Config files from 0.2 and earlier keep working; they
+  are read as a profile named `default`.
+
+### Changed
+- The config file moved to `~/.thoth/config.toml` on every OS, next to the
+  state thoth already kept there, instead of the platform config directory
+  (`%APPDATA%\thoth` on Windows, `~/.config/thoth` elsewhere). The old path
+  is still read when the new one is missing, so upgrading changes nothing
+  until the next save.
 - `@path` now opens a picker under the input instead of completing on tab
   only: up/down move, tab or enter takes the highlighted entry, esc closes
   it, and picking a directory lists what is inside it.

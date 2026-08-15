@@ -1,6 +1,17 @@
-use serde::Deserialize;
+//! Settings. The file holds named profiles and which one is active; a run
+//! resolves one profile, then lets `THOTH_*` env vars and CLI flags override
+//! it. Nothing here talks to the network: `Config` is just the answer to
+//! "what should this run connect to".
+
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
+pub const DEFAULT_MAX_TURNS: usize = 40;
+
+/// What a run actually uses, after profile, env and flags are layered.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_url: String,
@@ -19,54 +30,273 @@ pub struct Config {
     pub google_cx: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct FileConfig {
-    base_url: Option<String>,
-    model: Option<String>,
-    api_key: Option<String>,
-    temperature: Option<f32>,
-    max_turns: Option<usize>,
-    num_ctx: Option<u32>,
-    think: Option<bool>,
-    google_api_key: Option<String>,
-    google_cx: Option<String>,
+/// One saved set of settings. Every field is optional: a profile only records
+/// what it changes, so the file stays readable by hand.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Profile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub google_cx: Option<String>,
 }
 
-pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
+/// The whole config file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Store {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
+}
+
+/// `~/.thoth` — everything thoth owns on this machine: this file, the
+/// per-project state and the editor bridge. One directory on every OS
+/// instead of the platform config dir, so it is the same place to find,
+/// back up and delete no matter where you run it.
+pub fn thoth_home() -> PathBuf {
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("thoth")
+        .join(".thoth")
 }
 
-pub fn load(
-    base_url: Option<String>,
-    model: Option<String>,
-    api_key: Option<String>,
-    temperature: Option<f32>,
-) -> Config {
-    let file: FileConfig = std::fs::read_to_string(config_dir().join("config.toml"))
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default();
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+pub fn config_path() -> PathBuf {
+    thoth_home().join("config.toml")
+}
+
+/// Where thoth 0.2 and earlier kept it: `%APPDATA%\thoth` on Windows,
+/// `~/.config/thoth` elsewhere. Still read, never written.
+fn legacy_config_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("thoth").join("config.toml"))
+}
+
+impl Store {
+    /// Name of the profile a run should use: the one asked for, else the
+    /// active one, else the only one there is.
+    pub fn pick(&self, requested: Option<&str>) -> Result<Option<String>> {
+        if let Some(name) = requested {
+            if !self.profiles.contains_key(name) {
+                bail!(
+                    "no profile named '{name}'. `thoth config` to create one, \
+                     `thoth config list` to see what exists"
+                );
+            }
+            return Ok(Some(name.to_string()));
+        }
+        if let Some(a) = &self.active
+            && self.profiles.contains_key(a)
+        {
+            return Ok(Some(a.clone()));
+        }
+        if self.profiles.len() == 1 {
+            return Ok(self.profiles.keys().next().cloned());
+        }
+        Ok(None)
+    }
+
+    pub fn get(&self, name: &str) -> Profile {
+        self.profiles.get(name).cloned().unwrap_or_default()
+    }
+
+    /// A name that is not taken yet, for the "new profile" row.
+    pub fn free_name(&self) -> String {
+        if !self.profiles.contains_key("new") {
+            return "new".into();
+        }
+        (2..)
+            .map(|n| format!("new{n}"))
+            .find(|n| !self.profiles.contains_key(n))
+            .unwrap_or_else(|| "new".into())
+    }
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.is_empty())
+}
+
+/// Profile values with `THOTH_*` env vars layered on top. Used both at
+/// startup and when the config screen switches profile mid-session, so the
+/// two paths cannot drift apart.
+pub fn resolve(p: &Profile) -> Config {
     Config {
-        base_url: base_url
-            .or_else(|| env("THOTH_BASE_URL"))
-            .or(file.base_url)
-            .unwrap_or_else(|| "http://localhost:11434/v1".into())
+        base_url: env("THOTH_BASE_URL")
+            .or_else(|| p.base_url.clone())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.into())
             .trim_end_matches('/')
             .to_string(),
-        model: model.or_else(|| env("THOTH_MODEL")).or(file.model),
-        api_key: api_key.or_else(|| env("THOTH_API_KEY")).or(file.api_key),
-        temperature: temperature.or(file.temperature),
-        max_turns: file.max_turns.unwrap_or(40),
+        model: env("THOTH_MODEL").or_else(|| p.model.clone()),
+        api_key: env("THOTH_API_KEY").or_else(|| p.api_key.clone()),
+        temperature: env("THOTH_TEMPERATURE")
+            .and_then(|v| v.parse().ok())
+            .or(p.temperature),
+        max_turns: p.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
         num_ctx: env("THOTH_NUM_CTX")
             .and_then(|v| v.parse().ok())
-            .or(file.num_ctx),
-        think: env("THOTH_THINK")
-            .and_then(|v| v.parse().ok())
-            .or(file.think),
-        google_api_key: env("THOTH_GOOGLE_API_KEY").or(file.google_api_key),
-        google_cx: env("THOTH_GOOGLE_CX").or(file.google_cx),
+            .or(p.num_ctx),
+        think: env("THOTH_THINK").and_then(|v| v.parse().ok()).or(p.think),
+        google_api_key: env("THOTH_GOOGLE_API_KEY").or_else(|| p.google_api_key.clone()),
+        google_cx: env("THOTH_GOOGLE_CX").or_else(|| p.google_cx.clone()),
+    }
+}
+
+/// Command-line flags, which beat both the profile and the environment.
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub profile: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub temperature: Option<f32>,
+}
+
+/// Resolves the settings for a run. Returns the profile name it used, if any,
+/// so the interface can show which one is live.
+pub fn load(o: Overrides) -> Result<(Config, Option<String>)> {
+    let store = load_store();
+    let name = store.pick(o.profile.or_else(|| env("THOTH_PROFILE")).as_deref())?;
+    let profile = name.as_deref().map(|n| store.get(n)).unwrap_or_default();
+    let mut cfg = resolve(&profile);
+    if let Some(u) = o.base_url {
+        cfg.base_url = u.trim_end_matches('/').to_string();
+    }
+    cfg.model = o.model.or(cfg.model);
+    cfg.api_key = o.api_key.or(cfg.api_key);
+    cfg.temperature = o.temperature.or(cfg.temperature);
+    Ok((cfg, name))
+}
+
+pub fn load_store() -> Store {
+    let text = std::fs::read_to_string(config_path())
+        .or_else(|_| std::fs::read_to_string(legacy_config_path().unwrap_or_default()));
+    match text {
+        Ok(text) => parse_store(&text),
+        Err(_) => Store::default(),
+    }
+}
+
+/// Reads the current format, and the flat pre-profile file thoth 0.1/0.2
+/// wrote, which becomes a profile named "default".
+fn parse_store(text: &str) -> Store {
+    let mut store: Store = toml::from_str(text).unwrap_or_default();
+    if store.profiles.is_empty()
+        && let Ok(flat) = toml::from_str::<Profile>(text)
+        && flat != Profile::default()
+    {
+        store.active = Some("default".into());
+        store.profiles.insert("default".into(), flat);
+    }
+    store
+}
+
+/// Writes through a temp file, owner-only: this holds api keys.
+pub fn save_store(store: &Store) -> Result<()> {
+    let text = toml::to_string_pretty(store)?;
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_profiles_and_the_active_one() {
+        let store = parse_store(
+            r#"
+active = "big"
+
+[profiles.small]
+model = "qwen3:8b"
+
+[profiles.big]
+base_url = "http://box:11434/v1"
+model = "qwen3.6:35b"
+num_ctx = 65536
+"#,
+        );
+        assert_eq!(store.profiles.len(), 2);
+        assert_eq!(store.pick(None).unwrap().as_deref(), Some("big"));
+        assert_eq!(store.pick(Some("small")).unwrap().as_deref(), Some("small"));
+        assert!(store.pick(Some("nope")).is_err());
+        assert_eq!(store.get("big").num_ctx, Some(65536));
+    }
+
+    /// The 0.1/0.2 file must keep working: it becomes one profile.
+    #[test]
+    fn migrates_a_flat_config_file() {
+        let store = parse_store("model = \"qwen3:8b\"\nnum_ctx = 16384\n");
+        assert_eq!(store.pick(None).unwrap().as_deref(), Some("default"));
+        let p = store.get("default");
+        assert_eq!(p.model.as_deref(), Some("qwen3:8b"));
+        assert_eq!(p.num_ctx, Some(16384));
+        // and it round-trips into the new shape
+        let text = toml::to_string_pretty(&store).unwrap();
+        assert!(text.contains("[profiles.default]"), "{text}");
+        assert_eq!(parse_store(&text).get("default"), p);
+    }
+
+    #[test]
+    fn falls_back_to_the_only_profile_then_to_defaults() {
+        let store = parse_store("[profiles.solo]\nmodel = \"m\"\n");
+        assert_eq!(store.pick(None).unwrap().as_deref(), Some("solo"));
+        let empty = parse_store("");
+        assert_eq!(empty.pick(None).unwrap(), None);
+        assert_eq!(resolve(&Profile::default()).base_url, DEFAULT_BASE_URL);
+        assert_eq!(resolve(&Profile::default()).max_turns, DEFAULT_MAX_TURNS);
+    }
+
+    #[test]
+    fn trailing_slash_never_reaches_the_url() {
+        let p = Profile {
+            base_url: Some("http://localhost:8080/v1/".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&p).base_url, "http://localhost:8080/v1");
+    }
+
+    /// The file moved to ~/.thoth in 0.3. Both paths are still read, and the
+    /// new one wins when someone has both.
+    #[test]
+    fn config_lives_in_the_thoth_home() {
+        let path = config_path();
+        assert!(path.ends_with(".thoth/config.toml") || path.ends_with(".thoth\\config.toml"));
+        assert_eq!(path.parent(), Some(thoth_home().as_path()));
+        let legacy = legacy_config_path().expect("every platform has a config dir");
+        assert_ne!(legacy, path);
+    }
+
+    #[test]
+    fn suggests_a_free_name() {
+        let mut store = parse_store("[profiles.new]\n");
+        assert_eq!(store.free_name(), "new2");
+        store.profiles.insert("new2".into(), Profile::default());
+        assert_eq!(store.free_name(), "new3");
     }
 }

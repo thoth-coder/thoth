@@ -23,7 +23,7 @@ if [ "$PURGE" = "1" ]; then
     echo "removed ~/.thoth and the thoth config directory"
 else
     echo "kept config and state:"
-    echo "  ~/.thoth                (editor state, session recaps)"
-    echo "  ~/.config/thoth         (config.toml)"
+    echo "  ~/.thoth                (config.toml, editor state, session recaps)"
+    echo "  ~/.config/thoth         (config.toml from thoth 0.2 and earlier)"
     echo "run with --purge to remove them too"
 fi

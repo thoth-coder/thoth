@@ -32,6 +32,7 @@
 
 | command | effect |
 |---|---|
+| `/config` | edit the config profiles and switch between them (`/cfg`) |
 | `/clear` | reset the conversation (the system prompt is rebuilt) |
 | `/compact` | summarize the conversation to free context space |
 | `/recap` | load the previous session's summary into context |

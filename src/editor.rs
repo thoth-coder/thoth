@@ -56,7 +56,11 @@ struct Diag {
 }
 
 fn state_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".thoth").join("ide"))
+    // with no home directory there is no bridge. thoth_home() would fall back
+    // to the working directory, and the project's own .thoth is a different
+    // thing entirely: never read editor state out of it
+    dirs::home_dir()?;
+    Some(crate::config::thoth_home().join("ide"))
 }
 
 /// Short live label for the TUI, e.g. "In Cargo.toml, 7 lines selected".

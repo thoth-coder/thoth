@@ -204,7 +204,7 @@ pub struct Client {
     pub think: Option<bool>,
 }
 
-const DEFAULT_NUM_CTX: u32 = 32768;
+pub const DEFAULT_NUM_CTX: u32 = 32768;
 
 impl Client {
     pub fn new(

@@ -25,7 +25,7 @@ if ($env:THOTH_PURGE -eq "1") {
     Write-Host "removed ~/.thoth and %APPDATA%\thoth"
 } else {
     Write-Host "kept config and state:"
-    Write-Host "  $HOME\.thoth          (editor state, session recaps)"
-    Write-Host "  $env:APPDATA\thoth    (config.toml)"
+    Write-Host "  $HOME\.thoth          (config.toml, editor state, session recaps)"
+    Write-Host "  $env:APPDATA\thoth    (config.toml from thoth 0.2 and earlier)"
     Write-Host "set `$env:THOTH_PURGE = `"1`" before running to remove them too"
 }

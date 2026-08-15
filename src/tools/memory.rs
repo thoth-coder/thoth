@@ -47,9 +47,7 @@ fn project_key() -> String {
 /// `~/.thoth/projects/<encoded-cwd>/` — private per-project state (recap,
 /// saved session, permission allowlist). Never inside the repo.
 pub fn project_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".thoth")
+    crate::config::thoth_home()
         .join("projects")
         .join(project_key())
 }

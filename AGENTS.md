@@ -25,10 +25,12 @@ cover. There is no `tests/` directory, don't add one.
 
 - `main.rs`: CLI args and subcommands, config resolution, model discovery,
   spawns the agent task, picks TUI or one-shot print mode (`-p`).
-- `config.rs`: settings resolution, in precedence order: CLI flag, then
-  `THOTH_*` env var, then `config.toml` in the user config dir, then the
-  built-in default. A new setting means all of `Config`, `FileConfig`, the
-  env lookup and `docs/configuration.md`.
+- `config.rs`: named profiles in `~/.thoth/config.toml` plus the resolution
+  order: CLI flag, then `THOTH_*` env var, then the active profile, then the
+  built-in default. Owns `thoth_home()`, the one definition of `~/.thoth`
+  that session state and the editor bridge also use. Reads the pre-0.3 file
+  (flat, in the platform config dir) as a profile called `default`. A new setting means all of `Config`, `Profile`,
+  `resolve`, the field list in `ui/config.rs` and `docs/configuration.md`.
 - `client.rs`: LLM transport. Two paths: OpenAI-compatible SSE
   (`/chat/completions`) and Ollama native (`/api/chat`, auto-detected via
   `/api/version`) which allows setting `num_ctx` per request. Streams
@@ -56,6 +58,10 @@ cover. There is no `tests/` directory, don't add one.
   streaming, permission prompts, input history, mouse scroll, ctrl+o.
   `ui/render.rs` turns blocks into styled lines, `ui/theme.rs` holds colors
   and glyphs, `ui/input.rs` handles `@path` attachments and completion.
+- `ui/config.rs`: the profile screen. One struct drives both `thoth config`
+  (its own event loop) and `/config` (the App holds it and forwards keys),
+  so the two cannot drift. Saving hands back a `Config` that the agent
+  applies to the live session.
 - `upgrade.rs`: `thoth upgrade`, replacing the running binary with the
   latest verified GitHub release.
 

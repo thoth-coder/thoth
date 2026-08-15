@@ -1,8 +1,10 @@
+pub mod config;
 pub mod input;
 pub mod render;
 pub mod theme;
 
 use crate::agent::{AgentCmd, AgentEvent, PermReply};
+use crate::ui::config::{ConfigAction, ConfigScreen};
 use crate::ui::input::{
     complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
 };
@@ -38,6 +40,7 @@ const HELP: &str = "commands:
   /compact       summarize the conversation to free context space
   /recap         load the previous session's summary into context
   /memory        show project memory (/memory clear to wipe)
+  /config        edit the config profiles and switch between them (/cfg)
   /allow         tools always allowed here (/allow reset to clear)
   /status        session info: model, tokens, uptime
   /init          analyze the project and generate THOTH.md
@@ -121,6 +124,10 @@ enum Mode {
 struct App {
     model: String,
     base_url: String,
+    /// Config profile this session is running, when there is one.
+    profile: Option<String>,
+    /// Open config screen; while it is up it owns the frame and the keys.
+    config: Option<ConfigScreen>,
     blocks: Vec<ChatBlock>,
     input: String,
     /// Cursor position in the input, in chars.
@@ -164,6 +171,7 @@ struct App {
 pub async fn run(
     model: String,
     base_url: String,
+    profile: Option<String>,
     num_ctx: Option<u32>,
     cmd_tx: mpsc::UnboundedSender<AgentCmd>,
     mut ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -182,7 +190,7 @@ pub async fn run(
         }
     });
 
-    let mut app = App::new(model, base_url, num_ctx, cmd_tx, cancel_slot);
+    let mut app = App::new(model, base_url, profile, num_ctx, cmd_tx, cancel_slot);
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut dirty = true;
@@ -249,6 +257,7 @@ impl App {
     fn new(
         model: String,
         base_url: String,
+        profile: Option<String>,
         num_ctx: Option<u32>,
         cmd_tx: mpsc::UnboundedSender<AgentCmd>,
         cancel_slot: Arc<Mutex<CancellationToken>>,
@@ -256,6 +265,8 @@ impl App {
         Self {
             model,
             base_url,
+            profile,
+            config: None,
             blocks: vec![ChatBlock::Banner],
             input: String::new(),
             cursor: 0,
@@ -307,6 +318,18 @@ impl App {
 
     fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+        // the config screen is modal: it gets every key until it closes
+        if let Some(screen) = &mut self.config {
+            match screen.on_key(k) {
+                ConfigAction::Stay => {}
+                ConfigAction::Close => self.config = None,
+                ConfigAction::Apply(name, cfg) => {
+                    let _ = self.cmd_tx.send(AgentCmd::UseProfile { name, cfg });
+                }
+            }
+            return;
+        }
 
         if matches!(self.mode, Mode::Perm(_)) {
             let reply = match k.code {
@@ -456,6 +479,17 @@ impl App {
             AgentEvent::Info(t) => self.blocks.push(ChatBlock::Info(t)),
             AgentEvent::Error(t) => self.blocks.push(ChatBlock::Error(t)),
             AgentEvent::ModelChanged(m) => self.model = m,
+            AgentEvent::Connected {
+                profile,
+                model,
+                base_url,
+                num_ctx,
+            } => {
+                self.profile = profile;
+                self.model = model;
+                self.base_url = base_url;
+                self.num_ctx = num_ctx;
+            }
             AgentEvent::TurnStart => {
                 if !matches!(self.mode, Mode::Perm(_)) {
                     self.mode = Mode::Busy;
@@ -646,6 +680,14 @@ impl App {
             .unwrap_or((cmd, ""));
         match name {
             "help" | "h" => self.blocks.push(ChatBlock::Info(HELP.into())),
+            "config" | "cfg" => {
+                if matches!(self.mode, Mode::Perm(_)) {
+                    self.blocks
+                        .push(ChatBlock::Info("answer the permission prompt first".into()));
+                } else {
+                    self.config = Some(ConfigScreen::new());
+                }
+            }
             "quit" | "exit" | "q" => self.quit = true,
             "clear" => {
                 self.blocks.clear();
@@ -802,6 +844,10 @@ impl App {
     // ---- drawing ----
 
     fn draw(&mut self, f: &mut Frame) {
+        if let Some(screen) = &self.config {
+            screen.draw(f);
+            return;
+        }
         // one line of chrome at the top, one status line above the input and
         // one hint line below it: everything else belongs to the transcript.
         // the @path picker sits between the input and the hints, and is zero
@@ -825,7 +871,13 @@ impl App {
         let tag = "  agentic coding";
         let url = short_url(&self.base_url);
         let hw = header_a.width as usize;
-        let right_len = self.model.chars().count() + 2 + url.chars().count();
+        // the profile name rides with the model and server: they are what it
+        // decides, and they move together when it is switched
+        let prof = match &self.profile {
+            Some(p) => format!("{p}  "),
+            None => String::new(),
+        };
+        let right_len = prof.chars().count() + self.model.chars().count() + 2 + url.chars().count();
         let mut header = vec![Span::styled(
             chip.clone(),
             theme::accent().add_modifier(Modifier::REVERSED),
@@ -838,6 +890,7 @@ impl App {
         header.push(Span::raw(
             " ".repeat(hw.saturating_sub(left_len + right_len)),
         ));
+        header.push(Span::styled(prof, theme::muted_italic()));
         header.push(Span::styled(self.model.clone(), theme::accent()));
         header.push(Span::styled(format!("  {url}"), theme::muted()));
         f.render_widget(Paragraph::new(Line::from(header)), header_a);
@@ -1207,6 +1260,7 @@ mod tests {
         let mut a = App::new(
             "qwen3:8b".into(),
             "http://localhost:11434/v1".into(),
+            None,
             Some(32768),
             cmd_tx,
             Arc::new(Mutex::new(CancellationToken::new())),

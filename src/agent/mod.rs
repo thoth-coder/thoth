@@ -27,6 +27,11 @@ pub enum AgentCmd {
     Permissions {
         reset: bool,
     },
+    /// Point the session at another config profile, keeping the conversation.
+    UseProfile {
+        name: String,
+        cfg: Box<crate::config::Config>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +62,13 @@ pub enum AgentEvent {
     Info(String),
     Error(String),
     ModelChanged(String),
+    /// The session moved to another profile, server or context window.
+    Connected {
+        profile: Option<String>,
+        model: String,
+        base_url: String,
+        num_ctx: Option<u32>,
+    },
     /// Token usage of the latest model call.
     Usage(Usage),
     /// A user request (possibly queued) started processing.
@@ -99,6 +111,48 @@ impl Agent {
 
     fn send(&self, ev: AgentEvent) {
         let _ = self.tx.send(ev);
+    }
+
+    /// Rebuilds the connection from a config profile without touching the
+    /// conversation: the model, server, context window and turn budget can
+    /// all change mid-session.
+    async fn use_profile(&mut self, name: &str, cfg: &crate::config::Config) {
+        let keep_model = self.client.model.clone();
+        let mut client = Client::new(
+            cfg.base_url.clone(),
+            cfg.api_key.clone(),
+            cfg.temperature,
+            cfg.num_ctx,
+        );
+        client.detect_ollama().await;
+        client.think = cfg.think;
+        client.model = match cfg.model.clone() {
+            Some(m) => m,
+            // the profile leaves the model to the server: keep the one that is
+            // already running rather than blanking it
+            None => keep_model,
+        };
+        let is_ollama = client.transport == crate::client::Transport::Ollama;
+        self.auto_compact_at = is_ollama.then(|| client.num_ctx as u64 * 2 / 3);
+        self.max_turns = cfg.max_turns;
+        if let (Some(key), Some(cx)) = (cfg.google_api_key.clone(), cfg.google_cx.clone()) {
+            crate::tools::web::set_google(key, cx);
+        }
+        let (model, base_url) = (client.model.clone(), client.base_url.clone());
+        self.client = client;
+        self.send(AgentEvent::Connected {
+            profile: Some(name.to_string()),
+            model: model.clone(),
+            base_url: base_url.clone(),
+            num_ctx: is_ollama.then_some(self.client.num_ctx),
+        });
+        self.send(AgentEvent::Info(format!(
+            "profile {name}: {model} at {base_url}{}",
+            match is_ollama.then_some(self.client.num_ctx) {
+                Some(n) => format!(", context window {n} tokens"),
+                None => String::new(),
+            }
+        )));
     }
 
     /// Loads the saved transcript of this project's last run. The system
@@ -176,6 +230,7 @@ impl Agent {
                         )));
                     }
                 }
+                AgentCmd::UseProfile { name, cfg } => self.use_profile(&name, &cfg).await,
                 AgentCmd::Compact => self.compact().await,
                 AgentCmd::Recap => match tools::memory::load_recap() {
                     Some(recap) => {

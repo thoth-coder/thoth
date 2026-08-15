@@ -27,6 +27,9 @@ struct Args {
     /// Resume this project's previous conversation
     #[arg(short = 'c', long = "continue")]
     resume: bool,
+    /// Config profile to run with (see `thoth config`)
+    #[arg(short = 'P', long)]
+    profile: Option<String>,
     /// OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 (Ollama)
     /// or http://localhost:8080/v1 (llama.cpp)
     #[arg(long)]
@@ -46,15 +49,39 @@ struct Args {
 enum Cmd {
     /// Download the latest release and replace this binary
     Upgrade,
+    /// Edit the config profiles on a screen, or switch between them
+    #[command(alias = "cfg")]
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCmd>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ConfigCmd {
+    /// List the profiles and show which one is active
+    List,
+    /// Start with this profile from now on
+    Use { name: String },
+    /// Print the path of the config file
+    Path,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if let Some(Cmd::Upgrade) = args.command {
-        return upgrade::run().await;
+    match args.command {
+        Some(Cmd::Upgrade) => return upgrade::run().await,
+        Some(Cmd::Config { action }) => return run_config(action),
+        None => {}
     }
-    let cfg = config::load(args.base_url, args.model, args.api_key, args.temperature);
+    let (cfg, profile) = config::load(config::Overrides {
+        profile: args.profile,
+        base_url: args.base_url,
+        model: args.model,
+        api_key: args.api_key,
+        temperature: args.temperature,
+    })?;
 
     if let (Some(key), Some(cx)) = (cfg.google_api_key.clone(), cfg.google_cx.clone()) {
         tools::web::set_google(key, cx);
@@ -132,7 +159,60 @@ async fn main() -> Result<()> {
 
     match args.prompt {
         Some(p) => run_print_mode(p, cmd_tx, ev_rx).await,
-        None => ui::run(model, base_url, num_ctx_ui, cmd_tx, ev_rx, cancel_slot).await,
+        None => {
+            ui::run(
+                model,
+                base_url,
+                profile,
+                num_ctx_ui,
+                cmd_tx,
+                ev_rx,
+                cancel_slot,
+            )
+            .await
+        }
+    }
+}
+
+/// `thoth config`: the screen with no arguments, and the three things that
+/// are quicker to say than to click.
+fn run_config(action: Option<ConfigCmd>) -> Result<()> {
+    match action {
+        None => ui::config::run_standalone(),
+        Some(ConfigCmd::Path) => {
+            println!("{}", config::config_path().display());
+            Ok(())
+        }
+        Some(ConfigCmd::List) => {
+            let store = config::load_store();
+            if store.profiles.is_empty() {
+                println!("no profiles yet. `thoth config` makes one");
+                return Ok(());
+            }
+            for (name, p) in &store.profiles {
+                println!(
+                    "{} {name:<16} {:<24} {}",
+                    if store.active.as_ref() == Some(name) {
+                        "*"
+                    } else {
+                        " "
+                    },
+                    p.model.as_deref().unwrap_or("(server default)"),
+                    p.base_url.as_deref().unwrap_or(config::DEFAULT_BASE_URL),
+                );
+            }
+            Ok(())
+        }
+        Some(ConfigCmd::Use { name }) => {
+            let mut store = config::load_store();
+            if !store.profiles.contains_key(&name) {
+                bail!("no profile named '{name}'. `thoth config list` shows them");
+            }
+            store.active = Some(name.clone());
+            config::save_store(&store)?;
+            println!("thoth now starts with profile '{name}'");
+            Ok(())
+        }
     }
 }
 
@@ -202,7 +282,7 @@ async fn run_print_mode(
             }
             AgentEvent::Info(t) => eprintln!("* {t}"),
             AgentEvent::Error(t) => eprintln!("error: {t}"),
-            AgentEvent::ModelChanged(_) => {}
+            AgentEvent::ModelChanged(_) | AgentEvent::Connected { .. } => {}
             AgentEvent::TurnStart => {}
             AgentEvent::Usage(u) => {
                 ctx_tokens = u.prompt_tokens;
