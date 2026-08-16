@@ -40,6 +40,10 @@ All notable changes to thoth are documented here. The format follows
   ending leaves it holding the port for the rest of the day, and whether it
   is still up is a question the operating system answers rather than
   something to take the model's word on.
+- A tool call missing a field is told which tool and what a good call
+  carries. serde said "missing field `old_string`" and stopped there, which
+  names neither, and the model has to guess which of its calls went wrong.
+  The schema already lists the required fields, so the error can too.
 - Several files asked for in one turn no longer blow the window apart. Each
   tool result was capped on its own, so six read_file calls in one reply
   arrived as six full results and the request after them went over the

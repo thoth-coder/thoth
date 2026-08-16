@@ -5,7 +5,7 @@ pub mod shell;
 pub mod todo;
 pub mod web;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -365,6 +365,37 @@ pub fn preview(name: &str, args: &Value) -> String {
 /// `window` is what this conversation is measured against, when anything
 /// knows: the two budgets it sets, what a result may take and what one write
 /// may carry, are not the same number and do not guess the same way.
+/// The arguments a call was supposed to carry. serde says "missing field
+/// `old_string`" and stops there, which does not say which tool, which of
+/// its fields are required, or that the whole call has to be sent again.
+/// The schema already knows all three, so the error can say them.
+fn args_of<T: serde::de::DeserializeOwned>(name: &str, args: Value) -> Result<T> {
+    serde_json::from_value(args).map_err(|e| {
+        let required = definitions(true)
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| t.pointer("/function/name").and_then(|v| v.as_str()) == Some(name))
+            })
+            .and_then(|t| t.pointer("/function/parameters/required").cloned())
+            .and_then(|r| {
+                r.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            })
+            .unwrap_or_default();
+        if required.is_empty() {
+            anyhow!("{name}: {e}")
+        } else {
+            anyhow!("{name}: {e}. Send the call again with every required field: {required}")
+        }
+    })
+}
+
 pub async fn execute(
     name: &str,
     args: Value,
@@ -373,21 +404,21 @@ pub async fn execute(
 ) -> Result<String> {
     let cap = output_cap(window);
     let out = match name {
-        "read_file" => fs::read_file(serde_json::from_value(args)?, cap)?,
-        "write_file" => fs::write_file(serde_json::from_value(args)?, write_cap(window))?,
-        "edit_file" => fs::edit_file(serde_json::from_value(args)?)?,
-        "multi_edit" => fs::multi_edit(serde_json::from_value(args)?)?,
-        "move_file" => fs::move_file(serde_json::from_value(args)?)?,
-        "delete_file" => fs::delete_file(serde_json::from_value(args)?)?,
-        "todo" => todo::write(serde_json::from_value(args)?)?,
-        "list_dir" => fs::list_dir(serde_json::from_value(args)?, cap)?,
-        "glob" => fs::glob_files(serde_json::from_value(args)?, cap)?,
-        "grep" => search::grep(serde_json::from_value(args)?, cap)?,
+        "read_file" => fs::read_file(args_of(name, args)?, cap)?,
+        "write_file" => fs::write_file(args_of(name, args)?, write_cap(window))?,
+        "edit_file" => fs::edit_file(args_of(name, args)?)?,
+        "multi_edit" => fs::multi_edit(args_of(name, args)?)?,
+        "move_file" => fs::move_file(args_of(name, args)?)?,
+        "delete_file" => fs::delete_file(args_of(name, args)?)?,
+        "todo" => todo::write(args_of(name, args)?)?,
+        "list_dir" => fs::list_dir(args_of(name, args)?, cap)?,
+        "glob" => fs::glob_files(args_of(name, args)?, cap)?,
+        "grep" => search::grep(args_of(name, args)?, cap)?,
         "problems" => crate::editor::diagnostics_report(),
-        "remember" => memory::remember(serde_json::from_value(args)?)?,
-        "web_search" => web::search(serde_json::from_value(args)?).await?,
-        "web_fetch" => web::fetch(serde_json::from_value(args)?, cap).await?,
-        "shell" => shell::run(serde_json::from_value(args)?, cancel).await?,
+        "remember" => memory::remember(args_of(name, args)?)?,
+        "web_search" => web::search(args_of(name, args)?).await?,
+        "web_fetch" => web::fetch(args_of(name, args)?, cap).await?,
+        "shell" => shell::run(args_of(name, args)?, cancel).await?,
         _ => bail!("unknown tool: {name}"),
     };
     Ok(truncate_output(out, cap))
@@ -415,6 +446,28 @@ pub fn truncate_output(s: String, cap: usize) -> String {
 mod tests {
     use super::*;
 
+    /// "missing field `old_string`" names neither the tool nor what it
+    /// needed, and the model is left guessing which call it was.
+    #[test]
+    fn a_malformed_call_is_told_what_it_was_missing() {
+        let err = args_of::<fs::EditArgs>("edit_file", json!({"path": "a.rs"}))
+            .err()
+            .expect("a call with no old_string cannot be read");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("edit_file:"), "{msg}");
+        assert!(msg.contains("old_string"), "{msg}");
+        assert!(
+            msg.contains("path, old_string, new_string"),
+            "it has to list what a good call carries: {msg}"
+        );
+
+        // a tool whose schema requires nothing is not handed an empty list
+        let err = args_of::<fs::ListArgs>("list_dir", json!("not an object"))
+            .err()
+            .expect("a string is not arguments");
+        assert!(!format!("{err:#}").contains("required field"), "{err:#}");
+    }
+
     #[test]
     fn the_output_cap_follows_the_window() {
         // what a 16k window used to get, kept as the reference point
@@ -426,6 +479,7 @@ mod tests {
         // a write is capped for a different reason than a read, so it does
         // not guess the same way when nobody said how big the window is
         assert_eq!(write_cap(Some(32_768)), 12_288);
+        assert_eq!(write_cap(Some(200_000)), 40_000);
         assert_eq!(write_cap(Some(200_000)), 40_000);
         assert!(
             write_cap(None) > output_cap(None),
