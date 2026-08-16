@@ -6,6 +6,12 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The system prompt now varies with the model as well as with the window. A
+  frontier model infers the shape of a job from the job; a local one of
+  twenty or thirty billion parameters does better having been shown, so the
+  worked example and the terse-answer examples go to the models that need
+  them. Unknown counts as needing them, because that is what a model nobody
+  recognises usually is. The rules themselves go to everyone.
 - `ask_user`: the model can stop and put a question to the user with two to
   nine options, and the answer comes back as the tool result. It is for a
   fork in the task that only the user can settle, asked before the work
@@ -46,6 +52,12 @@ All notable changes to thoth are documented here. The format follows
   last lines of a Rust file are `}` and `}`.
 
 ### Security
+- A tool result that reads like an instruction aimed at the model gets a line
+  saying so, whatever it came from: a file, a page, a search result. The
+  phrases an injection needs are the tell, since it has to cancel what came
+  before and usually asks to be kept quiet. Refusing was already reliable;
+  saying so was not, and a hidden order the user never hears about is the
+  half of the attack that still works.
 - Anything fetched from the network arrives wrapped in a line saying what it
   is: content someone else wrote, to be read and never obeyed, and to be
   reported if it asks for a command, a file change or for the instructions to

@@ -228,11 +228,12 @@ impl Agent {
     ) -> Self {
         let window = window_of(&client, &cfg);
         let turns = cfg.max_turns;
+        let system = prompt::system_prompt(window, turns, &client.model);
         Self {
             auto_compact_at: compact_threshold(&client, &cfg),
             client,
             cfg,
-            messages: vec![Message::system(prompt::system_prompt(window, turns))],
+            messages: vec![Message::system(system)],
             always_allow: crate::agent::session::load_allow(),
             tx,
             cancel_slot,
@@ -533,6 +534,7 @@ impl Agent {
                     self.messages.push(Message::system(prompt::system_prompt(
                         window,
                         self.cfg.max_turns,
+                        &self.client.model,
                     )));
                     crate::agent::session::clear();
                     self.send(AgentEvent::Info("conversation context cleared".into()));
