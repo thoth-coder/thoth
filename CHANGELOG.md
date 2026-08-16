@@ -34,6 +34,16 @@ All notable changes to thoth are documented here. The format follows
   inventing a unique `old_string` out of the last lines of the file, and the
   last lines of a Rust file are `}` and `}`.
 
+### Security
+- Anything fetched from the network arrives wrapped in a line saying what it
+  is: content someone else wrote, to be read and never obeyed, and to be
+  reported if it asks for a command, a file change or for the instructions to
+  be set aside. The rule was already in the system prompt, two thousand
+  tokens before the page shows up; the warning that holds is the one next to
+  the payload. Search results are wrapped too, since a title and a snippet
+  are the cheapest place on the internet to put a sentence in front of
+  somebody else's agent.
+
 ### Fixed
 - A background process thoth started and the model never stopped is named at
   the end of the request. "Closing the server now" followed by the turn
