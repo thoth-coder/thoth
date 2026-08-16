@@ -935,6 +935,10 @@ impl Agent {
                     .is_some_and(|(tool, args)| Self::is_read_only(tool) && args.contains(&name))
             });
         }
+        // and every command, which name no file but read the whole tree.
+        // `cargo test` after a fix is the same command and a different
+        // answer, and blocking it is blocking the one habit worth having
+        self.call_counts.retain(|k, _| !k.starts_with("shell:"));
     }
 
     /// A model that reads the same thing twice leaves two copies of it in the
@@ -1215,6 +1219,18 @@ mod tests {
         assert!(
             counted(&agent, "list_dir:{\"path\":\"src\"}"),
             "a listing that did not name it is untouched"
+        );
+
+        // a command names no file and reads the whole tree, so a change to
+        // any of it makes the same command a different answer: running the
+        // tests again after a fix is the habit, not a loop
+        agent
+            .call_counts
+            .insert("shell:{\"command\":\"cargo test\"}".into(), 3);
+        agent.forget_reads_of(&call("edit_file", "{\"path\":\"src/main.rs\"}"));
+        assert!(
+            !counted(&agent, "shell:{\"command\":\"cargo test\"}"),
+            "the tests have to be runnable again after the fix"
         );
 
         // and a call that changes nothing leaves the count alone

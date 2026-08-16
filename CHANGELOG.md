@@ -44,6 +44,12 @@ All notable changes to thoth are documented here. The format follows
   One turn's results now share one turn's room, and a result that runs out
   of it says where it was cut and to ask again. The same job in an 8k window
   went from losing the task entirely to finishing it across two compactions.
+- Running the tests again after a fix is no longer blocked as a repeat. The
+  loop breaker counts a command by its text, and `bun test` after an edit is
+  the same text and a different answer; a model that fixed the bug and went
+  to confirm it got "this exact shell call was already run 3 times, the
+  result will not change". A change to any file now clears what was counted
+  about commands, which is the one habit worth encouraging.
 - A path that is not there says where the working directory is. "The system
   cannot find the path specified" cost three more calls and a `pwd` every
   time a model guessed an absolute path wrong.
