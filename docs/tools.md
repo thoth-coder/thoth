@@ -13,7 +13,7 @@
 | `web_search` | web search through DuckDuckGo, no API key needed | auto |
 | `web_fetch` | fetch a URL as readable text | asks per host |
 | `remember` | save a durable fact to project memory | asks first |
-| `write_file` | create a new file | asks first |
+| `write_file` | create a new file, or add a section to one with `append` | asks first |
 | `edit_file` | exact string replacement in a file | asks first |
 | `multi_edit` | several replacements in one file, all or nothing | asks first |
 | `move_file` | rename or move a file, never over an existing one | asks first |
@@ -39,7 +39,15 @@ blocking. The model kills the pid when it is done.
   at all.
 - Overwriting a file with `write_file` requires having read every line of
   it. Reads are tracked as line ranges, so neither a one-line peek nor a
-  peek at the first and last line counts as having read the file.
+  peek at the first and last line counts as having read the file. Adding to
+  the end with `append` needs no read, because nothing already in the file
+  is touched.
+- One `write_file` call is capped at half of what a tool result may take
+  (about 12k characters on a 32k window). A model that tries to emit a
+  1200-line file in one call has to fit all of it, and its reasoning, in a
+  single generation; past the window it is cut off mid-file and the whole
+  thing is lost. Long files are written as sections: the first normally,
+  the rest with `append`.
 - `read_file` refuses files over 2 MB; use `grep` or offset/limit instead.
 - Every file change is shown as a unified diff with line numbers, and every
   shell command line, move and delete is shown in full, even after

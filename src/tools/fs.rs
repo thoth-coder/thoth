@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use globset::GlobBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -227,14 +227,30 @@ pub fn read_file(a: ReadArgs, cap: usize) -> Result<String> {
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
+    /// Add to the end of the file instead of replacing it.
+    #[serde(default)]
+    pub append: bool,
 }
 
-pub fn write_file(a: WriteArgs) -> Result<String> {
+pub fn write_file(a: WriteArgs, cap: usize) -> Result<String> {
     let path = resolve(&a.path);
-    if path.exists() && !was_fully_read(&path) {
+    let size = a.content.chars().count();
+    if size > cap {
+        bail!(
+            "this call carries {size} characters, and one write_file may carry {cap} in this \
+             context. A file this long does not survive being written in one go: the generation \
+             is cut off before the call is finished and all of it is lost. Write it in parts. \
+             Start with the first section, under {cap} characters, ending at a point the file is \
+             still valid at, then send each next section to the same path with append true."
+        );
+    }
+    // appending adds to a file without touching a line of what is already
+    // there, so it needs no read: there is nothing to overwrite unseen
+    if !a.append && path.exists() && !was_fully_read(&path) {
         bail!(
             "{} already exists and you have not read it completely. Read the whole file first, \
-             and for modifying an existing file prefer edit_file over overwriting it",
+             and for modifying an existing file prefer edit_file over overwriting it. To add to \
+             the end of it, call write_file again with append true",
             path.display()
         );
     }
@@ -243,17 +259,42 @@ pub fn write_file(a: WriteArgs) -> Result<String> {
             .with_context(|| format!("cannot create directory {}", parent.display()))?;
     }
     let before = crate::agent::undo::snapshot(&path);
+    let old = match &before {
+        crate::agent::undo::Before::Text(old) => Some(old.clone()),
+        _ => None,
+    };
     // an overwrite that flips a CRLF file to LF shows up as every line
     // changed, which is not what was asked for
-    let content = match &before {
-        crate::agent::undo::Before::Text(old) => align_newlines(old, &a.content),
-        _ => a.content.clone(),
+    let added = match &old {
+        Some(old) => align_newlines(old, &a.content),
+        None => a.content.clone(),
+    };
+    let content = match (&old, a.append) {
+        (Some(old), true) => {
+            let mut s = old.clone();
+            // a section that starts where the last one stopped mid-line is
+            // a section pasted into the middle of a statement
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push_str(if s.contains("\r\n") { "\r\n" } else { "\n" });
+            }
+            s.push_str(&added);
+            s
+        }
+        _ => added,
     };
     std::fs::write(&path, &content).with_context(|| format!("cannot write {}", path.display()))?;
     crate::agent::undo::record(&path, before);
     // the model authored the whole file, so it has seen all of it
     let lines = content.lines().count().max(1);
     mark_read(&path, 1, lines, lines);
+    if a.append && old.is_some() {
+        return Ok(format!(
+            "Appended {} lines to {}, now {lines} lines ({} bytes)",
+            a.content.lines().count(),
+            path.display(),
+            content.len()
+        ));
+    }
     Ok(format!(
         "Wrote {} lines ({} bytes) to {}",
         content.lines().count(),
@@ -299,6 +340,7 @@ pub fn edit_file(a: EditArgs) -> Result<String> {
     if a.old_string == a.new_string {
         bail!("old_string and new_string are identical");
     }
+    empty_anchor(&a.old_string)?;
     let old = align_newlines(&content, &a.old_string);
     let new = align_newlines(&content, &a.new_string);
     let count = content.matches(&old).count();
@@ -309,10 +351,12 @@ pub fn edit_file(a: EditArgs) -> Result<String> {
         );
     }
     if !a.replace_all && count > 1 {
-        bail!(
-            "old_string appears {count} times in {}. add surrounding context to make it unique, or set replace_all",
-            path.display()
-        );
+        return Err(ambiguous(
+            &content,
+            &old,
+            count,
+            &path.display().to_string(),
+        ));
     }
     let new_content = if a.replace_all {
         content.replace(&old, &new)
@@ -357,28 +401,101 @@ pub fn multi_edit(a: MultiEditArgs) -> Result<String> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    let (new_content, n) = apply_edits(&content, &a.edits, &path.display().to_string())?;
+    let (new_content, n, skipped) = apply_edits(&content, &a.edits, &path.display().to_string())?;
     std::fs::write(&path, new_content)
         .with_context(|| format!("cannot write {}", path.display()))?;
     crate::agent::undo::record(&path, crate::agent::undo::Before::Text(content));
-    Ok(format!(
+    let mut out = format!(
         "Edited {} ({} edits, {n} replacement(s))",
         path.display(),
         a.edits.len()
-    ))
+    );
+    // never let the caller believe an edit landed when it asked for nothing
+    if !skipped.is_empty() {
+        let list: Vec<String> = skipped.iter().map(usize::to_string).collect();
+        out.push_str(&format!(
+            ". Edit {} asked for no change (old_string and new_string identical) and was \
+             skipped; the rest were applied",
+            list.join(", ")
+        ));
+    }
+    Ok(out)
 }
 
 /// Shared by the tool and its preview, so what the user approves is exactly
 /// what gets written. Fails on the first edit that does not apply, having
 /// changed nothing on disk.
-fn apply_edits(content: &str, edits: &[EditStep], name: &str) -> Result<(String, usize)> {
+/// Where a snippet that appears more than once appears. "It is not unique,
+/// add surrounding context" tells a model to guess; the line numbers tell it
+/// which lines to look at, and it picks the right context in one turn
+/// instead of two. Offsets come from `find` on this same string, so they are
+/// on character boundaries by construction.
+fn match_lines(content: &str, old: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    while let Some(i) = content[start..].find(old) {
+        let at = start + i;
+        lines.push(content[..at].matches('\n').count() + 1);
+        start = at + old.len();
+        if lines.len() >= 5 {
+            break;
+        }
+    }
+    lines
+}
+
+fn ambiguous(content: &str, old: &str, count: usize, name: &str) -> anyhow::Error {
+    let lines: Vec<String> = match_lines(content, old)
+        .iter()
+        .map(usize::to_string)
+        .collect();
+    let more = if count > lines.len() { ", ..." } else { "" };
+    anyhow!(
+        "old_string appears {count} times in {name}, at line {}{more}. Take the one you mean and \
+         add the lines above or below it until no other place matches, or set replace_all to \
+         change every one",
+        lines.join(", ")
+    )
+}
+
+/// An empty old_string is a model reaching for an append with the wrong
+/// tool. It matches between every pair of characters in the file, so what
+/// it gets back otherwise is "old_string appears 61 times in Cargo.toml,
+/// add surrounding context to make it unique", which is true and useless.
+fn empty_anchor(old: &str) -> Result<()> {
+    if old.is_empty() {
+        bail!(
+            "old_string is empty, so it matches everywhere. To add to the end of a file, call \
+             write_file with append true. To change something in the middle, copy the exact \
+             lines it should replace"
+        );
+    }
+    Ok(())
+}
+
+/// Returns the new content, how many replacements were made, and which
+/// edits were skipped because they asked for no change.
+fn apply_edits(
+    content: &str,
+    edits: &[EditStep],
+    name: &str,
+) -> Result<(String, usize, Vec<usize>)> {
     let mut out = content.to_string();
     let mut total = 0usize;
+    let mut skipped: Vec<usize> = Vec::new();
+    if edits.iter().all(|e| e.old_string == e.new_string) {
+        bail!("every edit has old_string equal to new_string: nothing to do");
+    }
     for (i, e) in edits.iter().enumerate() {
         let step = i + 1;
+        // one edit that changes nothing is not a reason to throw away the
+        // ones that do: applying none of them is for an edit that fails,
+        // and this one cannot fail, it just has no work in it
         if e.old_string == e.new_string {
-            bail!("edit {step}: old_string and new_string are identical");
+            skipped.push(step);
+            continue;
         }
+        empty_anchor(&e.old_string).with_context(|| format!("edit {step}"))?;
         let old = align_newlines(&out, &e.old_string);
         let new = align_newlines(&out, &e.new_string);
         let count = out.matches(&old).count();
@@ -389,10 +506,7 @@ fn apply_edits(content: &str, edits: &[EditStep], name: &str) -> Result<(String,
             );
         }
         if !e.replace_all && count > 1 {
-            bail!(
-                "edit {step}: old_string appears {count} times in {name}. add surrounding \
-                 context to make it unique, or set replace_all"
-            );
+            return Err(ambiguous(&out, &old, count, name).context(format!("edit {step}")));
         }
         out = if e.replace_all {
             total += count;
@@ -402,7 +516,7 @@ fn apply_edits(content: &str, edits: &[EditStep], name: &str) -> Result<(String,
             out.replacen(&old, &new, 1)
         };
     }
-    Ok((out, total))
+    Ok((out, total, skipped))
 }
 
 /// The whole set of edits as one diff: what the user approves is the file
@@ -419,7 +533,17 @@ pub fn preview_multi_edit(args: &Value) -> String {
         return header + "(cannot read file)\n";
     };
     match apply_edits(&content, &edits, path) {
-        Ok((new_content, _)) => header + &unified_diff(&content, &new_content),
+        Ok((new_content, _, skipped)) => {
+            let mut s = header;
+            if !skipped.is_empty() {
+                let list: Vec<String> = skipped.iter().map(usize::to_string).collect();
+                s.push_str(&format!(
+                    "(edit {} changes nothing and is skipped)\n",
+                    list.join(", ")
+                ));
+            }
+            s + &unified_diff(&content, &new_content)
+        }
         Err(e) => format!("{header}({e:#}, this call will fail)\n"),
     }
 }
@@ -711,6 +835,21 @@ pub fn unified_diff(old: &str, new: &str) -> String {
 pub fn preview_write(args: &Value) -> String {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let append = args
+        .get("append")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if append && std::fs::metadata(resolve(path)).is_ok() {
+        let n = content.lines().count();
+        let mut s = format!("Append to {path} ({n} lines):\n");
+        for l in content.lines().take(PREVIEW_LINES) {
+            s.push_str(&format!("+{l}\n"));
+        }
+        if n > PREVIEW_LINES {
+            s.push_str(&format!("  ... +{} more lines\n", n - PREVIEW_LINES));
+        }
+        return s;
+    }
     match std::fs::read_to_string(resolve(path)) {
         // through the same alignment write_file uses, or a CRLF file would
         // preview as every single line changed
@@ -988,6 +1127,88 @@ mod tests {
         );
     }
 
+    /// "Not unique, add surrounding context" leaves the model guessing which
+    /// of the matches it should have been looking at.
+    #[test]
+    fn an_ambiguous_anchor_says_which_lines_match() {
+        let p = tmp("ambiguous.rs", 0);
+        std::fs::write(
+            &p,
+            "fn first() -> i32 {\n    let x = 1;\n    x\n}\n\nfn second() -> i32 {\n    let x = 1;\n    x\n}\n",
+        )
+        .unwrap();
+        read(&p, 1, 600);
+        let err = edit_file(EditArgs {
+            path: p.to_string_lossy().into_owned(),
+            old_string: "    let x = 1;".into(),
+            new_string: "    let x = 2;".into(),
+            replace_all: false,
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("appears 2 times"), "{msg}");
+        assert!(
+            msg.contains("at line 2, 7"),
+            "the lines are the help: {msg}"
+        );
+        assert!(msg.contains("replace_all"), "{msg}");
+    }
+
+    /// An empty anchor is an append written with the wrong tool, and the
+    /// count of how many times nothing appears in the file says nothing
+    /// about that.
+    #[test]
+    fn an_empty_old_string_points_at_append() {
+        let p = tmp("empty_anchor.toml", 0);
+        std::fs::write(&p, "[package]\nname = \"probe\"\n").unwrap();
+        read(&p, 1, 600);
+        let err = edit_file(EditArgs {
+            path: p.to_string_lossy().into_owned(),
+            old_string: String::new(),
+            new_string: "[[bin]]\n".into(),
+            replace_all: false,
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("append true"), "{msg}");
+        assert!(!msg.contains("appears"), "not a uniqueness problem: {msg}");
+
+        let err = multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("", "[[bin]]\n")]),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("edit 1"), "{err:#}");
+    }
+
+    /// One edit that asks for no change is not a failed edit, and throwing
+    /// away the three real ones next to it costs a whole turn on a model
+    /// that only got one of four wrong.
+    #[test]
+    fn an_edit_that_changes_nothing_is_skipped_not_fatal() {
+        let p = tmp("noop.txt", 0);
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        read(&p, 1, 600);
+        let out = multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("alpha", "A"), ("beta", "beta"), ("gamma", "G")]),
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "A\nbeta\nG\n");
+        assert!(
+            out.contains("Edit 2"),
+            "it has to say what it skipped: {out}"
+        );
+
+        // but a call with nothing in it at all is still an error
+        let err = multi_edit(MultiEditArgs {
+            path: p.to_string_lossy().into_owned(),
+            edits: steps(&[("A", "A")]),
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("nothing to do"), "{err:#}");
+    }
+
     #[test]
     fn a_later_edit_sees_what_an_earlier_one_did() {
         let p = tmp("chain.txt", 0);
@@ -1133,12 +1354,99 @@ mod tests {
 
         // and a full overwrite keeps them too, instead of turning every
         // line of the file into a change
-        write_file(WriteArgs {
-            path: p.to_string_lossy().into_owned(),
-            content: "alpha\nbeta\n".into(),
-        })
+        write_file(
+            WriteArgs {
+                path: p.to_string_lossy().into_owned(),
+                content: "alpha\nbeta\n".into(),
+                append: false,
+            },
+            10_000,
+        )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\r\nbeta\r\n");
+    }
+
+    /// Sections of a long file go on the end without a read and without an
+    /// old_string to make unique, which is the whole point: the last lines
+    /// of a Rust file are `}` and `}`, and no anchor built out of them is
+    /// ever unique.
+    #[test]
+    fn a_section_is_appended_to_what_is_already_there() {
+        let dir = std::env::temp_dir().join("thoth_append_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("json.rs");
+        let _ = std::fs::remove_file(&p);
+        let args = |content: &str, append: bool| WriteArgs {
+            path: p.to_string_lossy().into_owned(),
+            content: content.into(),
+            append,
+        };
+
+        write_file(args("fn a() {}\n", false), 10_000).unwrap();
+        forget_read(&p);
+
+        // no read in between, the way a second section arrives
+        let out = write_file(args("fn b() {}\n", true), 10_000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() {}\nfn b() {}\n"
+        );
+        assert!(out.contains("Appended 1 lines"), "{out}");
+        assert!(out.contains("now 2 lines"), "{out}");
+
+        // an overwrite in the same spot is still refused
+        forget_read(&p);
+        let err = write_file(args("fn c() {}\n", false), 10_000).unwrap_err();
+        assert!(format!("{err:#}").contains("append true"), "{err:#}");
+
+        // a section that lands on a file with no trailing newline does not
+        // get glued onto the last line of it
+        std::fs::write(&p, "fn a() {}").unwrap();
+        write_file(args("fn b() {}\n", true), 10_000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() {}\nfn b() {}\n"
+        );
+
+        // and the file's own line endings survive
+        std::fs::write(&p, "fn a() {}\r\n").unwrap();
+        write_file(args("fn b() {}\n", true), 10_000).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() {}\r\nfn b() {}\r\n"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A file too long to generate in one turn is refused before it can
+    /// take the turn down with it, and the refusal says how to write it.
+    #[test]
+    fn a_write_too_big_for_the_window_is_refused() {
+        let dir = std::env::temp_dir().join("thoth_write_cap_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("big.rs");
+        let args = |content: String| WriteArgs {
+            path: p.to_string_lossy().into_owned(),
+            content,
+            append: false,
+        };
+
+        let err = write_file(args("x".repeat(3_000)), 2_000).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("3000 characters"), "{msg}");
+        assert!(
+            msg.contains("append true"),
+            "it has to say what to do: {msg}"
+        );
+        assert!(
+            !p.exists(),
+            "nothing may be written when the call is refused"
+        );
+
+        // and the same content is fine where there is room for it
+        write_file(args("x".repeat(3_000)), 4_000).unwrap();
+        assert!(p.exists());
+        let _ = std::fs::remove_file(&p);
     }
 
     /// The same double-cap trap read_file had: a listing that overran the

@@ -23,6 +23,17 @@ pub fn output_cap(window: Option<u32>) -> usize {
     }
 }
 
+/// How much one write_file may carry, given what a result may take. Reading
+/// something that big is fine: it arrives in one piece. Writing it is not,
+/// because the model has to emit every character inside one generation,
+/// together with its reasoning, and a generation that runs past the window
+/// is cut off mid-file: the whole thing is lost, and the turn with it. Half
+/// of a result's room leaves space for both, and a file too long for that is
+/// a file to build up in pieces, the way a person writes one.
+pub fn write_cap_from(cap: usize) -> usize {
+    (cap / 2).max(2_000)
+}
+
 /// `with_problems` drops the editor tool when no editor is connected: a tool
 /// that cannot work is schema tokens spent on a wrong turn waiting to happen.
 pub fn definitions(with_problems: bool) -> Value {
@@ -38,10 +49,11 @@ pub fn definitions(with_problems: bool) -> Value {
         }},
         {"type": "function", "function": {
             "name": "write_file",
-            "description": "Create or overwrite a file with the given content. Parent directories are created automatically. For small changes to existing files prefer edit_file.",
+            "description": "Create or overwrite a file with the given content. Parent directories are created automatically. For small changes to existing files prefer edit_file. A file too long for one call is written in sections: the first section normally, every section after it with append true.",
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
-                "content": {"type": "string", "description": "Full content to write"}
+                "content": {"type": "string", "description": "Full content to write, or the next section when append is true"},
+                "append": {"type": "boolean", "description": "Add content to the end of the file instead of replacing it. Needs no prior read."}
             }, "required": ["path", "content"]}
         }},
         {"type": "function", "function": {
@@ -340,7 +352,7 @@ pub async fn execute(
 ) -> Result<String> {
     let out = match name {
         "read_file" => fs::read_file(serde_json::from_value(args)?, cap)?,
-        "write_file" => fs::write_file(serde_json::from_value(args)?)?,
+        "write_file" => fs::write_file(serde_json::from_value(args)?, write_cap_from(cap))?,
         "edit_file" => fs::edit_file(serde_json::from_value(args)?)?,
         "multi_edit" => fs::multi_edit(serde_json::from_value(args)?)?,
         "move_file" => fs::move_file(serde_json::from_value(args)?)?,
