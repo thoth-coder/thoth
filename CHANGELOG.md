@@ -35,6 +35,15 @@ All notable changes to thoth are documented here. The format follows
   last lines of a Rust file are `}` and `}`.
 
 ### Fixed
+- A request that changed files and ran nothing says so. The prompt tells the
+  model to build what it changed, and a model that skipped it still signs off
+  with "build passed"; whether a command ran is not the model's word about
+  itself, thoth watched every tool call the request made. It now prints a
+  note, so "it builds" over an untouched compiler is contradicted on the
+  spot.
+- The preview of an `edit_file` with an empty `old_string` gives the reason
+  the tool will give. It used to say "old_string not found in file", sending
+  the reader to look for a typo in a string that is not there at all.
 - The write cap does not shrink a hosted model to 170 lines a file. It used
   to be derived from the tool-result cap, which guesses small when a profile
   declares no `context_window`, on purpose: one grep must not eat the context

@@ -250,6 +250,30 @@ impl Agent {
         self.perm_mode = m;
     }
 
+    /// Whether a call changed a file that something could have compiled or
+    /// run. A README with a typo fixed is a change nobody was going to
+    /// build, and saying so after every one of those is noise that teaches
+    /// the reader to skip the line that matters.
+    fn changed_code(tc: &ToolCall) -> bool {
+        const CODE: [&str; 20] = [
+            "rs", "ts", "tsx", "js", "jsx", "mjs", "py", "go", "java", "kt", "rb", "php", "c", "h",
+            "cc", "cpp", "hpp", "cs", "swift", "sh",
+        ];
+        if !tools::changes_files(&tc.function.name) {
+            return false;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(&tc.function.arguments) else {
+            return false;
+        };
+        ["path", "to"].iter().any(|k| {
+            args.get(*k)
+                .and_then(|v| v.as_str())
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| CODE.contains(&e.to_ascii_lowercase().as_str()))
+        })
+    }
+
     /// Whether the running mode answers the permission question by itself.
     /// Auto answers it for everything; accept-edits only for changes to
     /// files, which are the ones with a diff shown and an undo behind them.
@@ -607,6 +631,8 @@ impl Agent {
         let tools_def = tools::definitions(crate::editor::connected());
         // breaks infinite loops: counts identical tool calls within this task
         self.call_counts.clear();
+        // what this request actually did, for the note at the end of it
+        let (mut changed_files, mut ran_command) = (false, false);
         let mut compact_pending = false;
         let mut truncations = 0u32;
 
@@ -711,6 +737,17 @@ impl Agent {
                     // changed anything to say it: that is the plan
                     self.send(AgentEvent::PlanReady);
                 }
+                // The prompt tells the model to build what it changed, and
+                // a model that did not do it still writes "build passed" at
+                // the end. Whether a command ran is not its word against
+                // itself: thoth watched every tool call this request made.
+                if changed_files && !ran_command {
+                    self.send(AgentEvent::Info(
+                        "note: files changed and nothing was built or run this request. Anything \
+                         above about it building or passing was not checked here"
+                            .into(),
+                    ));
+                }
                 return Ok(());
             }
 
@@ -768,6 +805,8 @@ impl Agent {
                 if !is_error {
                     self.drop_stale_copy(tc);
                     self.forget_reads_of(tc);
+                    changed_files |= Self::changed_code(tc);
+                    ran_command |= tc.function.name == "shell";
                 }
             }
             if token.is_cancelled() {
@@ -1121,6 +1160,42 @@ mod tests {
         agent.call_counts.insert(read_key.into(), 3);
         agent.forget_reads_of(&call("shell", "{\"command\":\"cargo test\"}"));
         assert!(counted(&agent, read_key));
+    }
+
+    /// The note about an unchecked change is for code, not for every file:
+    /// after a typo fixed in a README it would be noise, and noise is what
+    /// teaches a reader to skip the line that matters.
+    #[test]
+    fn only_a_change_to_code_is_worth_saying_was_not_built() {
+        let call = |name: &str, args: &str| ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+        };
+        assert!(Agent::changed_code(&call(
+            "write_file",
+            "{\"path\":\"src/main.rs\"}"
+        )));
+        assert!(Agent::changed_code(&call(
+            "multi_edit",
+            "{\"path\":\"C:/p/app.TS\"}"
+        )));
+        assert!(Agent::changed_code(&call(
+            "move_file",
+            "{\"from\":\"a.md\",\"to\":\"b.py\"}"
+        )));
+        assert!(!Agent::changed_code(&call(
+            "edit_file",
+            "{\"path\":\"README.md\"}"
+        )));
+        assert!(!Agent::changed_code(&call(
+            "write_file",
+            "{\"path\":\"notes\"}"
+        )));
+        assert!(!Agent::changed_code(&call("shell", "{\"command\":\"ls\"}")));
     }
 
     /// What each mode answers by itself, and what it still leaves to the

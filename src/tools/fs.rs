@@ -899,6 +899,15 @@ pub fn preview_edit(args: &Value) -> String {
             };
             header + &unified_diff(&content, &new_content)
         }
+        // the preview has to give the same reason the tool will: "not
+        // found" for an empty anchor sends the user looking for a typo in
+        // a string that is not there at all
+        Ok(_) if old_s.is_empty() => {
+            header
+                + "(old_string is empty, so this edit will fail. Adding to the end of a file is \
+                   write_file with append)\n"
+                + &raw_edit_preview(old_s, new_s)
+        }
         Ok(_) => {
             header
                 + "(old_string not found in file, this edit will fail)\n"
