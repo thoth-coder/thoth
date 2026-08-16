@@ -376,8 +376,8 @@ impl Agent {
         let token = CancellationToken::new();
         *self.cancel_slot.lock().unwrap() = token.clone();
         let args = serde_json::json!({ "command": command });
-        let cap = tools::output_cap(window_of(&self.client, &self.cfg));
-        let (content, is_error) = match tools::execute("shell", args, token, cap).await {
+        let window = window_of(&self.client, &self.cfg);
+        let (content, is_error) = match tools::execute("shell", args, token, window).await {
             Ok(s) => (s, false),
             Err(e) => (format!("Error: {e:#}"), true),
         };
@@ -497,9 +497,10 @@ impl Agent {
             full_input.push_str(&Self::language_note(lang));
         }
         self.messages.push(Message::user(full_input));
-        // both depend on where this turn is running: how much room a result
-        // may take, and whether there is an editor to ask about problems
-        let cap = tools::output_cap(window_of(&self.client, &self.cfg));
+        // both depend on where this turn is running: the budgets the tools
+        // size themselves against, and whether there is an editor to ask
+        // about problems
+        let window = window_of(&self.client, &self.cfg);
         let tools_def = tools::definitions(crate::editor::connected());
         // breaks infinite loops: counts identical tool calls within this task
         self.call_counts.clear();
@@ -643,7 +644,7 @@ impl Agent {
                     ));
                     continue;
                 }
-                let result = self.run_tool(tc, &token, cap).await;
+                let result = self.run_tool(tc, &token, window).await;
                 let (content, is_error) = match result {
                     Ok(s) => (s, false),
                     Err(e) => (format!("Error: {e:#}"), true),
@@ -763,7 +764,7 @@ impl Agent {
         &mut self,
         tc: &ToolCall,
         token: &CancellationToken,
-        cap: usize,
+        window: Option<u32>,
     ) -> Result<String> {
         let name = tc.function.name.as_str();
         let args: Value = serde_json::from_str(&tc.function.arguments)
@@ -816,7 +817,7 @@ impl Agent {
             }
         }
 
-        tools::execute(name, args, token.clone(), cap).await
+        tools::execute(name, args, token.clone(), window).await
     }
 }
 

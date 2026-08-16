@@ -90,7 +90,7 @@ Every field is optional. A profile only records what it changes.
 | `model` | empty asks the server, which only works for a local one |
 | `api_key` | bearer token, or `x-api-key` on Anthropic |
 | `headers` | extra request headers, for endpoints that want their own |
-| `context_window` | requested per call on Ollama; elsewhere it is what auto-compact measures against. Was called `num_ctx` |
+| `context_window` | requested per call on Ollama; elsewhere it is what auto-compact measures against, and what sizes one tool result and one `write_file`. Was called `num_ctx` |
 | `max_tokens` | cap on one reply. Anthropic gets 8192 when it is unset, since that api requires one. Leave it empty on OpenAI reasoning models, which want `max_completion_tokens` instead and reject this |
 | `think` | force thinking on or off (Ollama) |
 | `temperature`, `max_turns` | sampling, and tool calls allowed per request |
@@ -167,6 +167,13 @@ the window is fixed by the server or the model, and the number in the
 profile is thoth's own yardstick: it is what auto-compact measures against,
 and it is what the `ctx 12.4k/200k` readout divides by. Leave it out and
 thoth simply stops guessing when to compact, so run `/compact` yourself.
+
+It also sizes the two tool budgets. Left out, they fall back to numbers that
+guess in opposite directions on purpose: a tool result is capped at 12k
+characters, small, so one `grep` cannot eat the context of a server nobody
+described, and one `write_file` at 40k, large, because a window nobody
+declared is a hosted api and cutting a capable model down to 170 lines a
+file would be the wrong mistake. Declaring the window replaces both guesses.
 
 If the model stalls, rambles, or forgets files it just read, the window is
 almost always too small. On Ollama raise `context_window` (costs RAM/VRAM;

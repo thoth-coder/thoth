@@ -215,7 +215,7 @@ pub fn system_prompt(window: Option<u32>, max_turns: usize) -> String {
     let git = repo.as_ref().map(|g| format!("\n{g}")).unwrap_or_default();
     let situational = situational_rules(repo.is_some(), crate::editor::connected());
     let project = project_context(window);
-    let write_cap = crate::tools::write_cap_from(crate::tools::output_cap(window));
+    let write_cap = crate::tools::write_cap(window);
     format!(
         "You are Thoth, an agentic coding assistant running in the user's terminal. You work \
 directly on the user's real files with tools.

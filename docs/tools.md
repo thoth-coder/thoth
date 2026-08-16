@@ -42,12 +42,12 @@ blocking. The model kills the pid when it is done.
   peek at the first and last line counts as having read the file. Adding to
   the end with `append` needs no read, because nothing already in the file
   is touched.
-- One `write_file` call is capped at half of what a tool result may take
-  (about 12k characters on a 32k window). A model that tries to emit a
-  1200-line file in one call has to fit all of it, and its reasoning, in a
-  single generation; past the window it is cut off mid-file and the whole
-  thing is lost. Long files are written as sections: the first normally,
-  the rest with `append`.
+- One `write_file` call is capped at half of what a tool result may take:
+  about 12k characters on a 32k window, 40k on a 200k one, and 40k when the
+  profile never said. A model that tries to emit a 1200-line file in one
+  call has to fit all of it, and its reasoning, in a single generation; past
+  the window it is cut off mid-file and the whole thing is lost. Long files
+  are written as sections: the first normally, the rest with `append`.
 - `read_file` refuses files over 2 MB; use `grep` or offset/limit instead.
 - Every file change is shown as a unified diff with line numbers, and every
   shell command line, move and delete is shown in full, even after

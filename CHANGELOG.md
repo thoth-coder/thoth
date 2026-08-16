@@ -14,6 +14,11 @@ All notable changes to thoth are documented here. The format follows
   last lines of a Rust file are `}` and `}`.
 
 ### Fixed
+- The write cap does not shrink a hosted model to 170 lines a file. It used
+  to be derived from the tool-result cap, which guesses small when a profile
+  declares no `context_window`, on purpose: one grep must not eat the context
+  of a server nobody described. A write is capped for the opposite reason,
+  so an undeclared window now means 40k characters there, not 6k.
 - A compaction in the middle of a request no longer leaves files unreadable.
   The loop breaker counts identical tool calls, and it kept counting across
   the compaction that had just thrown their results away, so a re-read of the

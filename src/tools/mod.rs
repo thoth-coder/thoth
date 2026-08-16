@@ -23,15 +23,23 @@ pub fn output_cap(window: Option<u32>) -> usize {
     }
 }
 
-/// How much one write_file may carry, given what a result may take. Reading
-/// something that big is fine: it arrives in one piece. Writing it is not,
-/// because the model has to emit every character inside one generation,
-/// together with its reasoning, and a generation that runs past the window
-/// is cut off mid-file: the whole thing is lost, and the turn with it. Half
-/// of a result's room leaves space for both, and a file too long for that is
-/// a file to build up in pieces, the way a person writes one.
-pub fn write_cap_from(cap: usize) -> usize {
-    (cap / 2).max(2_000)
+/// How much one write_file may carry. Reading something that big is fine:
+/// it arrives in one piece. Writing it is not, because the model has to emit
+/// every character inside one generation, together with its reasoning, and a
+/// generation that runs past the window is cut off mid-file: the whole thing
+/// is lost, and the turn with it. Half of what a result may take leaves room
+/// for both, and a file too long for that is a file to build up in pieces,
+/// the way a person writes one.
+pub fn write_cap(window: Option<u32>) -> usize {
+    match window {
+        Some(_) => (output_cap(window) / 2).max(2_000),
+        // A window nobody declared is a hosted api that was never asked, and
+        // those are large. The read side guesses small there on purpose, so
+        // one grep cannot eat a small server's context; guessing small here
+        // would do the opposite of what this cap is for, and cut a capable
+        // model down to 170 lines a file.
+        None => 40_000,
+    }
 }
 
 /// `with_problems` drops the editor tool when no editor is connected: a tool
@@ -344,15 +352,19 @@ pub fn preview(name: &str, args: &Value) -> String {
     }
 }
 
+/// `window` is what this conversation is measured against, when anything
+/// knows: the two budgets it sets, what a result may take and what one write
+/// may carry, are not the same number and do not guess the same way.
 pub async fn execute(
     name: &str,
     args: Value,
     cancel: CancellationToken,
-    cap: usize,
+    window: Option<u32>,
 ) -> Result<String> {
+    let cap = output_cap(window);
     let out = match name {
         "read_file" => fs::read_file(serde_json::from_value(args)?, cap)?,
-        "write_file" => fs::write_file(serde_json::from_value(args)?, write_cap_from(cap))?,
+        "write_file" => fs::write_file(serde_json::from_value(args)?, write_cap(window))?,
         "edit_file" => fs::edit_file(serde_json::from_value(args)?)?,
         "multi_edit" => fs::multi_edit(serde_json::from_value(args)?)?,
         "move_file" => fs::move_file(serde_json::from_value(args)?)?,
@@ -400,6 +412,15 @@ mod tests {
         // a big window is allowed to use its room, a tiny one is protected
         assert!(output_cap(Some(200_000)) > output_cap(Some(32_768)));
         assert_eq!(output_cap(Some(200_000)), 80_000);
+
+        // a write is capped for a different reason than a read, so it does
+        // not guess the same way when nobody said how big the window is
+        assert_eq!(write_cap(Some(32_768)), 12_288);
+        assert_eq!(write_cap(Some(200_000)), 40_000);
+        assert!(
+            write_cap(None) > output_cap(None),
+            "an undeclared window is a hosted api, not a small server"
+        );
         assert_eq!(output_cap(Some(2_000)), 4_000);
         // an unknown window must not be treated as a generous one
         assert_eq!(output_cap(None), 12_000);
