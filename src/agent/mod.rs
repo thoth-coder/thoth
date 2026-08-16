@@ -250,6 +250,34 @@ impl Agent {
         self.perm_mode = m;
     }
 
+    /// Keeps one turn's tool results inside one turn's share of the window.
+    /// Each result is capped on its own, but a model that asks for six files
+    /// at once gets six of those, and the request after it goes over the
+    /// window. The server does not complain: it drops the front of the
+    /// prompt, which is the system prompt and everything the conversation
+    /// had agreed so far, and the model answers the last file as if it had
+    /// been handed a stranger's code with no question attached. Checking
+    /// after the batch is too late, so the budget is spent as it goes.
+    fn fit_in_turn(content: String, left: &mut usize) -> Option<String> {
+        let size = content.chars().count();
+        if size <= *left {
+            *left -= size;
+            return Some(content);
+        }
+        // a scrap of a file is worse than none: it reads as the whole thing
+        const WORTH_KEEPING: usize = 400;
+        if *left < WORTH_KEEPING {
+            *left = 0;
+            return None;
+        }
+        let note = "\n…(cut here: the rest of this turn's results would not fit the context. \
+                    Ask again for what is missing, on its own.)";
+        let keep = left.saturating_sub(note.chars().count());
+        let cut: String = content.chars().take(keep).collect();
+        *left = 0;
+        Some(cut + note)
+    }
+
     /// Whether a call changed a file that something could have compiled or
     /// run. A README with a typo fixed is a change nobody was going to
     /// build, and saying so after every one of those is noise that teaches
@@ -770,6 +798,8 @@ impl Agent {
                 return Ok(());
             }
 
+            // what all of this turn's results together may take
+            let mut turn_budget = tools::output_cap(window);
             for tc in &tool_calls {
                 if token.is_cancelled() {
                     self.messages.push(Message::tool(
@@ -811,6 +841,18 @@ impl Agent {
                 let (content, is_error) = match result {
                     Ok(s) => (s, false),
                     Err(e) => (format!("Error: {e:#}"), true),
+                };
+                let (content, is_error) = match Self::fit_in_turn(content, &mut turn_budget) {
+                    Some(c) => (c, is_error),
+                    // over budget entirely: say so as an error, so the model
+                    // reads it as something to do differently rather than as
+                    // the file being empty
+                    None => (
+                        "(not read: the results of this turn have already filled the context. \
+                         Ask for this one on its own, or with offset and limit.)"
+                            .to_string(),
+                        true,
+                    ),
                 };
                 self.send(AgentEvent::ToolResult {
                     content: content.clone(),
@@ -1179,6 +1221,35 @@ mod tests {
         agent.call_counts.insert(read_key.into(), 3);
         agent.forget_reads_of(&call("shell", "{\"command\":\"cargo test\"}"));
         assert!(counted(&agent, read_key));
+    }
+
+    /// Six files asked for at once used to arrive as six full results, and
+    /// the request after them went over the window. The server does not say
+    /// so, it drops the front of the prompt, and the model answers the last
+    /// file with "what would you like me to do with this?".
+    #[test]
+    fn one_turn_of_results_stays_inside_one_turn_of_room() {
+        let mut left = 1_000usize;
+        let whole = Agent::fit_in_turn("x".repeat(600), &mut left).unwrap();
+        assert_eq!(whole.chars().count(), 600, "what fits arrives whole");
+        assert_eq!(left, 400);
+
+        // the next one only half fits, and says where it was cut
+        let cut = Agent::fit_in_turn("y".repeat(600), &mut left).unwrap();
+        assert!(cut.chars().count() <= 400, "{}", cut.chars().count());
+        assert!(cut.contains("cut here"), "{cut}");
+        assert!(cut.contains("Ask again"), "it has to say what to do: {cut}");
+        assert_eq!(left, 0);
+
+        // and once there is no room, a scrap is worse than nothing
+        assert!(Agent::fit_in_turn("z".repeat(600), &mut left).is_none());
+
+        // a result that fits exactly is not cut
+        let mut left = 5usize;
+        assert_eq!(
+            Agent::fit_in_turn("abcde".into(), &mut left).as_deref(),
+            Some("abcde")
+        );
     }
 
     /// The note about an unchecked change is for code, not for every file:

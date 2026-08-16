@@ -35,6 +35,21 @@ All notable changes to thoth are documented here. The format follows
   last lines of a Rust file are `}` and `}`.
 
 ### Fixed
+- Several files asked for in one turn no longer blow the window apart. Each
+  tool result was capped on its own, so six read_file calls in one reply
+  arrived as six full results and the request after them went over the
+  window. A server does not complain about that: it drops the front of the
+  prompt, which is the system prompt and everything agreed so far, and the
+  model answers the last file with "what would you like me to do with this?".
+  One turn's results now share one turn's room, and a result that runs out
+  of it says where it was cut and to ask again. The same job in an 8k window
+  went from losing the task entirely to finishing it across two compactions.
+- A path that is not there says where the working directory is. "The system
+  cannot find the path specified" cost three more calls and a `pwd` every
+  time a model guessed an absolute path wrong.
+- Adding a dependency counts as changing code for the note above: a version
+  number written into a manifest and never resolved is the same broken
+  handoff as code that was never built.
 - A request that changed files and ran nothing says so. The prompt tells the
   model to build what it changed, and a model that skipped it still signs off
   with "build passed"; whether a command ran is not the model's word about
