@@ -45,6 +45,12 @@ All notable changes to thoth are documented here. The format follows
   somebody else's agent.
 
 ### Fixed
+- A denied action is not reported as done. Answering `n` to a write outside
+  the working directory stopped the write, and the model still signed off
+  with "written the file, it has hello in it". The refusal now says the
+  action did NOT happen and not to report it as done, and the end of the
+  request counts what was denied, so a false sign-off is contradicted where
+  the user is reading.
 - A background process thoth started and the model never stopped is named at
   the end of the request. "Closing the server now" followed by the turn
   ending leaves it holding the port for the rest of the day, and whether it

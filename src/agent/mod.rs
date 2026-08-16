@@ -187,6 +187,9 @@ pub struct Agent {
     reply_language: Option<&'static str>,
     /// How much to ask before acting. Set from the UI, never persisted.
     perm_mode: PermMode,
+    /// Whether anything was refused in the request being run, so a final
+    /// answer that says it was done can be contradicted.
+    denied: usize,
     /// Auto-compact when the prompt reaches this many tokens (None = never).
     auto_compact_at: Option<u64>,
 }
@@ -231,6 +234,7 @@ impl Agent {
             call_counts: std::collections::HashMap::new(),
             reply_language: None,
             perm_mode: PermMode::default(),
+            denied: 0,
         }
     }
 
@@ -680,6 +684,7 @@ impl Agent {
         self.call_counts.clear();
         // what this request actually did, for the note at the end of it
         let (mut changed_files, mut ran_command) = (false, false);
+        self.denied = 0;
         let mut compact_pending = false;
         let mut truncations = 0u32;
 
@@ -788,6 +793,16 @@ impl Agent {
                 // a model that did not do it still writes "build passed" at
                 // the end. Whether a command ran is not its word against
                 // itself: thoth watched every tool call this request made.
+                // a model that was told no still signs off with "written the
+                // file, it has hello in it". Whether the user said yes is
+                // not something to take its word on
+                if self.denied > 0 {
+                    self.send(AgentEvent::Info(format!(
+                        "note: {} action(s) were denied this request and did not happen. \
+                         Anything above saying they were done is wrong",
+                        self.denied
+                    )));
+                }
                 if changed_files && !ran_command {
                     self.send(AgentEvent::Info(
                         "note: files changed and nothing was built or run this request. Anything \
@@ -1050,10 +1065,13 @@ impl Agent {
                 }
                 PermReply::Yes => {}
                 PermReply::No => {
+                    self.denied += 1;
                     return Ok(
-                        "The user denied this action. Do not retry it; ask the user or try another approach."
+                        "The user denied this action. It did NOT happen. Do not retry it, do not \
+                         work around it, and do not report it as done. Say what is now missing \
+                         and ask the user how to go on."
                             .into(),
-                    )
+                    );
                 }
             }
         }
