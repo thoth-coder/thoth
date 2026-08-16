@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -43,6 +44,7 @@ fn run_background(command: &str) -> Result<String> {
         .spawn()
         .context("failed to spawn background process")?;
     let pid = child.id();
+    started_here().lock().unwrap().push(pid);
     let kill_hint = if cfg!(windows) {
         format!("taskkill /PID {pid} /T /F")
     } else {
@@ -52,6 +54,38 @@ fn run_background(command: &str) -> Result<String> {
         "Started in background: pid {pid}\nOutput is being written to: {}\nCheck it with read_file on that path (wait a moment first). Stop the process when done with shell: {kill_hint}",
         log.display()
     ))
+}
+
+/// Pids thoth put into the background. A model that starts a server and
+/// then says "closing it now" without doing it leaves it holding the port
+/// for the rest of the day; whether it is still up is not the model's word
+/// about itself, it is a question the operating system answers.
+fn started_here() -> &'static Mutex<Vec<u32>> {
+    static P: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The ones thoth started that are still running. Checked by signalling
+/// them with no signal on unix, and by asking the task list on windows.
+pub fn still_running() -> Vec<u32> {
+    let pids = started_here().lock().unwrap().clone();
+    pids.into_iter().filter(|p| alive(*p)).collect()
+}
+
+fn alive(pid: u32) -> bool {
+    if cfg!(windows) {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    } else {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }
 
 /// Everything past this is discarded as it arrives: the model only ever sees

@@ -795,6 +795,19 @@ impl Agent {
                             .into(),
                     ));
                 }
+                // "closing the server now" and then stopping leaves it
+                // holding the port for the rest of the day. Whether it is
+                // still up is the operating system's answer, not the
+                // model's word about itself
+                let left = tools::shell::still_running();
+                if !left.is_empty() {
+                    let list: Vec<String> = left.iter().map(u32::to_string).collect();
+                    self.send(AgentEvent::Error(format!(
+                        "still running in the background: pid {}. Say \"stop it\" to have thoth \
+                         kill it, or leave it if you meant to",
+                        list.join(", ")
+                    )));
+                }
                 return Ok(());
             }
 

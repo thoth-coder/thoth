@@ -35,6 +35,11 @@ All notable changes to thoth are documented here. The format follows
   last lines of a Rust file are `}` and `}`.
 
 ### Fixed
+- A background process thoth started and the model never stopped is named at
+  the end of the request. "Closing the server now" followed by the turn
+  ending leaves it holding the port for the rest of the day, and whether it
+  is still up is a question the operating system answers rather than
+  something to take the model's word on.
 - Several files asked for in one turn no longer blow the window apart. Each
   tool result was capped on its own, so six read_file calls in one reply
   arrived as six full results and the request after them went over the
