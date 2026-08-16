@@ -112,6 +112,14 @@ pub fn definitions(with_problems: bool) -> Value {
             }, "required": ["items"]}
         }},
         {"type": "function", "function": {
+            "name": "ask_user",
+            "description": "Ask the user to choose, when the task has a fork in it that only they can settle: which of two designs, whether to touch something risky, which of several files they meant. Ask before doing the work, not after. Do not use it for things you can find out yourself by reading the project.",
+            "parameters": {"type": "object", "properties": {
+                "question": {"type": "string", "description": "One line, in the user's language"},
+                "options": {"type": "array", "description": "Two to nine short choices, the safest one first", "items": {"type": "string"}}
+            }, "required": ["question", "options"]}
+        }},
+        {"type": "function", "function": {
             "name": "list_dir",
             "description": "List the files and subdirectories in a directory.",
             "parameters": {"type": "object", "properties": {

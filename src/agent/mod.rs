@@ -4,7 +4,7 @@ pub mod undo;
 
 use crate::client::{Client, Message, StreamEvent, ToolCall, Usage};
 use crate::tools;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,9 @@ pub enum AgentCmd {
 pub enum PermReply {
     Yes,
     Always,
+    /// Not this one, and carry on with the rest of the task without it.
+    Skip,
+    /// Not this one, and stop: the user wants to say something first.
     No,
 }
 
@@ -154,6 +157,12 @@ pub enum AgentEvent {
     /// A plan-mode turn ended with a plan in it, so the UI can offer to
     /// carry it out instead of making the user retype the request.
     PlanReady,
+    /// The model asked the user to pick between options before going on.
+    Choice {
+        question: String,
+        options: Vec<String>,
+        reply: oneshot::Sender<Option<usize>>,
+    },
     /// A user request (possibly queued) started processing.
     TurnStart,
     TurnEnd,
@@ -252,6 +261,52 @@ impl Agent {
     /// agent runs; after that the UI moves it with `AgentCmd::SetMode`.
     pub fn set_mode(&mut self, m: PermMode) {
         self.perm_mode = m;
+    }
+
+    /// The model wants the user to decide something before it goes further.
+    /// Answering is the point, so a run with nobody at the keyboard says so
+    /// rather than hanging on a question no one will ever see.
+    async fn ask_user(&mut self, args: &Value, token: &CancellationToken) -> Result<String> {
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let options: Vec<String> = args
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if question.is_empty() || options.len() < 2 {
+            bail!("ask_user needs a question and at least two options");
+        }
+        if options.len() > 9 {
+            bail!("ask_user takes at most 9 options; the user has to be able to pick one");
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(AgentEvent::Choice {
+            question,
+            options: options.clone(),
+            reply: tx,
+        });
+        let picked = tokio::select! {
+            _ = token.cancelled() => None,
+            r = rx => r.unwrap_or(None),
+        };
+        Ok(match picked {
+            Some(i) => format!(
+                "The user chose: {}. Carry on with that, and do not ask again about it.",
+                options[i]
+            ),
+            None => "The user did not answer. Do not ask again; pick the option that changes \
+                     the least, say which one you took and why."
+                .into(),
+        })
     }
 
     /// Keeps one turn's tool results inside one turn's share of the window.
@@ -1034,6 +1089,11 @@ impl Agent {
             return Ok(content);
         }
 
+        // the one tool the user answers rather than the machine
+        if name == "ask_user" {
+            return self.ask_user(&args, token).await;
+        }
+
         let key = tools::permission_key(name, &args);
         let must_ask = tools::needs_permission(name, &args)
             && !self.always_allow.contains(&key)
@@ -1064,12 +1124,21 @@ impl Agent {
                     )));
                 }
                 PermReply::Yes => {}
+                PermReply::Skip => {
+                    self.denied += 1;
+                    return Ok(
+                        "The user skipped this action. It did NOT happen. Leave it out and carry \
+                         on with the rest of the task; say at the end which step was skipped and \
+                         what that leaves undone. Never report it as done."
+                            .into(),
+                    );
+                }
                 PermReply::No => {
                     self.denied += 1;
                     return Ok(
                         "The user denied this action. It did NOT happen. Do not retry it, do not \
-                         work around it, and do not report it as done. Say what is now missing \
-                         and ask the user how to go on."
+                         work around it, and do not report it as done. Stop here: say what is \
+                         missing and ask the user how to go on."
                             .into(),
                     );
                 }

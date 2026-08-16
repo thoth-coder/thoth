@@ -58,6 +58,9 @@ keys:
   mouse wheel / pgup / pgdn   scroll transcript
   ctrl+o         expand / collapse long tool outputs
   ctrl+c         quit
+answering:
+  y / a / s / n  permission: once / always / skip it / no, stop
+  1-9            pick an option when thoth asks you to choose (esc: let it decide)
 tips: hold shift while dragging to select text with the mouse
       start thoth with --continue to resume this project's last conversation";
 
@@ -121,6 +124,11 @@ enum Mode {
     Perm(oneshot::Sender<PermReply>),
     /// A plan came back and the user is choosing what to do with it.
     PlanChoice,
+    /// The model asked something and is waiting on the answer.
+    Choice {
+        options: Vec<String>,
+        reply: oneshot::Sender<Option<usize>>,
+    },
 }
 
 struct App {
@@ -348,7 +356,7 @@ impl App {
                 MouseEventKind::ScrollDown => self.scroll_by(3),
                 _ => {}
             },
-            Event::Paste(s) if !matches!(self.mode, Mode::Perm(_)) => {
+            Event::Paste(s) if !matches!(self.mode, Mode::Perm(_) | Mode::Choice { .. }) => {
                 // pasted code keeps its lines now that the input has them.
                 // A lone \r is a line break too, and leaving it in would
                 // draw the rest of the line over the start of it
@@ -376,10 +384,38 @@ impl App {
             return;
         }
 
+        // a question from the model owns the keys until it has an answer
+        if matches!(self.mode, Mode::Choice { .. }) {
+            let picked = match k.code {
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    Some(Some(c as usize - '1' as usize))
+                }
+                KeyCode::Esc => Some(None),
+                KeyCode::Char('c') if ctrl => {
+                    self.quit = true;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(choice) = picked
+                && let Mode::Choice { options, reply } =
+                    std::mem::replace(&mut self.mode, Mode::Busy)
+            {
+                let choice = choice.filter(|i| *i < options.len());
+                self.blocks.push(ChatBlock::Info(match choice {
+                    Some(i) => format!("chose: {}", options[i]),
+                    None => "left unanswered".into(),
+                }));
+                let _ = reply.send(choice);
+            }
+            return;
+        }
+
         if matches!(self.mode, Mode::Perm(_)) {
             let reply = match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(PermReply::Yes),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(PermReply::Always),
+                KeyCode::Char('s') | KeyCode::Char('S') => Some(PermReply::Skip),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(PermReply::No),
                 KeyCode::Char('c') if ctrl => {
                     self.quit = true;
@@ -390,11 +426,13 @@ impl App {
             if let Some(r) = reply
                 && let Mode::Perm(tx) = std::mem::replace(&mut self.mode, Mode::Busy)
             {
-                let denied = matches!(r, PermReply::No);
+                let said = match r {
+                    PermReply::Yes | PermReply::Always => "allowed",
+                    PermReply::Skip => "skipped, carrying on without it",
+                    PermReply::No => "denied",
+                };
                 let _ = tx.send(r);
-                self.blocks.push(ChatBlock::Info(
-                    if denied { "denied" } else { "allowed" }.into(),
-                ));
+                self.blocks.push(ChatBlock::Info(said.into()));
             }
             return;
         }
@@ -629,6 +667,19 @@ impl App {
                     self.spent = Some(self.spent.unwrap_or(0.0) + c);
                 }
             }
+            AgentEvent::Choice {
+                question,
+                options,
+                reply,
+            } => {
+                let mut lines = vec![question];
+                for (i, o) in options.iter().enumerate() {
+                    lines.push(format!("  {}. {o}", i + 1));
+                }
+                self.blocks.push(ChatBlock::Info(lines.join("\n")));
+                self.scroll = None;
+                self.mode = Mode::Choice { options, reply };
+            }
             AgentEvent::PlanReady => {
                 self.blocks.push(ChatBlock::Info(
                     "plan ready.  y do it (accept edits)   a do it, ask each time   n keep planning"
@@ -637,7 +688,10 @@ impl App {
                 self.mode = Mode::PlanChoice;
             }
             AgentEvent::TurnEnd => {
-                if !matches!(self.mode, Mode::Perm(_) | Mode::PlanChoice) {
+                if !matches!(
+                    self.mode,
+                    Mode::Perm(_) | Mode::PlanChoice | Mode::Choice { .. }
+                ) {
                     self.mode = Mode::Input;
                 }
                 self.turn_start = None;
@@ -691,8 +745,8 @@ impl App {
 
     fn submit(&mut self) {
         // typing is allowed while the agent works — messages queue up;
-        // only the permission prompt blocks submitting
-        if matches!(self.mode, Mode::Perm(_)) {
+        // only a question waiting on an answer blocks submitting
+        if matches!(self.mode, Mode::Perm(_) | Mode::Choice { .. }) {
             return;
         }
         let text = self.input.trim().to_string();
@@ -832,9 +886,10 @@ impl App {
         match name {
             "help" | "h" => self.blocks.push(ChatBlock::Info(HELP.into())),
             "config" | "cfg" => {
-                if matches!(self.mode, Mode::Perm(_)) {
-                    self.blocks
-                        .push(ChatBlock::Info("answer the permission prompt first".into()));
+                if matches!(self.mode, Mode::Perm(_) | Mode::Choice { .. }) {
+                    self.blocks.push(ChatBlock::Info(
+                        "answer the question on screen first".into(),
+                    ));
                 } else {
                     self.config = Some(ConfigScreen::new());
                 }
@@ -1178,6 +1233,73 @@ mod tests {
         a.cursor = 4;
         a.on_key(plain(KeyCode::Up));
         assert_eq!(a.input, "one\ntwo", "one line means history");
+    }
+
+    /// The model can stop and ask, and the answer has to reach it. Esc is
+    /// an answer too: it means decide for yourself.
+    #[tokio::test]
+    async fn a_question_from_the_model_is_answered_with_a_number() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut a = app();
+        let (tx, rx) = oneshot::channel();
+        a.on_agent_event(AgentEvent::Choice {
+            question: "ใช้ตัวไหนดี".into(),
+            options: vec!["serde".into(), "miniserde".into()],
+            reply: tx,
+        });
+        let s = screen(&mut a, 80, 16);
+        assert!(
+            s.iter().any(|l| l.contains("1. serde")),
+            "the options have to be on screen: {s:?}"
+        );
+        assert!(s.iter().any(|l| l.contains("your call")), "{s:?}");
+
+        a.on_key(plain(KeyCode::Char('2')));
+        assert_eq!(rx.await.unwrap(), Some(1), "the second option was picked");
+
+        // a number nobody offered is not an answer
+        let (tx, mut rx) = oneshot::channel();
+        a.on_agent_event(AgentEvent::Choice {
+            question: "q".into(),
+            options: vec!["a".into(), "b".into()],
+            reply: tx,
+        });
+        a.on_key(plain(KeyCode::Char('7')));
+        assert_eq!(rx.try_recv(), Ok(None), "out of range means no answer");
+
+        // and esc hands the decision back
+        let (tx, rx) = oneshot::channel();
+        a.on_agent_event(AgentEvent::Choice {
+            question: "q".into(),
+            options: vec!["a".into(), "b".into()],
+            reply: tx,
+        });
+        a.on_key(plain(KeyCode::Esc));
+        assert_eq!(rx.await.unwrap(), None);
+    }
+
+    /// Skip is not no: one carries on without the step, the other stops.
+    #[tokio::test]
+    async fn a_permission_prompt_takes_four_answers() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for (key, want) in [
+            ('y', "allowed"),
+            ('a', "allowed"),
+            ('s', "skipped"),
+            ('n', "denied"),
+        ] {
+            let mut a = app();
+            let (tx, rx) = oneshot::channel();
+            a.mode = Mode::Perm(tx);
+            a.on_key(plain(KeyCode::Char(key)));
+            let got = rx.await.unwrap();
+            let said = match got {
+                PermReply::Yes | PermReply::Always => "allowed",
+                PermReply::Skip => "skipped",
+                PermReply::No => "denied",
+            };
+            assert_eq!(said, want, "key {key}");
+        }
     }
 
     /// The input has to show what is in it: a message of four lines is four

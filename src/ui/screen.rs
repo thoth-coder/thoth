@@ -129,8 +129,24 @@ impl App {
                 Span::styled(" once   ", theme::muted()),
                 Span::styled("a", theme::key()),
                 Span::styled(" always   ", theme::muted()),
+                Span::styled("s", theme::key()),
+                Span::styled(" skip   ", theme::muted()),
                 Span::styled("n", theme::key()),
-                Span::styled(" no", theme::muted()),
+                Span::styled(" no, stop", theme::muted()),
+            ]),
+            Mode::Choice { options, .. } => Line::from(vec![
+                Span::styled("your call  ", Style::default().fg(theme::BUSY)),
+                Span::styled(
+                    if options.len() > 1 {
+                        format!("1-{}", options.len())
+                    } else {
+                        "1".into()
+                    },
+                    theme::key(),
+                ),
+                Span::styled(" pick   ", theme::muted()),
+                Span::styled("esc", theme::key()),
+                Span::styled(" let it decide", theme::muted()),
             ]),
             // the picker takes over some keys, so say which ones while it is up
             Mode::Input if self.picker.is_some() => Line::from(vec![

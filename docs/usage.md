@@ -33,7 +33,9 @@
 - `shift+tab` cycles how much thoth asks before it acts. The current mode is
   in the status line.
 - `ctrl+o` expands or collapses long tool outputs.
-- `y` / `a` / `n` answer permission prompts: once, always, deny.
+- `y` / `a` / `s` / `n` answer permission prompts: once, always, skip this
+  step and carry on, or no and stop.
+- `1`-`9` pick an option when thoth asks you to choose; `esc` lets it decide.
 - `ctrl+c` quits.
 
 ## Slash commands
@@ -89,6 +91,15 @@ asks what to do with the plan: carry it out with edits accepted, carry it
 out asking each time, or keep planning. Choosing one of the first two
 switches the mode and sends the plan back to be carried out, so there is
 nothing to retype.
+
+### When thoth asks you to choose
+
+The model can put a question on screen with two to nine options when the task
+has a fork in it that only you can settle. Pick with `1`-`9`. `esc` hands the
+decision back, and the model is told to take whichever option changes the
+least and say which one it took. In `-p` mode there is nobody at the
+keyboard, so the question is printed and answered for you rather than
+hanging.
 
 ## Editor integration
 

@@ -344,6 +344,13 @@ async fn run_print_mode(
             }
             // -p has nobody to ask, so a plan is simply the answer
             AgentEvent::PlanReady => {}
+            // and nobody to choose either: let the agent take the safe road
+            AgentEvent::Choice {
+                question, reply, ..
+            } => {
+                println!("\n[question, unanswered: nobody is here] {question}");
+                let _ = reply.send(None);
+            }
             AgentEvent::TurnEnd => break,
         }
     }

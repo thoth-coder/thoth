@@ -6,6 +6,17 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `ask_user`: the model can stop and put a question to the user with two to
+  nine options, and the answer comes back as the tool result. It is for a
+  fork in the task that only the user can settle, asked before the work
+  rather than after it. Pick with `1`-`9`; `esc` hands the decision back,
+  and the model is told to take the option that changes the least and say
+  which. A run with `-p` has nobody at the keyboard, so the question is
+  printed and answered "nobody is here" instead of hanging.
+- A permission prompt takes four answers, not three: `y` once, `a` always,
+  `s` skip, `n` no. Skip means leave this step out and carry on with the
+  rest; no means stop, because the user has something to say. Both are told
+  to the model as "it did NOT happen", and neither may be reported as done.
 - Four modes for how much thoth asks before it acts, cycled with
   `shift+tab`, named with `/mode`, and set for one run with `--mode`:
   `manual` (the default, ask every time), `accept edits` (file changes go
