@@ -160,6 +160,50 @@ fast), then verify with the shell tool (build/tests) when practical."
     out
 }
 
+/// The script the user is writing in, when it is not the Latin one the rest
+/// of the prompt is written in. A style rule alone does not hold: a local
+/// model reading two thousand words of English instructions answers in
+/// English, or in whatever language it was mostly trained on, so the language
+/// it owes the user is named outright on the request itself. Latin-script
+/// languages are left to the style rule; telling French from Portuguese needs
+/// real language identification, and guessing wrong is worse than saying
+/// nothing.
+pub fn user_language(text: &str) -> Option<&'static str> {
+    const NAMES: [&str; 9] = [
+        "Thai", "Chinese", "Japanese", "Korean", "Russian", "Arabic", "Hebrew", "Greek", "Hindi",
+    ];
+    const JAPANESE: usize = 2;
+    let mut counts = [0usize; NAMES.len()];
+    for c in text.chars() {
+        let i = match c as u32 {
+            0x0E00..=0x0E7F => 0,
+            0x4E00..=0x9FFF => 1,
+            0x3040..=0x30FF => JAPANESE, // kana, which kanji-only text lacks
+            0x1100..=0x11FF | 0xAC00..=0xD7AF => 3,
+            0x0400..=0x04FF => 4,
+            0x0600..=0x06FF => 5,
+            0x0590..=0x05FF => 6,
+            0x0370..=0x03FF => 7,
+            0x0900..=0x097F => 8,
+            _ => continue,
+        };
+        counts[i] += 1;
+    }
+    // kana settles what the shared han block cannot: Japanese prose is full
+    // of kanji, so the larger count there would otherwise read as Chinese
+    let winner = if counts[JAPANESE] > 0 {
+        JAPANESE
+    } else {
+        counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, n)| **n)
+            .map(|(i, _)| i)?
+    };
+    // a stray character (a name, a path, a quoted error) is not a language
+    (counts[winner] >= 3).then_some(NAMES[winner])
+}
+
 pub fn system_prompt(window: Option<u32>, max_turns: usize) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -171,6 +215,7 @@ pub fn system_prompt(window: Option<u32>, max_turns: usize) -> String {
     let git = repo.as_ref().map(|g| format!("\n{g}")).unwrap_or_default();
     let situational = situational_rules(repo.is_some(), crate::editor::connected());
     let project = project_context(window);
+    let write_cap = crate::tools::write_cap_from(crate::tools::output_cap(window));
     format!(
         "You are Thoth, an agentic coding assistant running in the user's terminal. You work \
 directly on the user's real files with tools.
@@ -191,13 +236,20 @@ File editing rules:
 - Always read a file (read_file) before changing it. Edits are rejected otherwise.
 - Modify existing files ONLY with edit_file (exact snippet replacement). Rewriting an existing \
 file with write_file is rejected unless you read it first, and even then it is the wrong choice \
-for small changes. write_file is for brand-new files.
+for small changes. write_file is for brand-new files, and for replacing a file you wrote \
+yourself earlier in this session: that one needs no read, you already know what is in it.
+- Build a long file up, never in one call. One write_file may carry {write_cap} characters here, \
+and a generation longer than that is cut off before the call is even finished: the whole file is \
+lost and so is the turn. Write the first section, ending somewhere the file is still valid, then \
+send each next section to the same path with append true. Build or check between sections, so a \
+mistake costs one section instead of the file.
 - old_string in edit_file must be copied exactly from the file, without the line-number prefix \
 that read_file shows.
 - Several changes to the same file go in ONE multi_edit call, not one edit_file after another.
-- NEVER delete, rename or move a file to get around the read-before-write rule. If write_file \
-is rejected because the file exists, read_file it, then edit_file or rewrite it. Deleting user \
-files without being asked is destructive.
+- NEVER delete, rename or move a file to get around the read-before-write rule, and never \
+delete a file just to write it again: write_file over it. If write_file is rejected because the \
+file exists, read_file it, then edit_file or rewrite it. Deleting files without being asked is \
+destructive.
 - Never read or write files through the shell (echo >, Set-Content, sed -i, cat, ...). Always \
 use the file tools; the shell is for running programs.
 - Keep diffs minimal: change only the lines the task needs, keep the file's existing \
@@ -263,7 +315,8 @@ A small task, from start to finish:
   \"Fixed: the handler returned before the promise resolved. npm test passes.\"
 
 Keep calling tools until the task is done, then stop calling tools and give the short final \
-answer. You have at most {max_turns} tool calls for this request, so do not spend them looking \
+answer, written in the language the user wrote to you in. You have at most {max_turns} tool \
+calls for this request, so do not spend them looking \
 at things you do not need. If a tool returns an error, read it and adjust. Do not repeat the \
 same failing call."
     )
@@ -292,6 +345,23 @@ mod tests {
         // but the rule it replaces still has to be said
         assert!(none.contains("verify with the shell tool"), "{none}");
         assert!(none.len() < all.len());
+    }
+
+    #[test]
+    fn names_the_language_the_user_writes_in() {
+        assert_eq!(user_language("เขียน compiler ให้หน่อย"), Some("Thai"));
+        assert_eq!(user_language("把这个函数改成异步的"), Some("Chinese"));
+        // kanji outnumber the kana, and it is still Japanese
+        assert_eq!(
+            user_language("この関数を非同期にしてください"),
+            Some("Japanese")
+        );
+        assert_eq!(user_language("этот тест падает"), Some("Russian"));
+        // latin script is left to the style rule, whatever the language
+        assert_eq!(user_language("fix the failing test"), None);
+        assert_eq!(user_language("corrige le test qui échoue"), None);
+        // a quoted string or a path is not the language of the request
+        assert_eq!(user_language("rename the ผ folder to out/"), None);
     }
 
     #[test]

@@ -109,6 +109,15 @@ pub struct Agent {
     /// Read-only call (name + arguments) to the id of the message holding
     /// its latest result, so an older identical one can be dropped.
     repeated: std::collections::HashMap<String, String>,
+    /// Identical tool calls (name + arguments) seen in the current request,
+    /// so a model going in circles is stopped. Reset with `repeated`: both
+    /// only make sense while the results they talk about are still in
+    /// `messages`, and a compaction takes those away.
+    call_counts: std::collections::HashMap<String, u32>,
+    /// The language the user last wrote in, when it is not a Latin-script
+    /// one. Kept because the reminder rides on the user message, and a
+    /// compaction throws every user message away.
+    reply_language: Option<&'static str>,
     /// Auto-compact when the prompt reaches this many tokens (None = never).
     auto_compact_at: Option<u64>,
 }
@@ -150,7 +159,26 @@ impl Agent {
             warned_text_calls: false,
             said_undo: false,
             repeated: std::collections::HashMap::new(),
+            call_counts: std::collections::HashMap::new(),
+            reply_language: None,
         }
+    }
+
+    /// Said on the request, and again on the summary that replaces it: a long
+    /// task compacts more than once, and after the first one nothing in the
+    /// context is in the user's language any more.
+    fn language_note(lang: &str) -> String {
+        format!(
+            "\n\n(the user is writing in {lang}. Answer in {lang}, however this request and the \
+             tool results are written.)"
+        )
+    }
+
+    /// Everything that remembers what is in the context, dropped together
+    /// when the context itself is dropped.
+    fn forget_call_history(&mut self) {
+        self.repeated.clear();
+        self.call_counts.clear();
     }
 
     fn send(&self, ev: AgentEvent) {
@@ -281,7 +309,7 @@ impl Agent {
                     // rebuild the system prompt so memory saved this session
                     // (and any project changes) are picked up immediately
                     self.messages.clear();
-                    self.repeated.clear();
+                    self.forget_call_history();
                     let window = window_of(&self.client, &self.cfg);
                     self.messages.push(Message::system(prompt::system_prompt(
                         window,
@@ -385,7 +413,8 @@ impl Agent {
         msgs.push(Message::user(
             "Summarize this entire conversation so it can be continued later: the user's \
              original request, key facts and decisions, files read or changed (with paths), \
-             current state, and what remains to be done. Reply with only the summary.",
+             current state, and what remains to be done. Write the summary in the language the \
+             user used, so the conversation continues in it. Reply with only the summary.",
         ));
         let before = self.messages.len();
         match self
@@ -397,10 +426,13 @@ impl Agent {
                 let summary = turn.content.trim().to_string();
                 tools::memory::save_recap(&summary);
                 self.messages.truncate(1);
-                self.repeated.clear();
-                self.messages.push(Message::user(format!(
-                    "(conversation continued from a compacted summary)\n{summary}"
-                )));
+                self.forget_call_history();
+                let mut carried =
+                    format!("(conversation continued from a compacted summary)\n{summary}");
+                if let Some(lang) = self.reply_language {
+                    carried.push_str(&Self::language_note(lang));
+                }
+                self.messages.push(Message::user(carried));
                 self.send(AgentEvent::Info(format!(
                     "context compacted: {before} messages -> 2. recap saved, /recap restores it next session"
                 )));
@@ -422,6 +454,9 @@ impl Agent {
     /// Model-free fallback: shorten old tool results in place, keeping the
     /// last few intact.
     fn hard_trim(&mut self) {
+        // a result cut to 200 characters is a result the model has to read
+        // again, so the count of what it already read goes with it
+        self.forget_call_history();
         let keep_from = self.messages.len().saturating_sub(4);
         let mut trimmed = 0usize;
         for m in self.messages.iter_mut().take(keep_from) {
@@ -453,14 +488,21 @@ impl Agent {
                 ctx.note
             ));
         }
+        // a short "ok" in the middle of a Thai conversation names no
+        // language, and is no reason to fall back to English
+        if let Some(lang) = prompt::user_language(input) {
+            self.reply_language = Some(lang);
+        }
+        if let Some(lang) = self.reply_language {
+            full_input.push_str(&Self::language_note(lang));
+        }
         self.messages.push(Message::user(full_input));
         // both depend on where this turn is running: how much room a result
         // may take, and whether there is an editor to ask about problems
         let cap = tools::output_cap(window_of(&self.client, &self.cfg));
         let tools_def = tools::definitions(crate::editor::connected());
         // breaks infinite loops: counts identical tool calls within this task
-        let mut call_counts: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        self.call_counts.clear();
         let mut compact_pending = false;
         let mut truncations = 0u32;
 
@@ -507,6 +549,12 @@ impl Agent {
                     self.send(AgentEvent::Info(
                         "hit the context limit mid-generation, compacting and continuing".into(),
                     ));
+                    // this is the compaction the pending request was asking
+                    // for, and the only path out of the loop that skips the
+                    // place where the flag is answered: leaving it set
+                    // compacts a two-message conversation one turn later,
+                    // throwing away the result that turn just fetched
+                    compact_pending = false;
                     self.compact().await;
                     continue;
                 }
@@ -569,7 +617,7 @@ impl Agent {
                 }
                 let key = format!("{}:{}", tc.function.name, tc.function.arguments);
                 let n = {
-                    let c = call_counts.entry(key).or_insert(0);
+                    let c = self.call_counts.entry(key).or_insert(0);
                     *c += 1;
                     *c
                 };
@@ -611,6 +659,7 @@ impl Agent {
                 ));
                 if !is_error {
                     self.drop_stale_copy(tc);
+                    self.forget_reads_of(tc);
                 }
             }
             if token.is_cancelled() {
@@ -631,6 +680,52 @@ impl Agent {
         Ok(())
     }
 
+    /// Calls whose result is the same every time, so a second one is a copy
+    /// of the first and a third is a model going in circles.
+    fn is_read_only(name: &str) -> bool {
+        matches!(
+            name,
+            "read_file" | "grep" | "glob" | "list_dir" | "problems" | "web_fetch" | "web_search"
+        )
+    }
+
+    /// A file that just changed makes every earlier read of it out of date.
+    /// An identical read_file after an edit is not a repeat: it is the only
+    /// way to see what is there now, and it is exactly what a model does
+    /// after its own edit came out wrong. The breaker counts calls, not
+    /// results, so without this it blocks the read that would let the model
+    /// recover, and tells it "the result will not change" while the file on
+    /// disk says otherwise.
+    fn forget_reads_of(&mut self, tc: &ToolCall) {
+        if !matches!(
+            tc.function.name.as_str(),
+            "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file"
+        ) {
+            return;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(&tc.function.arguments) else {
+            return;
+        };
+        for key in ["path", "from", "to"] {
+            let Some(p) = args.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // the write may name the file relatively and the read
+            // absolutely: match on the name, where over-matching costs one
+            // more allowed read of a file that happens to share it
+            let name = std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string());
+            let stale = |k: &String| {
+                k.split_once(':')
+                    .is_some_and(|(tool, args)| Self::is_read_only(tool) && args.contains(&name))
+            };
+            self.call_counts.retain(|k, _| !stale(k));
+            self.repeated.retain(|k, _| !stale(k));
+        }
+    }
+
     /// A model that reads the same thing twice leaves two copies of it in the
     /// context, and the older one is dead weight. When a read-only call is
     /// repeated with the exact same arguments, the earlier result is replaced
@@ -639,15 +734,15 @@ impl Agent {
     /// something the newer one does not, and is left alone. The todo list is
     /// the exception that needs no arguments to match: it is one list.
     fn drop_stale_copy(&mut self, tc: &ToolCall) {
-        let key = match tc.function.name.as_str() {
+        let name = tc.function.name.as_str();
+        let key = if name == "todo" {
             // the plan is one thing that keeps being rewritten: only the
             // latest version of it means anything
-            "todo" => "todo".to_string(),
-            "read_file" | "grep" | "glob" | "list_dir" | "problems" | "web_fetch"
-            | "web_search" => {
-                format!("{}:{}", tc.function.name, tc.function.arguments)
-            }
-            _ => return,
+            "todo".to_string()
+        } else if Self::is_read_only(name) {
+            format!("{name}:{}", tc.function.arguments)
+        } else {
+            return;
         };
         let Some(old_id) = self.repeated.insert(key, tc.id.clone()) else {
             return;
@@ -812,6 +907,88 @@ mod tests {
         second.id = "e".into();
         agent.drop_stale_copy(&second);
         assert_eq!(body(&agent, "d"), "edited");
+    }
+
+    /// The loop breaker counts calls whose results are in the context. A
+    /// compaction throws those results away, so a read the model no longer
+    /// has must be allowed again: otherwise the file it is working on
+    /// becomes unreadable for the rest of the request.
+    #[tokio::test]
+    async fn compaction_forgets_what_was_called_before_it() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cfg = crate::config::resolve(&crate::config::Profile::default());
+        let mut agent = Agent::new(
+            Client::new(&cfg),
+            cfg,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+        agent.call_counts.insert("read_file:{}".into(), 3);
+        agent.repeated.insert("read_file:{}".into(), "a".into());
+        agent.forget_call_history();
+        assert!(agent.call_counts.is_empty(), "still blocked after compact");
+        assert!(agent.repeated.is_empty());
+    }
+
+    /// Reading a file again after changing it is not going in circles, it
+    /// is the only way to see the change. The breaker has to let that
+    /// through, and still stop a read that nothing happened between.
+    #[tokio::test]
+    async fn a_change_to_a_file_lets_it_be_read_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cfg = crate::config::resolve(&crate::config::Profile::default());
+        let mut agent = Agent::new(
+            Client::new(&cfg),
+            cfg,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+        let call = |name: &str, args: &str| ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+        };
+        let counted = |a: &Agent, k: &str| a.call_counts.contains_key(k);
+
+        let read_key = "read_file:{\"path\":\"src/lib.rs\"}";
+        agent.call_counts.insert(read_key.into(), 3);
+        agent
+            .call_counts
+            .insert("grep:{\"pattern\":\"lib.rs\"}".into(), 2);
+        agent
+            .call_counts
+            .insert("list_dir:{\"path\":\"src\"}".into(), 1);
+        agent
+            .repeated
+            .insert(read_key.into(), "old-result".to_string());
+
+        // an edit somewhere else changes nothing about this file
+        agent.forget_reads_of(&call("edit_file", "{\"path\":\"src/main.rs\"}"));
+        assert!(counted(&agent, read_key), "another file is another file");
+
+        // the same file, named the other way round, still counts
+        agent.forget_reads_of(&call("write_file", "{\"path\":\"C:/p/src/lib.rs\"}"));
+        assert!(
+            !counted(&agent, read_key),
+            "the read has to be allowed again"
+        );
+        assert!(agent.repeated.is_empty(), "and its result is stale too");
+        assert!(
+            !counted(&agent, "grep:{\"pattern\":\"lib.rs\"}"),
+            "a search that named the file is stale as well"
+        );
+        assert!(
+            counted(&agent, "list_dir:{\"path\":\"src\"}"),
+            "a listing that did not name it is untouched"
+        );
+
+        // and a call that changes nothing leaves the count alone
+        agent.call_counts.insert(read_key.into(), 3);
+        agent.forget_reads_of(&call("shell", "{\"command\":\"cargo test\"}"));
+        assert!(counted(&agent, read_key));
     }
 
     /// `!cmd` runs without a model or a permission prompt, and its output
