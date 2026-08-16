@@ -17,11 +17,17 @@
 ## Keys
 
 - `enter` sends. While the agent is working, messages queue up.
+- `shift+enter` starts a new line in the message instead of sending it.
+  `alt+enter` and `ctrl+j` do the same, for terminals that swallow the
+  first one. Where none of them get through, end the line with `\` and
+  press `enter`: the backslash becomes the line break. The input grows to
+  fit, up to ten rows.
 - `tab` or `enter` takes the highlighted path while the `@path` picker is
   open.
 - `esc` closes the picker, interrupts generation, or clears the input when
   idle.
-- `up` / `down` move in the picker, otherwise through input history.
+- `up` / `down` move in the picker, then between the lines of a multi-line
+  message, and through input history when there is only one line.
 - Mouse wheel, `pgup` / `pgdn` scroll the transcript. Hold `shift` while
   dragging to select text.
 - `ctrl+o` expands or collapses long tool outputs.

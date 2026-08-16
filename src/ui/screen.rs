@@ -18,6 +18,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
+/// Rows the input may grow to before it scrolls instead. A message longer
+/// than this is being written somewhere else and pasted in.
+const INPUT_MAX_ROWS: u16 = 10;
+
 impl App {
     // ---- drawing ----
 
@@ -31,12 +35,19 @@ impl App {
         // the @path picker sits between the input and the hints, and is zero
         // rows tall while it is closed
         let pick_h = self.picker.as_ref().map(|p| p.height()).unwrap_or(0);
+        // the input is as tall as the message written in it, up to a third of
+        // the screen: past that the transcript it is a reply to matters more
+        // split, not lines(): a message ending in a break has an empty last
+        // line, and that is the line the cursor is sitting on
+        let input_h = (self.input.split('\n').count().max(1) as u16)
+            .min((f.area().height / 3).max(1))
+            .min(INPUT_MAX_ROWS);
         let [header_a, chat_a, state_a, rule_a, input_a, pick_a, status_a] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(input_h),
             Constraint::Length(pick_h),
             Constraint::Length(1),
         ])
@@ -143,23 +154,38 @@ impl App {
             rule_a,
         );
 
-        // input line
+        // input: one row per typed line, scrolled so the row the cursor is
+        // on is always among them
         let avail = input_a.width.saturating_sub(3) as usize;
-        let (view, cx) = self.input_window(avail);
         let style = if matches!(self.mode, Mode::Input) {
             Style::default()
         } else {
             theme::muted()
         };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(PROMPT, theme::accent()),
-                Span::styled(view, style),
-            ])),
-            input_a,
-        );
+        let (rows, cur_row, cx) = self.input_rows(avail, input_a.height as usize);
+        let lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                // only the first row of the message carries the prompt mark,
+                // the rest line up under it
+                let mark = if cur_row.1 == 0 && i == 0 {
+                    PROMPT
+                } else {
+                    "  "
+                };
+                Line::from(vec![
+                    Span::styled(mark, theme::accent()),
+                    Span::styled(text.clone(), style),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(Text::from(lines)), input_a);
         if matches!(self.mode, Mode::Input) {
-            f.set_cursor_position(Position::new(input_a.x + 2 + cx as u16, input_a.y));
+            f.set_cursor_position(Position::new(
+                input_a.x + 2 + cx as u16,
+                input_a.y + cur_row.0 as u16,
+            ));
         }
 
         // @path picker: one row per candidate, the highlighted one reversed
@@ -244,12 +270,58 @@ impl App {
         );
     }
 
-    fn input_window(&self, avail: usize) -> (String, usize) {
+    /// The rows to draw, which row of them the cursor is on, and its column.
+    /// The second half of `cur_row` is the line the top row is showing, so
+    /// the caller knows whether it is looking at the start of the message.
+    fn input_rows(&self, avail: usize, height: usize) -> (Vec<String>, (usize, usize), usize) {
+        let lines: Vec<&str> = if self.input.is_empty() {
+            vec![""]
+        } else {
+            self.input.split('\n').collect()
+        };
+        // which line the cursor is on, and where in it
+        let mut seen = 0usize;
+        let mut cur_line = 0usize;
+        let mut col = 0usize;
+        for (i, l) in lines.iter().enumerate() {
+            let len = l.chars().count();
+            if self.cursor <= seen + len {
+                cur_line = i;
+                col = self.cursor - seen;
+                break;
+            }
+            seen += len + 1; // the newline itself
+            cur_line = i;
+            col = len;
+        }
+        // scroll so the cursor's line is the last one visible, never past
+        // the top of the message
+        let height = height.max(1);
+        let top = (cur_line + 1).saturating_sub(height).min(cur_line);
+        let mut cx = 0usize;
+        let rows: Vec<String> = lines[top..(top + height).min(lines.len())]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let (text, x) =
+                    Self::window_of_line(l, if top + i == cur_line { col } else { 0 }, avail);
+                if top + i == cur_line {
+                    cx = x;
+                }
+                text
+            })
+            .collect();
+        (rows, (cur_line - top, top), cx)
+    }
+
+    /// The stretch of one line that fits `avail` columns with the cursor in
+    /// it, and the cursor's column within that stretch.
+    fn window_of_line(line: &str, cursor: usize, avail: usize) -> (String, usize) {
         if avail == 0 {
             return (String::new(), 0);
         }
-        let chars: Vec<char> = self.input.chars().collect();
-        let cur = self.cursor.min(chars.len());
+        let chars: Vec<char> = line.chars().collect();
+        let cur = cursor.min(chars.len());
         let cw = |c: char| UnicodeWidthChar::width(c).unwrap_or(1);
         // widest suffix ending at the cursor that fits
         let mut start = cur;

@@ -14,7 +14,8 @@ use crate::ui::theme::SPINNER;
 use anyhow::Result;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::text::Line;
@@ -188,6 +189,21 @@ pub async fn run(
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
+    // Without this a terminal on unix reports shift+enter as plain enter,
+    // and there is no way to type a second line. The windows console tells
+    // them apart on its own and says it supports nothing, which is why this
+    // asks first. Only the disambiguation flag: the others change what every
+    // other key looks like.
+    let enhanced = matches!(
+        ratatui::crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    if enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
 
     // Blocking reader thread feeding terminal events into the async loop.
     let (key_tx, mut key_rx) = mpsc::unbounded_channel();
@@ -253,6 +269,11 @@ pub async fn run(
         }
     }
 
+    if enhanced {
+        // leaving it pushed would follow thoth out and change how the shell
+        // after it reads keys
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         std::io::stdout(),
         DisableBracketedPaste,
@@ -317,7 +338,10 @@ impl App {
                 _ => {}
             },
             Event::Paste(s) if !matches!(self.mode, Mode::Perm(_)) => {
-                let s = s.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                // pasted code keeps its lines now that the input has them.
+                // A lone \r is a line break too, and leaving it in would
+                // draw the rest of the line over the start of it
+                let s = s.replace("\r\n", "\n").replace('\r', "\n");
                 self.insert_str(&s);
                 self.picker_off = false;
                 self.refresh_picker();
@@ -421,6 +445,26 @@ impl App {
                     self.cursor = 0;
                 }
             }
+            // a newline in the input, by every route a terminal offers.
+            // shift+enter is what people try first and what modern terminals
+            // send; alt+enter and ctrl+j are what the older ones can manage,
+            // and a line ending in a backslash works even where none of the
+            // three survive the emulator
+            KeyCode::Enter
+                if k.modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.insert_char('\n')
+            }
+            KeyCode::Char('j') if ctrl => self.insert_char('\n'),
+            KeyCode::Enter
+                if self.cursor > 0 && self.input.chars().nth(self.cursor - 1) == Some('\\') =>
+            {
+                self.cursor -= 1;
+                let i = byte_idx(&self.input, self.cursor);
+                self.input.remove(i);
+                self.insert_char('\n');
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -433,8 +477,14 @@ impl App {
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.chars().count(),
+            KeyCode::Home => self.cursor = self.line_start(self.cursor),
+            KeyCode::End => self.cursor = self.line_end(self.cursor),
+            // in a written-out multi-line message the arrows belong to the
+            // message; history is what they mean when there is one line
+            KeyCode::Up if self.line_start(self.cursor) > 0 => self.move_line(-1),
+            KeyCode::Down if self.line_end(self.cursor) < self.input.chars().count() => {
+                self.move_line(1)
+            }
             KeyCode::Up => self.history_prev(),
             KeyCode::Down => self.history_next(),
             KeyCode::PageUp => self.scroll_by(-10),
@@ -858,6 +908,42 @@ impl App {
         self.cursor += 1;
     }
 
+    /// Char index of the first character on the line `at` sits on. Lines are
+    /// what the user typed, not what the width wrapped: a message written
+    /// over four lines moves as four lines however wide the terminal is.
+    fn line_start(&self, at: usize) -> usize {
+        self.input
+            .chars()
+            .take(at)
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    fn line_end(&self, at: usize) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        chars[at.min(chars.len())..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|i| at + i)
+            .unwrap_or(chars.len())
+    }
+
+    /// Up or down one typed line, keeping the column where it can.
+    fn move_line(&mut self, delta: isize) {
+        let col = self.cursor - self.line_start(self.cursor);
+        let (start, end) = if delta < 0 {
+            let prev_end = self.line_start(self.cursor).saturating_sub(1);
+            (self.line_start(prev_end), prev_end)
+        } else {
+            let next_start = (self.line_end(self.cursor) + 1).min(self.input.chars().count());
+            (next_start, self.line_end(next_start))
+        };
+        self.cursor = (start + col).min(end);
+    }
+
     fn insert_str(&mut self, s: &str) {
         let i = byte_idx(&self.input, self.cursor);
         self.input.insert_str(i, s);
@@ -968,6 +1054,84 @@ mod tests {
         assert!(s[11].contains("/help"), "{:?}", s[11]);
         assert!(s[11].contains("ctx 15.4k/32.8k (46%)"), "{:?}", s[11]);
         assert!(s[11].contains("out 820"));
+    }
+
+    /// Enter sends, and there has to be a way to say something that takes
+    /// more than one line. Shift+enter is the one people reach for; the
+    /// others are there for terminals that never deliver it.
+    #[test]
+    fn a_message_can_be_written_over_several_lines() {
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut a = app();
+        a.on_key(plain(KeyCode::Char('a')));
+        a.on_key(shift(KeyCode::Enter));
+        a.on_key(plain(KeyCode::Char('b')));
+        assert_eq!(a.input, "a\nb", "shift+enter has to break the line");
+
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(a.input, "a\nb\n\n");
+
+        // a trailing backslash is the way through a terminal that delivers
+        // none of the three
+        a.on_key(plain(KeyCode::Char('\\')));
+        a.on_key(plain(KeyCode::Enter));
+        assert_eq!(a.input, "a\nb\n\n\n", "the backslash becomes the break");
+
+        // plain enter still sends, with the line breaks intact
+        a.input = "one\ntwo".into();
+        a.cursor = 7;
+        a.on_key(plain(KeyCode::Enter));
+        assert!(a.input.is_empty(), "it has to send");
+        assert_eq!(a.history.last().map(String::as_str), Some("one\ntwo"));
+
+        // up and down walk the lines of the message, not the history
+        a.input = "one\ntwo".into();
+        a.cursor = 5; // on the second line
+        a.on_key(plain(KeyCode::Up));
+        assert_eq!(a.cursor, 1, "up goes to the same column one line above");
+        a.on_key(plain(KeyCode::Down));
+        assert_eq!(a.cursor, 5);
+        // and on a single line they are the history again
+        a.input = "solo".into();
+        a.cursor = 4;
+        a.on_key(plain(KeyCode::Up));
+        assert_eq!(a.input, "one\ntwo", "one line means history");
+    }
+
+    /// The input has to show what is in it: a message of four lines is four
+    /// rows, and the cursor sits on the row it is really on.
+    #[test]
+    fn the_input_grows_to_the_message() {
+        let mut a = app();
+        a.input = "first\nsecond\nthird".into();
+        a.cursor = a.input.chars().count();
+        let s = screen(&mut a, 80, 14);
+
+        let rows: Vec<&String> = s.iter().filter(|l| l.contains("second")).collect();
+        assert_eq!(rows.len(), 1, "the middle line is drawn: {s:?}");
+        // a message that ends in a break has an empty last line, and the
+        // box has to have grown for the cursor to be on it
+        let mut b = app();
+        b.input = "one\n".into();
+        b.cursor = 4;
+        let s2 = screen(&mut b, 80, 14);
+        let one = s2.iter().position(|l| l.contains("one")).unwrap();
+        assert!(
+            s2[one + 1].is_empty() && !s2[one + 1].contains(RULE),
+            "the new line needs a row of its own: {:?}",
+            &s2[one..one + 2]
+        );
+        let first = s.iter().position(|l| l.contains("first")).unwrap();
+        assert!(s[first].starts_with(PROMPT), "{:?}", s[first]);
+        assert!(
+            !s[first + 1].starts_with(PROMPT),
+            "only the first row carries the mark: {:?}",
+            s[first + 1]
+        );
+        assert!(s[first + 2].contains("third"), "{:?}", s[first + 2]);
     }
 
     #[test]

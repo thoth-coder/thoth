@@ -6,6 +6,14 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `shift+enter` starts a new line in the input instead of sending it, and
+  the input grows to as many rows as the message has lines, up to ten.
+  `alt+enter` and `ctrl+j` do the same for terminals that never deliver the
+  first one, and a line ending in `\` breaks where even those do not get
+  through. `up` and `down` walk the lines of a multi-line message, and are
+  the history again when there is only one line. On unix thoth now asks the
+  terminal for key disambiguation, without which shift+enter arrives as a
+  plain enter; the windows console tells them apart on its own.
 - `write_file` takes `append`, for adding a section to the end of a file.
   It needs no prior read, because nothing already in the file is touched.
   It is how a file too long for one call gets written: the first section
@@ -52,7 +60,10 @@ All notable changes to thoth are documented here. The format follows
   file, edited it wrong, and read it back to see the damage was told "this
   exact read_file call was already run 3 times, the result will not change"
   while the file on disk said otherwise. A change to a file now clears what
-  was counted and remembered about reads of it.
+  was counted about reads of it. Only the count: what makes the re-read
+  supersede the copy taken before the change stays, because after a change
+  that copy is not merely old, it is wrong, and leaving it would put both
+  versions of the file in front of the model at once.
 - Hitting the context limit mid-generation no longer costs two compactions.
   The recovery path compacted and jumped straight back to the model, past the
   point where the auto-compact request from that same turn is answered, so

@@ -718,12 +718,15 @@ impl Agent {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.to_string());
-            let stale = |k: &String| {
-                k.split_once(':')
+            // only the count, never `repeated`. That map is what lets the
+            // re-read supersede the copy taken before the change, and after
+            // a change that copy is not merely old, it is wrong: dropping
+            // the entry would leave both versions of the file in the
+            // context for the model to choose between
+            self.call_counts.retain(|k, _| {
+                !k.split_once(':')
                     .is_some_and(|(tool, args)| Self::is_read_only(tool) && args.contains(&name))
-            };
-            self.call_counts.retain(|k, _| !stale(k));
-            self.repeated.retain(|k, _| !stale(k));
+            });
         }
     }
 
@@ -976,7 +979,14 @@ mod tests {
             !counted(&agent, read_key),
             "the read has to be allowed again"
         );
-        assert!(agent.repeated.is_empty(), "and its result is stale too");
+        // the copy taken before the change is not merely old, it is wrong.
+        // What lets the re-read supersede it has to survive, or both
+        // versions of the file sit in the context at once
+        assert_eq!(
+            agent.repeated.get(read_key).map(String::as_str),
+            Some("old-result"),
+            "the stale copy would be left in the context beside the new one"
+        );
         assert!(
             !counted(&agent, "grep:{\"pattern\":\"lib.rs\"}"),
             "a search that named the file is stale as well"

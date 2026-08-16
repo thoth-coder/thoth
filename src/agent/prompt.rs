@@ -152,11 +152,20 @@ changed (never `git add -A` blindly) and write a one-line message describing the
         );
     }
     out.push_str(if editor {
-        "\n- After changing code, check the `problems` tool first (live editor diagnostics, \
-fast), then verify with the shell tool (build/tests) when practical."
+        "\n- Code you changed is not done until something has run it. Check the `problems` tool \
+first (live editor diagnostics, fast), then build it and run its tests with the shell tool. Do \
+that before you say the task is finished, not only at the very end of a long task: after each \
+file that could break the build."
     } else {
-        "\n- After changing code, verify with the shell tool (build/tests) when practical."
+        "\n- Code you changed is not done until something has run it. Build it and run its tests \
+with the shell tool before you say the task is finished, not only at the very end of a long task: \
+after each file that could break the build."
     });
+    out.push_str(
+        "\n- If a build or test command fails, read the error and fix the cause. Never report a \
+task as done over a failing build, and never say a test passed without having run it. If it \
+cannot be run here, say which command you would have used and that it did not run.",
+    );
     out
 }
 
@@ -245,7 +254,9 @@ send each next section to the same path with append true. Build or check between
 mistake costs one section instead of the file.
 - old_string in edit_file must be copied exactly from the file, without the line-number prefix \
 that read_file shows.
-- Several changes to the same file go in ONE multi_edit call, not one edit_file after another.
+- Several changes to the same file go in ONE multi_edit call, not one edit_file after another. \
+Renaming something everywhere is one edit_file with replace_all, not one call per line it \
+appears on.
 - NEVER delete, rename or move a file to get around the read-before-write rule, and never \
 delete a file just to write it again: write_file over it. If write_file is rejected because the \
 file exists, read_file it, then edit_file or rewrite it. Deleting files without being asked is \
@@ -343,7 +354,11 @@ mod tests {
         assert!(!none.contains("git"), "no repo, no git rules: {none}");
         assert!(!none.contains("`problems`"), "no editor, no tool: {none}");
         // but the rule it replaces still has to be said
-        assert!(none.contains("verify with the shell tool"), "{none}");
+        assert!(none.contains("run its tests with the shell tool"), "{none}");
+        // and the one that does not depend on anything is always there
+        for rules in [&all, &none] {
+            assert!(rules.contains("Never report a task as done"), "{rules}");
+        }
         assert!(none.len() < all.len());
     }
 
