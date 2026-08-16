@@ -39,4 +39,14 @@ and, for web_search/web_fetch, to the sites involved. There is no telemetry.
 
 Prompt injection through fetched web pages is a known risk for every agentic
 tool. thoth tells the model to treat web content as data and never store it
-in memory, but that is an instruction, not a guarantee.
+in memory, but that is an instruction, not a guarantee. Two things narrow the
+gap. Anything off the network arrives wrapped in a marked boundary saying it
+is somebody else's writing, to be read and never obeyed, which is a warning
+sitting next to the payload rather than two thousand tokens before it. And
+any tool result carrying the phrases an injection needs, in a file as much as
+on a page, gets a line pointing at the attempt, because refusing quietly
+still leaves the user not knowing someone tried.
+
+None of that is a guarantee either. The model is the thing being persuaded,
+and the last defence is the same as the first: every action that touches your
+machine is shown to you in full and, unless you turned that off, asks first.

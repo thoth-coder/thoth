@@ -157,7 +157,8 @@ Environment variables: `THOTH_PROFILE`, `THOTH_BASE_URL`, `THOTH_MODEL`,
 `THOTH_NUM_CTX`), `THOTH_THINK`.
 
 CLI flags: `-P/--profile`, `--base-url`, `-m/--model`, `--api-key`,
-`--temperature`, `-p/--prompt` for one-shot mode. See `thoth --help`.
+`--temperature`, `-p/--prompt` for one-shot mode, `--mode` to start in
+`manual`, `accept-edits`, `auto` or `plan`. See `thoth --help`.
 
 ## Context window notes
 

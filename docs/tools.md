@@ -10,6 +10,7 @@
 | `grep` | regex search over file contents, `context` shows surrounding lines | auto |
 | `problems` | current errors/warnings from the editor (only offered when the VS Code extension is connected) | auto |
 | `todo` | the plan for the task, rewritten as it goes | auto |
+| `ask_user` | put a question with two to nine options to the user and wait for the answer | the answer is the permission |
 | `web_search` | web search through DuckDuckGo, no API key needed | auto |
 | `web_fetch` | fetch a URL as readable text | asks per host |
 | `remember` | save a durable fact to project memory | asks first |
@@ -20,8 +21,9 @@
 | `delete_file` | delete one file inside the project, after reading it | asks first |
 | `shell` | run a command (PowerShell on Windows, sh elsewhere) | asks per program |
 
-Permission prompt answers: `y` this once, `a` always, `n` deny. On deny the
-model is told and adjusts. An `a` answer is scoped to what you saw: the
+Permission prompt answers: `y` this once, `a` always, `s` skip this step and
+carry on without it, `n` no and stop. Skip and no are both reported to the
+model as "it did not happen", and neither may be written up as done. An `a` answer is scoped to what you saw: the
 program for a shell command, the host for a fetch, and one directory for a
 file outside the project. It is saved per project
 in `~/.thoth/projects/<key>/allow.json`; `/allow` reviews it and
