@@ -44,6 +44,10 @@ struct Args {
     /// Sampling temperature
     #[arg(long)]
     temperature: Option<f32>,
+    /// How much to ask before acting: manual, accept-edits, auto, plan.
+    /// Lasts for this run only; shift+tab changes it in the TUI
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -121,6 +125,15 @@ async fn main() -> Result<()> {
     // inert for anything that is not a real session
     agent::undo::arm();
     let mut agent = Agent::new(client, cfg, ev_tx, cancel_slot.clone());
+    if let Some(m) = &args.mode {
+        match agent::PermMode::from_name(m) {
+            Some(m) => agent.set_mode(m),
+            None => {
+                eprintln!("thoth: no mode called {m}. manual, accept-edits, auto or plan");
+                std::process::exit(2);
+            }
+        }
+    }
     if args.resume {
         agent.resume_session();
     }
@@ -329,6 +342,8 @@ async fn run_print_mode(
                 spent += cost.unwrap_or(0.0);
                 priced |= cost.is_some();
             }
+            // -p has nobody to ask, so a plan is simply the answer
+            AgentEvent::PlanReady => {}
             AgentEvent::TurnEnd => break,
         }
     }

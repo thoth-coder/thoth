@@ -4,7 +4,7 @@ pub mod render;
 mod screen;
 pub mod theme;
 
-use crate::agent::{AgentCmd, AgentEvent, PermReply};
+use crate::agent::{AgentCmd, AgentEvent, PermMode, PermReply};
 use crate::ui::config::{ConfigAction, ConfigScreen};
 use crate::ui::input::{
     byte_idx, complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
@@ -37,6 +37,8 @@ const HELP: &str = "commands:
   /config        edit the config profiles and switch between them (/cfg)
   /undo          put back the files the last request changed (/undo list)
   /allow         tools always allowed here (/allow reset to clear)
+  /mode          how much thoth asks: manual, accept edits, auto, plan
+  /plan          short for /mode plan
   /status        session info: profile, model, api, tokens, cost, uptime
   /init          analyze the project and generate THOTH.md
   /model NAME    switch model
@@ -47,9 +49,12 @@ input:
   !command       run a command yourself; its output goes into the context
 keys:
   enter          send
+  shift+enter    new line in the message (also alt+enter, ctrl+j, or \\ then enter)
+  shift+tab      cycle mode: manual / accept edits / auto / plan
   tab / enter    take the highlighted path while the picker is open
   esc            close the picker / interrupt generation / clear input
-  up / down      move in the picker, otherwise input history
+  up / down      move in the picker, then between the lines of the message,
+                 otherwise input history
   mouse wheel / pgup / pgdn   scroll transcript
   ctrl+o         expand / collapse long tool outputs
   ctrl+c         quit
@@ -114,6 +119,8 @@ enum Mode {
     Input,
     Busy,
     Perm(oneshot::Sender<PermReply>),
+    /// A plan came back and the user is choosing what to do with it.
+    PlanChoice,
 }
 
 struct App {
@@ -146,6 +153,9 @@ struct App {
     max_scroll: usize,
     spin: usize,
     quit: bool,
+    /// How much thoth asks before it acts. The agent holds the same value;
+    /// this copy is what the status line draws.
+    perm_mode: PermMode,
     session_start: std::time::Instant,
     turn_start: Option<std::time::Instant>,
     /// Live "In file.rs, N lines selected" label from the IDE extension.
@@ -290,6 +300,7 @@ impl App {
         cancel_slot: Arc<Mutex<CancellationToken>>,
     ) -> Self {
         Self {
+            perm_mode: PermMode::default(),
             model: session.model,
             base_url: session.base_url,
             profile: session.profile,
@@ -388,6 +399,34 @@ impl App {
             return;
         }
 
+        // the plan is on screen and the only question left is whether to
+        // carry it out, so the keys mean that until it is answered
+        if matches!(self.mode, Mode::PlanChoice) {
+            let chosen = match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Some(Some(PermMode::AcceptEdits)),
+                KeyCode::Char('a') | KeyCode::Char('A') => Some(Some(PermMode::Manual)),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(None),
+                KeyCode::Char('c') if ctrl => {
+                    self.quit = true;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(choice) = chosen {
+                self.mode = Mode::Input;
+                match choice {
+                    Some(m) => {
+                        self.set_mode(m);
+                        self.send_input("Carry out the plan you just described.".into());
+                    }
+                    None => self
+                        .blocks
+                        .push(ChatBlock::Info("still planning. say what to change".into())),
+                }
+            }
+            return;
+        }
+
         // typing anywhere re-opens a picker that was dismissed with esc
         if matches!(
             k.code,
@@ -433,6 +472,7 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
             }
+            KeyCode::BackTab => self.set_mode(self.perm_mode.next()),
             KeyCode::Char('o') if ctrl => {
                 self.expanded = !self.expanded;
                 self.invalidate_cache();
@@ -589,8 +629,15 @@ impl App {
                     self.spent = Some(self.spent.unwrap_or(0.0) + c);
                 }
             }
+            AgentEvent::PlanReady => {
+                self.blocks.push(ChatBlock::Info(
+                    "plan ready.  y do it (accept edits)   a do it, ask each time   n keep planning"
+                        .into(),
+                ));
+                self.mode = Mode::PlanChoice;
+            }
             AgentEvent::TurnEnd => {
-                if !matches!(self.mode, Mode::Perm(_)) {
+                if !matches!(self.mode, Mode::Perm(_) | Mode::PlanChoice) {
                     self.mode = Mode::Input;
                 }
                 self.turn_start = None;
@@ -691,6 +738,23 @@ impl App {
         let _ = self
             .cmd_tx
             .send(AgentCmd::UserInput(format!("{text}{attachments}")));
+    }
+
+    /// A request thoth sends on the user's behalf: it goes in the transcript
+    /// like anything they typed, because it is a turn they will be charged
+    /// for and have to read.
+    fn send_input(&mut self, text: String) {
+        self.blocks.push(ChatBlock::User(text.clone()));
+        self.scroll = None;
+        if matches!(self.mode, Mode::Input) {
+            self.set_busy();
+        }
+        let _ = self.cmd_tx.send(AgentCmd::UserInput(text));
+    }
+
+    fn set_mode(&mut self, m: PermMode) {
+        self.perm_mode = m;
+        let _ = self.cmd_tx.send(AgentCmd::SetMode(m));
     }
 
     /// Rebuilds the `@path` picker for whatever the cursor sits in now. Called
@@ -795,6 +859,21 @@ impl App {
                 self.set_busy();
                 let _ = self.cmd_tx.send(AgentCmd::Compact);
             }
+            "mode" => match PermMode::from_name(arg) {
+                Some(m) => self.set_mode(m),
+                None if arg.is_empty() => {
+                    self.blocks.push(ChatBlock::Info(format!(
+                        "{} mode: {}\n/mode manual | accept edits | auto | plan, or shift+tab to \
+                         cycle",
+                        self.perm_mode.name(),
+                        self.perm_mode.note()
+                    )));
+                }
+                None => self.blocks.push(ChatBlock::Info(format!(
+                    "no mode called {arg}. manual, accept edits, auto or plan"
+                ))),
+            },
+            "plan" => self.set_mode(PermMode::Plan),
             "recap" => {
                 self.set_busy();
                 let _ = self.cmd_tx.send(AgentCmd::Recap);

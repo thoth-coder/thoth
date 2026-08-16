@@ -141,6 +141,15 @@ impl App {
                 Span::styled("esc", theme::key()),
                 Span::styled(" close", theme::muted()),
             ]),
+            Mode::PlanChoice => Line::from(vec![
+                Span::styled("plan ready  ", Style::default().fg(theme::BUSY)),
+                Span::styled("y", theme::key()),
+                Span::styled(" do it   ", theme::muted()),
+                Span::styled("a", theme::key()),
+                Span::styled(" do it, ask each time   ", theme::muted()),
+                Span::styled("n", theme::key()),
+                Span::styled(" keep planning", theme::muted()),
+            ]),
             Mode::Input => Line::default(),
         };
         f.render_widget(Paragraph::new(state), state_a);
@@ -226,7 +235,8 @@ impl App {
             "scrolled up  ·  pgdn for the latest".to_string()
         } else {
             format!(
-                "/help  ·  ctrl+o {}  ·  ctrl+c quit",
+                "/help  ·  shift+tab {}  ·  ctrl+o {}",
+                self.perm_mode.name(),
                 if self.expanded { "collapse" } else { "expand" }
             )
         };

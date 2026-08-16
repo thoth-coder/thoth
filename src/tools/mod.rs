@@ -190,6 +190,16 @@ The command already runs in the working directory, no need to cd first.";
     }
 }
 
+/// Tools that change a file on disk. These are the ones with a diff to show
+/// and an undo checkpoint behind them, which is what makes them the set that
+/// accept-edits mode may wave through and plan mode has to stop.
+pub fn changes_files(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file"
+    )
+}
+
 pub fn needs_permission(name: &str, args: &Value) -> bool {
     match name {
         "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file" | "shell"

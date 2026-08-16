@@ -30,6 +30,8 @@
   message, and through input history when there is only one line.
 - Mouse wheel, `pgup` / `pgdn` scroll the transcript. Hold `shift` while
   dragging to select text.
+- `shift+tab` cycles how much thoth asks before it acts. The current mode is
+  in the status line.
 - `ctrl+o` expands or collapses long tool outputs.
 - `y` / `a` / `n` answer permission prompts: once, always, deny.
 - `ctrl+c` quits.
@@ -45,6 +47,7 @@
 | `/recap` | load the previous session's summary into context |
 | `/memory` | show project memory, `/memory clear` wipes it |
 | `/allow` | list what is always allowed here, `/allow reset` clears it |
+| `/mode` | show or set how much thoth asks: `manual`, `accept edits`, `auto`, `plan`. `/plan` is short for the last one |
 | `/status` | profile, model, server and api, tokens, cost, uptime |
 | `/init` | analyze the project and generate THOTH.md |
 | `/model NAME` | switch model, `/models` lists what the server has |
@@ -63,6 +66,29 @@ it sits in, so one look at a dotfile does not open the whole disk. The
 grant is saved in `~/.thoth/projects/<key>/allow.json` and survives
 restarts, so review it with `/allow` now and then. Auto-approved actions
 still print the full command line and the full diff.
+
+### Modes
+
+`shift+tab` cycles four of them, and `/mode` names one directly. The mode
+lasts for the session and is never saved: a mode turned on for a sandbox
+must not still be on tomorrow against a real repository.
+
+| mode | what happens |
+|---|---|
+| `manual` | the default. Every change and command asks first |
+| `accept edits` | changes to files go through; the shell and the network still ask |
+| `auto` | nothing asks |
+| `plan` | nothing is changed at all |
+
+`accept edits` stops at the shell on purpose: a file change is shown as a
+diff and `/undo` puts it back, and a command is neither.
+
+In `plan` mode the tools that write are refused before they run, and the
+model is told to describe what it would do instead. When it answers, thoth
+asks what to do with the plan: carry it out with edits accepted, carry it
+out asking each time, or keep planning. Choosing one of the first two
+switches the mode and sends the plan back to be carried out, so there is
+nothing to retype.
 
 ## Editor integration
 

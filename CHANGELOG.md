@@ -6,6 +6,19 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Four modes for how much thoth asks before it acts, cycled with
+  `shift+tab`, named with `/mode`, and set for one run with `--mode`:
+  `manual` (the default, ask every time), `accept edits` (file changes go
+  through, the shell and the network still ask), `auto` (nothing asks) and
+  `plan` (nothing is changed at all). Accept-edits stops at the shell on
+  purpose: a file change is a diff with an undo behind it, a command is
+  neither. The mode is never saved, so one turned on for a sandbox is not
+  still on tomorrow against a real repository.
+- Plan mode answers with the plan, then asks what to do with it: carry it
+  out with edits accepted, carry it out asking each time, or keep planning.
+  The first two switch the mode and send the plan back to be carried out,
+  so there is nothing to retype. The tools that write are refused while it
+  is on, and the refusal tells the model to describe the change instead.
 - `shift+enter` starts a new line in the input instead of sending it, and
   the input grows to as many rows as the message has lines, up to ten.
   `alt+enter` and `ctrl+j` do the same for terminals that never deliver the

@@ -38,6 +38,8 @@ pub enum AgentCmd {
         name: String,
         cfg: Box<crate::config::Config>,
     },
+    /// How much to ask before acting, from here on.
+    SetMode(PermMode),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +47,68 @@ pub enum PermReply {
     Yes,
     Always,
     No,
+}
+
+/// How much thoth asks before it touches the machine. Shift+tab cycles it,
+/// `/mode` names it. It is one session's setting, not a saved one: a mode
+/// that outlived the task it was turned on for is how a sandbox setting ends
+/// up running against a real repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermMode {
+    /// Ask before anything that touches the machine.
+    #[default]
+    Manual,
+    /// File edits go through; the shell and the network still ask.
+    AcceptEdits,
+    /// Nothing asks.
+    Auto,
+    /// Nothing is changed at all. Work it out and say what you would do.
+    Plan,
+}
+
+impl PermMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Manual => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Auto,
+            Self::Auto => Self::Plan,
+            Self::Plan => Self::Manual,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AcceptEdits => "accept edits",
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+        }
+    }
+
+    /// What it changes, in the words of what will happen next.
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Manual => "every change and command asks first",
+            Self::AcceptEdits => "file changes go through, the shell still asks",
+            Self::Auto => "nothing asks. every change and command runs",
+            Self::Plan => "nothing is changed: thoth works out what to do and says so",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_")
+            .as_str()
+        {
+            "manual" | "ask" | "default" => Some(Self::Manual),
+            "accept_edits" | "edits" | "accept" => Some(Self::AcceptEdits),
+            "auto" | "yolo" => Some(Self::Auto),
+            "plan" => Some(Self::Plan),
+            _ => None,
+        }
+    }
 }
 
 pub enum AgentEvent {
@@ -87,6 +151,9 @@ pub enum AgentEvent {
         usage: Usage,
         cost: Option<f64>,
     },
+    /// A plan-mode turn ended with a plan in it, so the UI can offer to
+    /// carry it out instead of making the user retype the request.
+    PlanReady,
     /// A user request (possibly queued) started processing.
     TurnStart,
     TurnEnd,
@@ -118,6 +185,8 @@ pub struct Agent {
     /// one. Kept because the reminder rides on the user message, and a
     /// compaction throws every user message away.
     reply_language: Option<&'static str>,
+    /// How much to ask before acting. Set from the UI, never persisted.
+    perm_mode: PermMode,
     /// Auto-compact when the prompt reaches this many tokens (None = never).
     auto_compact_at: Option<u64>,
 }
@@ -161,6 +230,7 @@ impl Agent {
             repeated: std::collections::HashMap::new(),
             call_counts: std::collections::HashMap::new(),
             reply_language: None,
+            perm_mode: PermMode::default(),
         }
     }
 
@@ -172,6 +242,25 @@ impl Agent {
             "\n\n(the user is writing in {lang}. Answer in {lang}, however this request and the \
              tool results are written.)"
         )
+    }
+
+    /// Start in a mode other than manual, from `--mode`. Set before the
+    /// agent runs; after that the UI moves it with `AgentCmd::SetMode`.
+    pub fn set_mode(&mut self, m: PermMode) {
+        self.perm_mode = m;
+    }
+
+    /// Whether the running mode answers the permission question by itself.
+    /// Auto answers it for everything; accept-edits only for changes to
+    /// files, which are the ones with a diff shown and an undo behind them.
+    /// The shell and the network keep asking there, because a command is not
+    /// a diff and cannot be taken back.
+    fn mode_allows(&self, tool: &str) -> bool {
+        match self.perm_mode {
+            PermMode::Auto => true,
+            PermMode::AcceptEdits => tools::changes_files(tool),
+            PermMode::Manual | PermMode::Plan => false,
+        }
     }
 
     /// Everything that remembers what is in the context, dropped together
@@ -343,6 +432,11 @@ impl Agent {
                     }
                 }
                 AgentCmd::UseProfile { name, cfg } => self.use_profile(&name, &cfg).await,
+                AgentCmd::SetMode(m) => {
+                    self.perm_mode = m;
+
+                    self.send(AgentEvent::Info(format!("{} mode: {}", m.name(), m.note())));
+                }
                 AgentCmd::Compact => self.compact().await,
                 AgentCmd::Recap => match tools::memory::load_recap() {
                     Some(recap) => {
@@ -496,6 +590,15 @@ impl Agent {
         if let Some(lang) = self.reply_language {
             full_input.push_str(&Self::language_note(lang));
         }
+        // said on the request, not in the system prompt, because the mode is
+        // switched mid-session and the system prompt is built once
+        if self.perm_mode == PermMode::Plan {
+            full_input.push_str(
+                "\n\n(plan mode: do not change anything. Read, search and run nothing that \
+                 writes. Answer with the plan itself: the files to change and what the change \
+                 to each one is. Keep it to what you would actually do, in a few lines.)",
+            );
+        }
         self.messages.push(Message::user(full_input));
         // both depend on where this turn is running: the budgets the tools
         // size themselves against, and whether there is an editor to ask
@@ -603,6 +706,10 @@ impl Agent {
                         "(empty response from the model. rephrase, or /compact to free context)"
                             .into(),
                     ));
+                } else if self.perm_mode == PermMode::Plan {
+                    // it stopped with something to say and could not have
+                    // changed anything to say it: that is the plan
+                    self.send(AgentEvent::PlanReady);
                 }
                 return Ok(());
             }
@@ -778,16 +885,30 @@ impl Agent {
             summary: tools::summarize(name, &args),
         });
 
+        // plan mode is a wall, not a prompt: the answer to "may I change
+        // this" is no, and saying so as a tool result is what tells the
+        // model to describe the change instead of trying again
+        if self.perm_mode == PermMode::Plan && tools::changes_files(name) {
+            let content = format!(
+                "Plan mode is on, so nothing may be changed yet. Do not call {name} or any other \
+                 tool that writes. Work the task out with the read-only tools and describe what \
+                 you would do: the files, and for each one what the change is. The user turns \
+                 plan mode off when they want it carried out."
+            );
+            self.send(AgentEvent::ToolResult {
+                content: content.clone(),
+                is_error: true,
+            });
+            return Ok(content);
+        }
+
         let key = tools::permission_key(name, &args);
-        let must_ask = tools::needs_permission(name, &args) && !self.always_allow.contains(&key);
+        let must_ask = tools::needs_permission(name, &args)
+            && !self.always_allow.contains(&key)
+            && !self.mode_allows(name);
         // permission skipped (always-allowed): still show exactly what runs —
         // the full diff for file changes, the full command line for shell
-        if !must_ask
-            && matches!(
-                name,
-                "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file" | "shell"
-            )
-        {
+        if !must_ask && (tools::changes_files(name) || name == "shell") {
             self.send(AgentEvent::Diff(tools::preview(name, &args)));
         }
         if must_ask {
@@ -1000,6 +1121,67 @@ mod tests {
         agent.call_counts.insert(read_key.into(), 3);
         agent.forget_reads_of(&call("shell", "{\"command\":\"cargo test\"}"));
         assert!(counted(&agent, read_key));
+    }
+
+    /// What each mode answers by itself, and what it still leaves to the
+    /// user. A shell command is not a diff and has no undo behind it, so
+    /// accept-edits must never wave one through.
+    #[tokio::test]
+    async fn a_mode_answers_only_what_it_is_meant_to() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cfg = crate::config::resolve(&crate::config::Profile::default());
+        let mut agent = Agent::new(
+            Client::new(&cfg),
+            cfg,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+
+        for tool in ["write_file", "edit_file", "shell", "web_fetch"] {
+            assert!(!agent.mode_allows(tool), "manual asks about {tool}");
+        }
+
+        agent.perm_mode = PermMode::AcceptEdits;
+        assert!(agent.mode_allows("write_file"));
+        assert!(agent.mode_allows("delete_file"));
+        assert!(!agent.mode_allows("shell"), "a command is not a diff");
+        assert!(!agent.mode_allows("web_fetch"));
+
+        agent.perm_mode = PermMode::Auto;
+        for tool in ["write_file", "shell", "web_fetch"] {
+            assert!(agent.mode_allows(tool), "auto asks about nothing: {tool}");
+        }
+
+        // plan mode does not answer the question, it removes it: the tools
+        // that write are stopped before anything is asked
+        agent.perm_mode = PermMode::Plan;
+        assert!(!agent.mode_allows("write_file"));
+        assert!(tools::changes_files("write_file"));
+        assert!(!tools::changes_files("shell"));
+    }
+
+    #[test]
+    fn the_modes_cycle_and_answer_to_their_names() {
+        let mut m = PermMode::default();
+        assert_eq!(m.name(), "manual");
+        let mut seen = vec![m.name()];
+        for _ in 0..3 {
+            m = m.next();
+            seen.push(m.name());
+        }
+        assert_eq!(seen, ["manual", "accept edits", "auto", "plan"]);
+        assert_eq!(m.next(), PermMode::Manual, "it has to come back around");
+
+        assert_eq!(
+            PermMode::from_name("Accept Edits"),
+            Some(PermMode::AcceptEdits)
+        );
+        assert_eq!(
+            PermMode::from_name("accept-edits"),
+            Some(PermMode::AcceptEdits)
+        );
+        assert_eq!(PermMode::from_name("plan"), Some(PermMode::Plan));
+        assert_eq!(PermMode::from_name("nonsense"), None);
     }
 
     /// `!cmd` runs without a model or a permission prompt, and its output
