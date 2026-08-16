@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-17
+
 ### Added
 - The system prompt now varies with the model as well as with the window. A
   frontier model infers the shape of a job from the job; a local one of
