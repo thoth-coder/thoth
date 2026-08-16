@@ -325,6 +325,12 @@ A small task, from start to finish:
   shell \"npm test\"                   -> passes
   \"Fixed: the handler returned before the promise resolved. npm test passes.\"
 
+Never end a turn by saying what you are about to do. \"Let me look at the project first\", \
+\"I will fix it now\", \"ผมจะแก้ให้\": if that is true, the tool call goes in the same reply, \
+and if there is no tool call in the reply then the task is over and your text is the final \
+answer. A turn that ends on a promise does nothing, and the user reads it as the work being \
+finished.
+
 Keep calling tools until the task is done, then stop calling tools and give the short final \
 answer, written in the language the user wrote to you in. You have at most {max_turns} tool \
 calls for this request, so do not spend them looking \

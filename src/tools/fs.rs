@@ -102,6 +102,34 @@ const MAX_ENTRIES: usize = 500;
 /// should use offset/limit or grep instead.
 pub const MAX_FILE_BYTES: u64 = 2_000_000;
 
+/// What to say when a path is not there. A model that guessed an absolute
+/// path guesses it wrong, and "The system cannot find the path specified" is
+/// the one thing that does not help it: it costs three more calls and a
+/// `pwd` before the model works out where it actually is. Naming the working
+/// directory in the error is the whole fix.
+fn where_am_i(path: &Path) -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".into());
+    format!(
+        "cannot find {}. The working directory is {cwd}; paths are relative to it, so use \
+         src/main.rs rather than guessing an absolute one",
+        path.display()
+    )
+}
+
+/// The context for a failed file operation: the plain message, unless the
+/// file is simply not there, which is worth saying properly. Asking the
+/// filesystem rather than the error kind, because reading a directory on
+/// Windows comes back as NotFound and a directory is very much there.
+fn fs_error(path: &Path, e: &std::io::Error, verb: &str) -> String {
+    if path.exists() {
+        format!("cannot {verb} {}: {e}", path.display())
+    } else {
+        where_am_i(path)
+    }
+}
+
 pub fn resolve(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.is_absolute() {
@@ -174,7 +202,7 @@ pub fn read_file(a: ReadArgs, cap: usize) -> Result<String> {
             meta.len() / 1_000_000
         );
     }
-    let bytes = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let bytes = std::fs::read(&path).map_err(|e| anyhow!("{}", fs_error(&path, &e, "read")))?;
     let text = String::from_utf8_lossy(&bytes);
     let offset = a.offset.unwrap_or(1).max(1);
     let limit = a.limit.unwrap_or(MAX_READ_LINES).min(MAX_READ_LINES);
@@ -687,7 +715,7 @@ pub fn list_dir(a: ListArgs, cap: usize) -> Result<String> {
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&path)
-        .with_context(|| format!("cannot list {}", path.display()))?
+        .map_err(|e| anyhow!("{}", fs_error(&path, &e, "list")))?
         .flatten()
     {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1161,6 +1189,44 @@ mod tests {
             "the lines are the help: {msg}"
         );
         assert!(msg.contains("replace_all"), "{msg}");
+    }
+
+    /// A path that is not there costs three more calls and a `pwd` if the
+    /// error does not say where the model actually is.
+    #[test]
+    fn a_missing_path_says_where_the_working_directory_is() {
+        let err = read_file(
+            ReadArgs {
+                path: "C:/nowhere/at/all/probe.rs".into(),
+                offset: None,
+                limit: None,
+            },
+            10_000,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("working directory is"), "{msg}");
+        assert!(
+            msg.contains(&std::env::current_dir().unwrap().display().to_string()),
+            "and it has to be the real one: {msg}"
+        );
+
+        // a file that is there and unreadable for another reason is not
+        // dressed up as a missing one
+        let dir = std::env::temp_dir();
+        let err = read_file(
+            ReadArgs {
+                path: dir.to_string_lossy().into_owned(),
+                offset: None,
+                limit: None,
+            },
+            10_000,
+        )
+        .unwrap_err();
+        assert!(
+            !format!("{err:#}").contains("working directory is"),
+            "a directory is not a missing file: {err:#}"
+        );
     }
 
     /// An empty anchor is an append written with the wrong tool, and the

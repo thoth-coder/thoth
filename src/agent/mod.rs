@@ -259,6 +259,17 @@ impl Agent {
             "rs", "ts", "tsx", "js", "jsx", "mjs", "py", "go", "java", "kt", "rb", "php", "c", "h",
             "cc", "cpp", "hpp", "cs", "swift", "sh",
         ];
+        // a manifest compiles nothing itself, but a dependency written into
+        // one and never resolved is the same broken handoff as code that
+        // was never built, and a guessed version number is how it happens
+        const MANIFESTS: [&str; 6] = [
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+            "requirements.txt",
+            "build.gradle",
+        ];
         if !tools::changes_files(&tc.function.name) {
             return false;
         }
@@ -266,11 +277,19 @@ impl Agent {
             return false;
         };
         ["path", "to"].iter().any(|k| {
-            args.get(*k)
-                .and_then(|v| v.as_str())
-                .and_then(|p| std::path::Path::new(p).extension())
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| CODE.contains(&e.to_ascii_lowercase().as_str()))
+            let Some(p) = args.get(*k).and_then(|v| v.as_str()) else {
+                return false;
+            };
+            let path = std::path::Path::new(p);
+            let named = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| MANIFESTS.contains(&n));
+            named
+                || path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| CODE.contains(&e.to_ascii_lowercase().as_str()))
         })
     }
 
@@ -1190,6 +1209,15 @@ mod tests {
         assert!(!Agent::changed_code(&call(
             "edit_file",
             "{\"path\":\"README.md\"}"
+        )));
+        // a dependency written in and never resolved is the same handoff
+        assert!(Agent::changed_code(&call(
+            "edit_file",
+            "{\"path\":\"Cargo.toml\"}"
+        )));
+        assert!(Agent::changed_code(&call(
+            "write_file",
+            "{\"path\":\"C:/p/package.json\"}"
         )));
         assert!(!Agent::changed_code(&call(
             "write_file",
