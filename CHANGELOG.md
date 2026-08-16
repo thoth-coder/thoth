@@ -5,6 +5,66 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `write_file` takes `append`, for adding a section to the end of a file.
+  It needs no prior read, because nothing already in the file is touched.
+  It is how a file too long for one call gets written: the first section
+  normally, every one after it appended. Doing that with `edit_file` meant
+  inventing a unique `old_string` out of the last lines of the file, and the
+  last lines of a Rust file are `}` and `}`.
+
+### Fixed
+- A compaction in the middle of a request no longer leaves files unreadable.
+  The loop breaker counts identical tool calls, and it kept counting across
+  the compaction that had just thrown their results away, so a re-read of the
+  file the model was working on came back "STOP: this exact read_file call was
+  already run 4 times" with no way to get the content. It burned the rest of
+  the turn going in circles.
+- Answers come back in the language the request was written in. Local models
+  read a system prompt full of English and answer in English (or in Chinese)
+  whatever the style rule says, so a request in a non-Latin script now names
+  the language outright. The name is remembered for the session, because the
+  reminder rides on the user message and a compaction deletes every one of
+  them: after the first compaction the whole conversation went back to
+  English. The summary is asked for in the user's language too.
+- "old_string appears 2 times" now says which lines they are. Telling a
+  model its anchor is not unique and to "add surrounding context" leaves it
+  guessing which of the matches it was aiming at; the line numbers let it
+  pick the context in one turn instead of two.
+- An `edit_file` with an empty `old_string` is answered with the tool that
+  does what it was trying to do. An empty anchor matches between every pair
+  of characters, so a model trying to add a `[[bin]]` section to a 7-line
+  Cargo.toml got "old_string appears 61 times, add surrounding context to
+  make it unique": true, and no help at all. It now says to use `write_file`
+  with `append`.
+- One edit in a `multi_edit` that asks for no change (old_string equal to
+  new_string) is skipped and named in the result, instead of failing the
+  whole call. Throwing away three real edits because the fourth had nothing
+  in it cost a turn every time a model got one of four wrong. A call where
+  every edit is like that is still an error.
+- Reading a file again after changing it is no longer treated as going in
+  circles. The loop breaker counts identical calls, so a model that read a
+  file, edited it wrong, and read it back to see the damage was told "this
+  exact read_file call was already run 3 times, the result will not change"
+  while the file on disk said otherwise. A change to a file now clears what
+  was counted and remembered about reads of it.
+- Hitting the context limit mid-generation no longer costs two compactions.
+  The recovery path compacted and jumped straight back to the model, past the
+  point where the auto-compact request from that same turn is answered, so
+  the next turn compacted again with four messages in the conversation and
+  threw away the file it had just read.
+- Long files are built up in sections instead of being lost. A model that
+  tries to emit a whole 1200-line file in one write_file has to fit every
+  character of it, and its reasoning, inside one generation; past the window
+  it is cut off mid-file and all of it is gone. write_file now refuses a call
+  larger than half of what a tool result may take and says how to write the
+  file in parts, and the prompt asks for that shape up front.
+- The model stopped deleting files to rewrite them. write_file already
+  counts a file thoth wrote itself as read, so overwriting it was allowed all
+  along; the prompt said only "write_file is for brand-new files", and a
+  model that wanted to start over on a 1300-line file it had just written
+  reached for delete_file instead.
+
 ### Changed
 - Release notes are the changelog entry for the tag, put there by one
   publish job instead of by all five build jobs at once. Each of them was
