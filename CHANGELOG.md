@@ -5,6 +5,15 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- The binary is a third smaller: 8.4 MB to 5.7 MB on Windows. Link-time
+  optimization across the whole program, one codegen unit, symbols stripped,
+  and no unwinding tables, since thoth has nothing that has to run while a
+  panic travels and the terminal is put back either way.
+- The demo screens behind `--view` are no longer compiled into a release
+  build at all. They were dead code in one, but only because the optimizer
+  noticed.
+
 ## [0.4.2] - 2026-08-18
 
 ### Added

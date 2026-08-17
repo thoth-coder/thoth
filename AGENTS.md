@@ -29,8 +29,15 @@ along those lines needs no new `pub`.
 
 ## Architecture (src/)
 
-- `main.rs`: CLI args and subcommands, config resolution, model discovery,
-  spawns the agent task, picks TUI or one-shot print mode (`-p`).
+- `main.rs`: the order things happen in at startup, and nothing else. Config
+  resolution, model discovery, spawning the agent task, then TUI or `-p`.
+- `cli.rs`: the clap surface and the subcommands that answer without ever
+  starting a session (`upgrade`, `config`, `--view`). Everything here has to
+  work on a machine with no model running, which is why it sits before the
+  config load rather than inside it.
+- `print.rs`: `-p` mode. The split down the middle is the point: the model's
+  answer goes to stdout and nothing else does, so `thoth -p "..." > out.txt`
+  leaves a file with the answer and a terminal with the working shown.
 - `config.rs`: named profiles in `~/.thoth/config.toml` plus the resolution
   order: CLI flag, then `THOTH_*` env var, then the active profile, then the
   built-in default. Owns `thoth_home()`, the one definition of `~/.thoth`
@@ -50,10 +57,14 @@ along those lines needs no new `pub`.
   copy.
 - `agent/mod.rs`: the agentic loop (model call, tool calls, results, repeat).
   Owns conversation history, permission gating, duplicate-call breaker,
-  auto-compact at 2/3 of the window, truncation recovery, /compact, /recap,
-  editor-context injection, `!command` runs. Also keeps the history from
-  growing copies of itself: an identical read-only call drops the older
-  result (`drop_stale_copy`), and identical is the whole safety condition.
+  truncation recovery, /recap, editor-context injection, `!command` runs.
+- `agent/history.rs`: what leaves the conversation, since context is the
+  scarce resource and three things spend it. The summary that replaces a
+  history too long to send (`compact`, automatic at 2/3 of the window or on
+  `/compact`), the trim that saves a request the server already truncated
+  (`hard_trim`), and the older copy of a result a newer identical read has
+  superseded (`drop_stale_copy`) - where identical is the whole safety
+  condition. A child module, so these stay `impl Agent`.
 - `agent/prompt.rs`: system prompt. Environment (cwd, os, date, git branch),
   project scan, guardrail rules, instruction file (THOTH.md/AGENTS.md/
   CLAUDE.md, pointers followed), project memory.
@@ -81,10 +92,13 @@ along those lines needs no new `pub`.
   companion extension (thoth-for-vscode) from `~/.thoth/ide/`, falls back
   to window titles on Windows.
 - `ui/mod.rs`: ratatui interface. The state and everything that changes it:
-  terminal and agent events, keys, slash commands, the transcript blocks.
-  `ui/screen.rs` is the other half, the drawing, including the incremental
-  wrap cache; it is a child module, so it reads `App`'s private fields
-  without any of them being made public. `ui/render.rs` turns text into
+  agent events, slash commands, the transcript blocks. `ui/screen.rs` is the
+  other half, the drawing, including the incremental wrap cache; it is a
+  child module, so it reads `App`'s private fields without any of them being
+  made public. `ui/keys.rs` is what a key means: the mode routing (chooser,
+  permission prompt, completion popup, plain typing) and the input editing
+  that follows from it, and the order the modes are tested in is the whole of
+  the routing. `ui/render.rs` turns text into
   styled lines (markdown, diffs, wrapping), `ui/theme.rs` holds colors and
   glyphs, `ui/input.rs` handles `@path` attachments and completion.
 - `ui/clipboard.rs`: OSC 52, so the terminal does the copying and thoth
@@ -147,3 +161,12 @@ along those lines needs no new `pub`.
 - Prefer runtime `cfg!(windows)` over `#[cfg]` so both branches compile on
   every platform. `#[cfg]` items need a non-Windows stub.
 - No new heavyweight dependencies without a good reason.
+- Development-only code is `#[cfg(debug_assertions)]`, not a runtime `if`.
+  `ui/demo.rs` carries made-up transcripts nobody who installs thoth will
+  ever see; the optimizer happened to drop them, and `#[cfg]` is the same
+  thing said as a guarantee. The release profile is tuned for what a user
+  downloads (`lto = "fat"`, one codegen unit, symbols stripped, `panic =
+  "abort"`): thoth has no `catch_unwind` and nothing that must run while a
+  panic travels, and ratatui's hook still puts the terminal back under
+  abort, so the unwinding tables were pure weight. Adding either would mean
+  taking `panic = "abort"` back out.

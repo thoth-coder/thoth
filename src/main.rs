@@ -1,126 +1,34 @@
 mod agent;
+mod cli;
 mod client;
 mod config;
 mod editor;
+mod print;
 mod tools;
 mod ui;
 mod upgrade;
 
-use agent::{Agent, AgentCmd, AgentEvent, PermReply};
+use agent::{Agent, AgentEvent};
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use client::Client;
-use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Agentic coding assistant. Runs on your own models (Ollama, llama.cpp) or
-/// on an api you pay for (Anthropic, OpenAI, Google, OpenRouter).
-#[derive(Parser)]
-#[command(name = "thoth", version)]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Cmd>,
-    /// Run a single prompt non-interactively (plain output) and exit
-    #[arg(short, long)]
-    prompt: Option<String>,
-    /// Resume this project's previous conversation
-    #[arg(short = 'c', long = "continue")]
-    resume: bool,
-    /// Config profile to run with (see `thoth config`)
-    #[arg(short = 'P', long)]
-    profile: Option<String>,
-    /// OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 (Ollama)
-    /// or http://localhost:8080/v1 (llama.cpp)
-    #[arg(long)]
-    base_url: Option<String>,
-    /// Model name, e.g. qwen3:8b
-    #[arg(short, long)]
-    model: Option<String>,
-    /// API key, if the server requires one
-    #[arg(long)]
-    api_key: Option<String>,
-    /// Sampling temperature
-    #[arg(long)]
-    temperature: Option<f32>,
-    /// How much to ask before acting: manual, accept-edits, auto, plan.
-    /// Lasts for this run only; shift+tab changes it in the TUI
-    #[arg(long, value_name = "MODE")]
-    mode: Option<String>,
-    /// Print a screen of the interface with made-up contents and exit, for
-    /// working on the UI without waiting for a model to reach that state.
-    /// Bare `--view` lists what there is. Debug builds only
-    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
-    view: Option<String>,
-    /// Size for --view, e.g. 100x30
-    #[arg(long, value_name = "WxH", default_value = "100x30")]
-    view_size: String,
-}
-
-/// `--view` exists so a UI state that normally needs a model behind it can be
-/// looked at in one command. Refused in a release build: it is a development
-/// tool, and a user who reaches for it has misread something. The code is
-/// still compiled there, so clippy and the release build check it like the
-/// rest, which is worth more than the few kilobytes of demo transcript.
-fn run_view(name: &str, size: &str) -> Result<()> {
-    if !cfg!(debug_assertions) {
-        bail!("--view is for debug builds. cargo run -- --view {name}");
-    }
-    if name.is_empty() {
-        println!("thoth --view <name> [--view-size WxH]\n");
-        for v in ui::demo::VIEWS {
-            println!("  {:<12} {}", v.name, v.about);
-        }
-        return Ok(());
-    }
-    let (w, h) = size
-        .split_once(['x', 'X'])
-        .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
-        .ok_or_else(|| anyhow!("--view-size wants something like 100x30, not {size}"))?;
-    if w < 20 || h < 6 {
-        bail!("--view-size {size} is too small to draw anything into");
-    }
-    print!("{}", ui::demo::render(name, w, h)?);
-    Ok(())
-}
-
-#[derive(clap::Subcommand)]
-enum Cmd {
-    /// Download the latest release and replace this binary
-    Upgrade,
-    /// Edit the config profiles on a screen, or switch between them
-    #[command(alias = "cfg")]
-    Config {
-        #[command(subcommand)]
-        action: Option<ConfigCmd>,
-    },
-}
-
-#[derive(clap::Subcommand)]
-enum ConfigCmd {
-    /// List the profiles and show which one is active
-    List,
-    /// Start with this profile from now on
-    Use { name: String },
-    /// Print the path of the config file
-    Path,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    match args.command {
-        Some(Cmd::Upgrade) => return upgrade::run().await,
-        Some(Cmd::Config { action }) => return run_config(action),
-        None => {}
+    let args = cli::Args::parse();
+    if let Some(done) = cli::run_subcommand(args.command).await {
+        return done;
     }
     // before any of the config and network work below: a view needs nothing
     // but the drawing code, and asking for one on a machine with no model
     // running has to still show the screen
     if let Some(name) = &args.view {
-        return run_view(name, &args.view_size);
+        return cli::run_view(name, &args.view_size);
     }
+
     let (cfg, profile) = config::load(config::Overrides {
         profile: args.profile,
         base_url: args.base_url,
@@ -130,7 +38,6 @@ async fn main() -> Result<()> {
     })?;
 
     let mut client = Client::connect(&cfg).await;
-
     let mut startup_note = None;
     if client.model.is_empty() {
         let (model, note) = choose_model(&client).await?;
@@ -181,7 +88,7 @@ async fn main() -> Result<()> {
     tokio::spawn(agent.run(cmd_rx));
 
     match args.prompt {
-        Some(p) => run_print_mode(p, cmd_tx, ev_rx).await,
+        Some(p) => print::run(p, cmd_tx, ev_rx).await,
         None => {
             ui::run(
                 ui::Session {
@@ -258,153 +165,4 @@ fn looks_like_chat_model(id: &str) -> bool {
     ]
     .iter()
     .any(|bad| id.contains(bad))
-}
-
-/// `thoth config`: the screen with no arguments, and the three things that
-/// are quicker to say than to click.
-fn run_config(action: Option<ConfigCmd>) -> Result<()> {
-    match action {
-        None => ui::config::run_standalone(),
-        Some(ConfigCmd::Path) => {
-            println!("{}", config::config_path().display());
-            Ok(())
-        }
-        Some(ConfigCmd::List) => {
-            let store = config::load_store();
-            if store.profiles.is_empty() {
-                println!("no profiles yet. `thoth config` makes one");
-                return Ok(());
-            }
-            for (name, p) in &store.profiles {
-                println!(
-                    "{} {name:<16} {:<24} {}",
-                    if store.active.as_ref() == Some(name) {
-                        "*"
-                    } else {
-                        " "
-                    },
-                    p.model.as_deref().unwrap_or("(server default)"),
-                    p.base_url.as_deref().unwrap_or(config::DEFAULT_BASE_URL),
-                );
-            }
-            Ok(())
-        }
-        Some(ConfigCmd::Use { name }) => {
-            let mut store = config::load_store();
-            if !store.profiles.contains_key(&name) {
-                bail!("no profile named '{name}'. `thoth config list` shows them");
-            }
-            store.active = Some(name.clone());
-            config::save_store(&store)?;
-            println!("thoth now starts with profile '{name}'");
-            Ok(())
-        }
-    }
-}
-
-/// Plain stdout/stderr mode for `thoth -p "..."` — no TUI.
-async fn run_print_mode(
-    prompt: String,
-    cmd_tx: mpsc::UnboundedSender<AgentCmd>,
-    mut ev_rx: mpsc::UnboundedReceiver<AgentEvent>,
-) -> Result<()> {
-    let (attachments, labels) = ui::input::expand_mentions(&prompt, &ui::input::cwd());
-    for l in labels {
-        eprintln!("* {l}");
-    }
-    cmd_tx
-        .send(AgentCmd::UserInput(format!("{prompt}{attachments}")))
-        .map_err(|_| anyhow!("agent task died"))?;
-    let mut ctx_tokens = 0u64;
-    let mut out_tokens = 0u64;
-    let mut spent = 0.0f64;
-    let mut priced = false;
-    while let Some(ev) = ev_rx.recv().await {
-        match ev {
-            AgentEvent::Content(t) => {
-                print!("{t}");
-                std::io::stdout().flush().ok();
-            }
-            AgentEvent::Reasoning(_) => {}
-            AgentEvent::ToolStart { name, summary } => {
-                eprintln!("\n[{name}] {summary}");
-            }
-            AgentEvent::ToolResult { content, is_error } => {
-                let lines: Vec<&str> = content.lines().collect();
-                for l in lines.iter().take(3) {
-                    eprintln!("  | {l}");
-                }
-                if lines.len() > 3 {
-                    eprintln!("  | … +{} lines", lines.len() - 3);
-                }
-                if is_error {
-                    eprintln!("  | (error)");
-                }
-            }
-            AgentEvent::Permission {
-                tool,
-                preview,
-                reply,
-            } => {
-                eprintln!("\n{preview}");
-                let q = format!("allow {tool}? [y=yes / a=always / n=no] ");
-                let ans = tokio::task::spawn_blocking(move || {
-                    eprint!("{q}");
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s).ok();
-                    s
-                })
-                .await
-                .unwrap_or_default();
-                let r = match ans.trim().to_lowercase().as_str() {
-                    "y" | "yes" => PermReply::Yes,
-                    "a" | "always" => PermReply::Always,
-                    _ => PermReply::No,
-                };
-                let _ = reply.send(r);
-            }
-            AgentEvent::Diff(t) => {
-                for l in t.lines() {
-                    eprintln!("  {l}");
-                }
-            }
-            AgentEvent::Info(t) => eprintln!("* {t}"),
-            AgentEvent::Error(t) => eprintln!("error: {t}"),
-            AgentEvent::ModelChanged(_) | AgentEvent::Connected { .. } => {}
-            AgentEvent::Models(models) => {
-                for m in models {
-                    eprintln!("  {m}");
-                }
-            }
-            AgentEvent::TurnStart => {}
-            AgentEvent::Usage { usage, cost } => {
-                ctx_tokens = usage.prompt_tokens;
-                out_tokens += usage.completion_tokens;
-                spent += cost.unwrap_or(0.0);
-                priced |= cost.is_some();
-            }
-            // -p has nobody to ask, so a plan is simply the answer
-            AgentEvent::PlanReady => {}
-            // and nobody to choose either: let the agent take the safe road
-            AgentEvent::Choice {
-                question, reply, ..
-            } => {
-                println!("\n[question, unanswered: nobody is here] {question}");
-                let _ = reply.send(None);
-            }
-            AgentEvent::TurnEnd => break,
-        }
-    }
-    println!();
-    if ctx_tokens > 0 {
-        eprintln!(
-            "* context {ctx_tokens} tokens, output {out_tokens} tokens{}",
-            if priced {
-                format!(", cost ${spent:.4}")
-            } else {
-                String::new()
-            }
-        );
-    }
-    Ok(())
 }

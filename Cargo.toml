@@ -27,6 +27,10 @@ unicode-width = "0.2"
 walkdir = "2"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
+# thoth has no catch_unwind and nothing that has to run while a panic travels;
+# ratatui installs a panic hook to put the terminal back, and hooks still run
+# under abort. So the unwinding tables are pure weight.
+panic = "abort"
