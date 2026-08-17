@@ -4,7 +4,7 @@ pub mod render;
 mod screen;
 pub mod theme;
 
-use crate::agent::{AgentCmd, AgentEvent, PermMode, PermReply};
+use crate::agent::{AgentCmd, AgentEvent, Answer, PermMode, PermReply};
 use crate::ui::config::{ConfigAction, ConfigScreen};
 use crate::ui::input::{
     byte_idx, complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
@@ -60,7 +60,8 @@ keys:
   ctrl+c         quit
 answering:
   y / a / s / n  permission: once / always / skip it / no, stop
-  1-9            pick an option when thoth asks you to choose (esc: let it decide)
+  up/down enter  move through thoth's options and take one (1-9 picks directly)
+  last row       none of them: write your own answer instead (esc goes back)
 tips: hold shift while dragging to select text with the mouse
       start thoth with --continue to resume this project's last conversation";
 
@@ -124,11 +125,27 @@ enum Mode {
     Perm(oneshot::Sender<PermReply>),
     /// A plan came back and the user is choosing what to do with it.
     PlanChoice,
-    /// The model asked something and is waiting on the answer.
+    /// The model asked something and is waiting on the answer. The rows are
+    /// the options plus one more for an answer of the user's own, so a
+    /// question whose real answer nobody offered is still answerable.
     Choice {
         options: Vec<String>,
-        reply: oneshot::Sender<Option<usize>>,
+        /// Highlighted row. `options.len()` is the write-your-own row.
+        sel: usize,
+        /// Set while they are writing that answer, holding whatever was
+        /// half-typed in the input box when the question arrived: a question
+        /// turning up is not a reason to lose a draft.
+        typing: Option<String>,
+        reply: oneshot::Sender<Option<Answer>>,
     },
+}
+
+impl Mode {
+    /// Rows the chooser puts on screen: every option, then the one that lets
+    /// the user write an answer instead of taking one.
+    fn choice_rows(options: &[String]) -> usize {
+        options.len() + 1
+    }
 }
 
 struct App {
@@ -356,7 +373,9 @@ impl App {
                 MouseEventKind::ScrollDown => self.scroll_by(3),
                 _ => {}
             },
-            Event::Paste(s) if !matches!(self.mode, Mode::Perm(_) | Mode::Choice { .. }) => {
+            // a paste belongs in the input box, and while an answer is being
+            // written that is exactly where it should land
+            Event::Paste(s) if !matches!(self.mode, Mode::Perm(_)) && !self.picking() => {
                 // pasted code keeps its lines now that the input has them.
                 // A lone \r is a line break too, and leaving it in would
                 // draw the rest of the line over the start of it
@@ -384,31 +403,60 @@ impl App {
             return;
         }
 
-        // a question from the model owns the keys until it has an answer
-        if matches!(self.mode, Mode::Choice { .. }) {
-            let picked = match k.code {
-                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                    Some(Some(c as usize - '1' as usize))
+        // a question from the model owns the keys until it has an answer,
+        // except while the user is writing one of their own: there the input
+        // box is doing its ordinary job and only enter and esc mean something
+        // different, so everything else falls through to the editing keys
+        let asking = match &self.mode {
+            Mode::Choice {
+                options,
+                sel,
+                typing,
+                ..
+            } => Some((Mode::choice_rows(options), *sel, typing.is_some())),
+            _ => None,
+        };
+        if let Some((rows, sel, writing)) = asking {
+            let step = |d: isize| (sel as isize + d).rem_euclid(rows as isize) as usize;
+            if writing {
+                match k.code {
+                    KeyCode::Esc => {
+                        self.stop_writing_answer();
+                        return;
+                    }
+                    KeyCode::Enter if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                        let said = self.input.trim().to_string();
+                        if !said.is_empty() {
+                            self.input.clear();
+                            self.cursor = 0;
+                            self.answer_choice(Some(Answer::Wrote(said)));
+                        }
+                        return;
+                    }
+                    // and everything else is ordinary typing
+                    _ => {}
                 }
-                KeyCode::Esc => Some(None),
-                KeyCode::Char('c') if ctrl => {
-                    self.quit = true;
-                    None
+            } else {
+                match k.code {
+                    KeyCode::Up => self.move_choice(step(-1)),
+                    KeyCode::Down => self.move_choice(step(1)),
+                    KeyCode::Char('p') if ctrl => self.move_choice(step(-1)),
+                    KeyCode::Char('n') if ctrl => self.move_choice(step(1)),
+                    KeyCode::Char('c') if ctrl => self.quit = true,
+                    // the numbers still work, and only for a row there is one
+                    // of: a 7 against three options is a typo, not an answer
+                    KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                        let i = c as usize - '1' as usize;
+                        if i < rows {
+                            self.take_choice(i);
+                        }
+                    }
+                    KeyCode::Enter => self.take_choice(sel),
+                    KeyCode::Esc => self.answer_choice(None),
+                    _ => {}
                 }
-                _ => None,
-            };
-            if let Some(choice) = picked
-                && let Mode::Choice { options, reply } =
-                    std::mem::replace(&mut self.mode, Mode::Busy)
-            {
-                let choice = choice.filter(|i| *i < options.len());
-                self.blocks.push(ChatBlock::Info(match choice {
-                    Some(i) => format!("chose: {}", options[i]),
-                    None => "left unanswered".into(),
-                }));
-                let _ = reply.send(choice);
+                return;
             }
-            return;
         }
 
         if matches!(self.mode, Mode::Perm(_)) {
@@ -563,8 +611,11 @@ impl App {
             KeyCode::Down if self.line_end(self.cursor) < self.input.chars().count() => {
                 self.move_line(1)
             }
-            KeyCode::Up => self.history_prev(),
-            KeyCode::Down => self.history_next(),
+            // but not into the input history while an answer is being
+            // written: the history belongs to the conversation, and pulling
+            // an old message over a half-written answer loses it
+            KeyCode::Up if !self.answering() => self.history_prev(),
+            KeyCode::Down if !self.answering() => self.history_next(),
             KeyCode::PageUp => self.scroll_by(-10),
             KeyCode::PageDown => self.scroll_by(10),
             KeyCode::Char(ch) if !ctrl => self.insert_char(ch),
@@ -672,13 +723,17 @@ impl App {
                 options,
                 reply,
             } => {
-                let mut lines = vec![question];
-                for (i, o) in options.iter().enumerate() {
-                    lines.push(format!("  {}. {o}", i + 1));
-                }
-                self.blocks.push(ChatBlock::Info(lines.join("\n")));
+                // only the question goes in the transcript. The options are
+                // drawn live under the input, because one of them is
+                // highlighted and that changes as the user moves
+                self.blocks.push(ChatBlock::Info(question));
                 self.scroll = None;
-                self.mode = Mode::Choice { options, reply };
+                self.mode = Mode::Choice {
+                    options,
+                    sel: 0,
+                    typing: None,
+                    reply,
+                };
             }
             AgentEvent::PlanReady => {
                 self.blocks.push(ChatBlock::Info(
@@ -744,8 +799,9 @@ impl App {
     }
 
     fn submit(&mut self) {
-        // typing is allowed while the agent works — messages queue up;
-        // only a question waiting on an answer blocks submitting
+        // typing is allowed while the agent works, messages queue up; only a
+        // question waiting on an answer blocks submitting, and while one is
+        // being written enter has already been dealt with above
         if matches!(self.mode, Mode::Perm(_) | Mode::Choice { .. }) {
             return;
         }
@@ -792,6 +848,85 @@ impl App {
         let _ = self
             .cmd_tx
             .send(AgentCmd::UserInput(format!("{text}{attachments}")));
+    }
+
+    /// A question is on screen and the user is choosing between the rows,
+    /// rather than writing an answer of their own. While they are writing,
+    /// the input box works exactly as it always does.
+    fn picking(&self) -> bool {
+        matches!(&self.mode, Mode::Choice { typing, .. } if typing.is_none())
+    }
+
+    /// The input box is holding an answer to the model's question rather than
+    /// the next message.
+    fn answering(&self) -> bool {
+        matches!(&self.mode, Mode::Choice { typing, .. } if typing.is_some())
+    }
+
+    fn move_choice(&mut self, i: usize) {
+        if let Mode::Choice { sel, .. } = &mut self.mode {
+            *sel = i;
+        }
+    }
+
+    /// Taking a row of the chooser. The last one is not an answer, it is the
+    /// way to write one, so it opens the input box instead of replying.
+    fn take_choice(&mut self, i: usize) {
+        let picked = match &self.mode {
+            Mode::Choice { options, .. } if i + 1 < Mode::choice_rows(options) => {
+                Some(options[i].clone())
+            }
+            Mode::Choice { .. } => None,
+            _ => return,
+        };
+        match picked {
+            Some(s) => self.answer_choice(Some(Answer::Picked(s))),
+            None => {
+                let draft = std::mem::take(&mut self.input);
+                self.cursor = 0;
+                if let Mode::Choice { sel, typing, .. } = &mut self.mode {
+                    *sel = i;
+                    *typing = Some(draft);
+                }
+            }
+        }
+    }
+
+    /// Back from writing an answer to the list, with the draft put back the
+    /// way it was found.
+    fn stop_writing_answer(&mut self) {
+        let Mode::Choice { typing, .. } = &mut self.mode else {
+            return;
+        };
+        let Some(draft) = typing.take() else { return };
+        self.input = draft;
+        self.cursor = self.input.chars().count();
+    }
+
+    /// Sends the answer and writes it into the transcript: what the user
+    /// decided belongs in the record they can scroll back to, not only in the
+    /// model's context.
+    fn answer_choice(&mut self, answer: Option<Answer>) {
+        if !matches!(self.mode, Mode::Choice { .. }) {
+            return;
+        }
+        let draft = match &mut self.mode {
+            Mode::Choice { typing, .. } => typing.take(),
+            _ => None,
+        };
+        let Mode::Choice { reply, .. } = std::mem::replace(&mut self.mode, Mode::Busy) else {
+            return;
+        };
+        if let Some(d) = draft {
+            self.input = d;
+            self.cursor = self.input.chars().count();
+        }
+        self.blocks.push(ChatBlock::Info(match &answer {
+            Some(Answer::Picked(s)) => format!("chose: {s}"),
+            Some(Answer::Wrote(s)) => format!("answered: {s}"),
+            None => "left unanswered".into(),
+        }));
+        let _ = reply.send(answer);
     }
 
     /// A request thoth sends on the user's behalf: it goes in the transcript
@@ -1238,44 +1373,114 @@ mod tests {
     /// The model can stop and ask, and the answer has to reach it. Esc is
     /// an answer too: it means decide for yourself.
     #[tokio::test]
-    async fn a_question_from_the_model_is_answered_with_a_number() {
+    async fn a_question_from_the_model_is_picked_from_the_list() {
         let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ask = |a: &mut App| {
+            let (tx, rx) = oneshot::channel();
+            a.on_agent_event(AgentEvent::Choice {
+                question: "ใช้ตัวไหนดี".into(),
+                options: vec!["serde".into(), "miniserde".into()],
+                reply: tx,
+            });
+            rx
+        };
         let mut a = app();
-        let (tx, rx) = oneshot::channel();
-        a.on_agent_event(AgentEvent::Choice {
-            question: "ใช้ตัวไหนดี".into(),
-            options: vec!["serde".into(), "miniserde".into()],
-            reply: tx,
-        });
+        let rx = ask(&mut a);
         let s = screen(&mut a, 80, 16);
         assert!(
-            s.iter().any(|l| l.contains("1. serde")),
+            s.iter().any(|l| l.contains("1 serde")),
             "the options have to be on screen: {s:?}"
         );
-        assert!(s.iter().any(|l| l.contains("your call")), "{s:?}");
+        assert!(
+            s.iter().any(|l| l.contains("something else")),
+            "and so does the way out of them: {s:?}"
+        );
+        assert!(s.iter().any(|l| l.contains("up/down")), "{s:?}");
 
+        // the number is still the shortcut it always was
         a.on_key(plain(KeyCode::Char('2')));
-        assert_eq!(rx.await.unwrap(), Some(1), "the second option was picked");
+        assert_eq!(
+            rx.await.unwrap(),
+            Some(Answer::Picked("miniserde".into())),
+            "the second option was picked"
+        );
 
-        // a number nobody offered is not an answer
+        // and so is walking there: down wraps past the write-your-own row
+        let rx = ask(&mut a);
+        for _ in 0..4 {
+            a.on_key(plain(KeyCode::Down));
+        }
+        a.on_key(plain(KeyCode::Enter));
+        assert_eq!(rx.await.unwrap(), Some(Answer::Picked("miniserde".into())));
+
+        // a number nobody offered does nothing at all: a 7 against two
+        // options is a typo, and answering it as "no answer" loses the turn
+        let mut rx = ask(&mut a);
+        a.on_key(plain(KeyCode::Char('7')));
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        // esc hands the decision back
+        a.on_key(plain(KeyCode::Esc));
+        assert_eq!(rx.await.unwrap(), None);
+    }
+
+    /// The last row is not one of the model's options, it is the way past
+    /// them: none of these, here is what I actually want.
+    #[tokio::test]
+    async fn the_last_row_lets_the_user_write_their_own_answer() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut a = app();
+        // a half-written message is sitting in the box when the question lands
+        a.input = "draft".into();
+        a.cursor = 5;
+        let (tx, rx) = oneshot::channel();
+        a.on_agent_event(AgentEvent::Choice {
+            question: "which layout?".into(),
+            options: vec!["routes/".into(), "mvc".into()],
+            reply: tx,
+        });
+
+        a.on_key(plain(KeyCode::Up)); // wraps straight onto the last row
+        a.on_key(plain(KeyCode::Enter));
+        assert!(
+            a.input.is_empty(),
+            "the box is cleared to type the answer in"
+        );
+        let s = screen(&mut a, 80, 16);
+        assert!(s.iter().any(|l| l.contains("type your answer")), "{s:?}");
+
+        for c in "one file".chars() {
+            a.on_key(plain(KeyCode::Char(c)));
+        }
+        a.on_key(plain(KeyCode::Enter));
+        assert_eq!(rx.await.unwrap(), Some(Answer::Wrote("one file".into())));
+        assert_eq!(a.input, "draft", "and the draft comes back afterwards");
+    }
+
+    /// Esc while writing goes back to the list rather than answering: the
+    /// user changed their mind about writing, not about the question.
+    #[tokio::test]
+    async fn escaping_out_of_a_written_answer_returns_to_the_options() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut a = app();
+        a.input = "draft".into();
         let (tx, mut rx) = oneshot::channel();
         a.on_agent_event(AgentEvent::Choice {
             question: "q".into(),
             options: vec!["a".into(), "b".into()],
             reply: tx,
         });
-        a.on_key(plain(KeyCode::Char('7')));
-        assert_eq!(rx.try_recv(), Ok(None), "out of range means no answer");
-
-        // and esc hands the decision back
-        let (tx, rx) = oneshot::channel();
-        a.on_agent_event(AgentEvent::Choice {
-            question: "q".into(),
-            options: vec!["a".into(), "b".into()],
-            reply: tx,
-        });
+        a.on_key(plain(KeyCode::Char('3'))); // the write-your-own row
+        a.on_key(plain(KeyCode::Char('x')));
+        // the arrows must not reach for input history here: the box is
+        // holding an answer, not the next message
+        a.on_key(plain(KeyCode::Up));
+        assert_eq!(a.input, "x");
         a.on_key(plain(KeyCode::Esc));
-        assert_eq!(rx.await.unwrap(), None);
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        assert_eq!(a.input, "draft");
+        a.on_key(plain(KeyCode::Char('1')));
+        assert_eq!(rx.try_recv(), Ok(Some(Answer::Picked("a".into()))));
     }
 
     /// Skip is not no: one carries on without the step, the other stops.
@@ -1521,6 +1726,40 @@ mod tests {
         a.cursor = a.input.chars().count();
         println!();
         for l in screen(&mut a, 100, 24) {
+            println!("{l}");
+        }
+    }
+
+    /// The chooser, both halves of it:
+    /// cargo test choice_preview -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn choice_preview() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut a = app();
+        a.blocks = vec![ChatBlock::User("จัดโครงสร้างโปรเจกต์ใหม่ให้หน่อย".into())];
+        let (tx, _rx) = oneshot::channel();
+        a.on_agent_event(AgentEvent::Choice {
+            question: "โครงสร้างแบบไหนดีครับ".into(),
+            options: vec![
+                "src/routes/todos.ts + src/db.ts, one file per resource".into(),
+                "keep index.ts, move only the handlers to src/handlers/".into(),
+                "controllers / services / models".into(),
+            ],
+            reply: tx,
+        });
+        a.on_key(plain(KeyCode::Down));
+        println!("\npicking:");
+        for l in screen(&mut a, 100, 20) {
+            println!("{l}");
+        }
+        a.on_key(plain(KeyCode::Up));
+        a.on_key(plain(KeyCode::Up));
+        a.on_key(plain(KeyCode::Enter));
+        a.input = "แยกแค่ route ออกไป ที่เหลือไว้เหมือนเดิม".into();
+        a.cursor = a.input.chars().count();
+        println!("\nwriting an answer of their own:");
+        for l in screen(&mut a, 100, 20) {
             println!("{l}");
         }
     }

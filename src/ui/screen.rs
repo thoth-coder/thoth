@@ -34,7 +34,13 @@ impl App {
         // one hint line below it: everything else belongs to the transcript.
         // the @path picker sits between the input and the hints, and is zero
         // rows tall while it is closed
-        let pick_h = self.picker.as_ref().map(|p| p.height()).unwrap_or(0);
+        // and the chooser for a question from the model takes the same rows:
+        // the two are never up at once, a question owns the keys the picker
+        // would want
+        let pick_h = match &self.mode {
+            Mode::Choice { options, .. } => Mode::choice_rows(options) as u16,
+            _ => self.picker.as_ref().map(|p| p.height()).unwrap_or(0),
+        };
         // the input is as tall as the message written in it, up to a third of
         // the screen: past that the transcript it is a reply to matters more
         // split, not lines(): a message ending in a break has an empty last
@@ -134,16 +140,23 @@ impl App {
                 Span::styled("n", theme::key()),
                 Span::styled(" no, stop", theme::muted()),
             ]),
-            Mode::Choice { options, .. } => Line::from(vec![
+            Mode::Choice {
+                typing: Some(_), ..
+            } => Line::from(vec![
                 Span::styled("your call  ", Style::default().fg(theme::BUSY)),
-                Span::styled(
-                    if options.len() > 1 {
-                        format!("1-{}", options.len())
-                    } else {
-                        "1".into()
-                    },
-                    theme::key(),
-                ),
+                Span::styled("type your answer   ", theme::muted()),
+                Span::styled("enter", theme::key()),
+                Span::styled(" send it   ", theme::muted()),
+                Span::styled("esc", theme::key()),
+                Span::styled(" back to the list", theme::muted()),
+            ]),
+            Mode::Choice { .. } => Line::from(vec![
+                Span::styled("your call  ", Style::default().fg(theme::BUSY)),
+                Span::styled("up/down", theme::key()),
+                Span::styled(" move   ", theme::muted()),
+                Span::styled("enter", theme::key()),
+                Span::styled(" take   ", theme::muted()),
+                Span::styled("1-9", theme::key()),
                 Span::styled(" pick   ", theme::muted()),
                 Span::styled("esc", theme::key()),
                 Span::styled(" let it decide", theme::muted()),
@@ -211,6 +224,47 @@ impl App {
                 input_a.x + 2 + cx as u16,
                 input_a.y + cur_row.0 as u16,
             ));
+        }
+
+        // the model's question: one row per option, then the row that opens
+        // the input box for an answer nobody offered
+        if let Mode::Choice {
+            options,
+            sel,
+            typing,
+            ..
+        } = &self.mode
+        {
+            let width = pick_a.width.saturating_sub(6) as usize;
+            let last = options.len();
+            let lines: Vec<Line> = (0..=last)
+                .map(|i| {
+                    let text = if i == last {
+                        match typing {
+                            Some(_) => "something else, type it below".to_string(),
+                            None => "something else (type your own answer)".to_string(),
+                        }
+                    } else {
+                        options[i].clone()
+                    };
+                    let style = if i == *sel {
+                        theme::accent().add_modifier(Modifier::REVERSED)
+                    } else if i == last {
+                        theme::muted()
+                    } else {
+                        theme::accent()
+                    };
+                    Line::from(vec![
+                        Span::styled(
+                            if i == *sel { " > " } else { "   " },
+                            Style::default().fg(theme::BUSY),
+                        ),
+                        Span::styled(format!("{} ", i + 1), theme::muted()),
+                        Span::styled(clip(&text, width), style),
+                    ])
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), pick_a);
         }
 
         // @path picker: one row per candidate, the highlighted one reversed

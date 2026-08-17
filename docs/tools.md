@@ -10,7 +10,7 @@
 | `grep` | regex search over file contents, `context` shows surrounding lines | auto |
 | `problems` | current errors/warnings from the editor (only offered when the VS Code extension is connected) | auto |
 | `todo` | the plan for the task, rewritten as it goes | auto |
-| `ask_user` | put a question with two to nine options to the user and wait for the answer | the answer is the permission |
+| `ask_user` | put a question with two to nine options to the user and wait for the answer, which may be an option or something they wrote themselves | the answer is the permission |
 | `web_search` | web search through DuckDuckGo, no API key needed | auto |
 | `web_fetch` | fetch a URL as readable text | asks per host |
 | `remember` | save a durable fact to project memory | asks first |

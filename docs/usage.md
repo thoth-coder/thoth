@@ -35,7 +35,9 @@
 - `ctrl+o` expands or collapses long tool outputs.
 - `y` / `a` / `s` / `n` answer permission prompts: once, always, skip this
   step and carry on, or no and stop.
-- `1`-`9` pick an option when thoth asks you to choose; `esc` lets it decide.
+- `up` / `down` and `enter` move through thoth's options and take one; `1`-`9`
+  picks one straight off, the last row lets you write your own answer, and
+  `esc` lets thoth decide.
 - `ctrl+c` quits.
 
 ## Slash commands
@@ -95,11 +97,22 @@ nothing to retype.
 ### When thoth asks you to choose
 
 The model can put a question on screen with two to nine options when the task
-has a fork in it that only you can settle. Pick with `1`-`9`. `esc` hands the
-decision back, and the model is told to take whichever option changes the
-least and say which one it took. In `-p` mode there is nobody at the
-keyboard, so the question is printed and answered for you rather than
-hanging.
+has a fork in it that only you can settle. The options are listed under the
+input: `up`/`down` move through them, `enter` takes the highlighted one, and
+`1`-`9` picks one straight off.
+
+The last row is not one of the model's options. It is there for when none of
+them is what you want: take it and the input box opens, you write the answer
+in your own words, and `enter` sends that instead. The model is told plainly
+that you took none of its options, so it does the thing you asked for rather
+than the offer yours sounded closest to. `esc` while writing goes back to the
+list, and anything you had half-typed when the question arrived is put back
+afterwards.
+
+`esc` on the list hands the decision back, and the model is told to take
+whichever option changes the least and say which one it took. In `-p` mode
+there is nobody at the keyboard, so the question is printed and answered for
+you rather than hanging.
 
 ## Editor integration
 

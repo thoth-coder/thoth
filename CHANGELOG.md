@@ -5,6 +5,17 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- The chooser for a question from the model is a list you move through with
+  `up`/`down` and take with `enter`, drawn under the input with the
+  highlighted row marked. `1`-`9` still picks one straight off.
+- Its last row is not one of the model's options: it opens the input box so
+  you can write the answer in your own words when none of them is what you
+  wanted. The model is told plainly that you took none of its options, so it
+  does what you asked rather than the offer yours sounded closest to. `esc`
+  goes back to the list, and a message half-typed when the question arrived
+  is put back afterwards.
+
 ## [0.4.1] - 2026-08-18
 
 ### Added

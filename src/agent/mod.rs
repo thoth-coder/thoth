@@ -116,6 +116,16 @@ impl PermMode {
     }
 }
 
+/// What came back from a question the model asked. Not an index into the
+/// options: the last row of the chooser is the user writing their own answer,
+/// and "none of those, do this instead" has to reach the model as a different
+/// thing from "the second one", or it carries on down a road nobody picked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Picked(String),
+    Wrote(String),
+}
+
 pub enum AgentEvent {
     Reasoning(String),
     Content(String),
@@ -163,7 +173,7 @@ pub enum AgentEvent {
     Choice {
         question: String,
         options: Vec<String>,
-        reply: oneshot::Sender<Option<usize>>,
+        reply: oneshot::Sender<Option<Answer>>,
     },
     /// A user request (possibly queued) started processing.
     TurnStart,
@@ -302,9 +312,15 @@ impl Agent {
             r = rx => r.unwrap_or(None),
         };
         Ok(match picked {
-            Some(i) => format!(
-                "The user chose: {}. Carry on with that, and do not ask again about it.",
-                options[i]
+            Some(Answer::Picked(s)) => {
+                format!("The user chose: {s}. Carry on with that, and do not ask again about it.")
+            }
+            // saying only what they typed would read as one of the options
+            // coming back in the user's own words, and the model would go on
+            // building whichever offer it sounded closest to
+            Some(Answer::Wrote(s)) => format!(
+                "The user took NONE of the options and answered in their own words: {s}. Do that, \
+                 not the nearest thing you offered, and do not ask again about it."
             ),
             None => "The user did not answer. Do not ask again; pick the option that changes \
                      the least, say which one you took and why."
