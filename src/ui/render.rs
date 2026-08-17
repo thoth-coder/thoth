@@ -131,6 +131,24 @@ pub fn render_diff_body(out: &mut Vec<Line<'static>>, text: &str, width: usize) 
             Some('$') => theme::bold(),
             _ => Style::default().fg(theme::BUSY),
         };
+        // a command is the one line here that wraps instead of being cut.
+        // Everything else is code, where the columns mean something and a
+        // wrapped line reads worse than a clipped one; a command is a thing
+        // the user is about to say yes to, and half of it is not enough to
+        // say yes to
+        if l.starts_with('$') {
+            // and it breaks at spaces only: `--test-threads=1` split across
+            // two rows is a command the user cannot read back to themselves
+            let w = textwrap::Options::new(width.saturating_sub(4).max(8))
+                .word_splitter(textwrap::WordSplitter::NoHyphenation);
+            for (n, piece) in textwrap::wrap(&l, w).iter().enumerate() {
+                out.push(Line::from(Span::styled(
+                    format!("  {}{piece}", if n == 0 { "" } else { "  " }),
+                    style,
+                )));
+            }
+            continue;
+        }
         out.push(Line::from(Span::styled(
             format!("  {}", clip(&l, width.saturating_sub(2))),
             style,

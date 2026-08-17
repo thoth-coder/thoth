@@ -1399,7 +1399,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::theme::{PROMPT, RULE};
+    use crate::ui::theme::PROMPT;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn draws_header_rule_and_prompt() {
+    fn draws_header_input_box_and_status() {
         let mut a = app();
         a.ctx_tokens = 15_400;
         a.out_tokens = 820;
@@ -1450,10 +1450,15 @@ mod tests {
         assert!(s[0].contains("qwen3:8b"));
         // the server url is shortened, not printed raw
         assert!(s[0].contains("localhost:11434") && !s[0].contains("http://"));
-        // the input sits between a full-width rule and the status line
-        assert_eq!(s[9], RULE.repeat(80));
-        assert!(s[10].starts_with(PROMPT), "{:?}", s[10]);
-        assert!(s[10].contains("hello"));
+        // the input sits in a box of its own, above the status line
+        assert!(s[8].starts_with('╭') && s[8].ends_with('╮'), "{:?}", s[8]);
+        assert!(s[9].contains(PROMPT.trim()), "{:?}", s[9]);
+        assert!(s[9].contains("hello"));
+        assert!(
+            s[10].starts_with('╰') && s[10].ends_with('╯'),
+            "{:?}",
+            s[10]
+        );
         assert!(s[11].contains("/help"), "{:?}", s[11]);
         assert!(s[11].contains("ctx 15.4k/32.8k (46%)"), "{:?}", s[11]);
         assert!(s[11].contains("out 820"));
@@ -1735,14 +1740,14 @@ mod tests {
         let s2 = screen(&mut b, 80, 14);
         let one = s2.iter().position(|l| l.contains("one")).unwrap();
         assert!(
-            s2[one + 1].is_empty() && !s2[one + 1].contains(RULE),
-            "the new line needs a row of its own: {:?}",
+            s2[one + 1].trim_matches(['│', ' ']).is_empty() && s2[one + 1].starts_with('│'),
+            "the new line needs a row of its own, inside the box: {:?}",
             &s2[one..one + 2]
         );
         let first = s.iter().position(|l| l.contains("first")).unwrap();
-        assert!(s[first].starts_with(PROMPT), "{:?}", s[first]);
+        assert!(s[first].contains(PROMPT.trim()), "{:?}", s[first]);
         assert!(
-            !s[first + 1].starts_with(PROMPT),
+            !s[first + 1].contains(PROMPT.trim()),
             "only the first row carries the mark: {:?}",
             s[first + 1]
         );
@@ -1755,9 +1760,9 @@ mod tests {
         a.mode = Mode::Busy;
         a.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(75));
         let s = screen(&mut a, 80, 12);
-        assert!(s[8].contains("working"), "{:?}", s[8]);
-        assert!(s[8].contains("1m 15s"), "{:?}", s[8]);
-        assert!(s[8].contains("esc to interrupt"));
+        assert!(s[7].contains("working"), "{:?}", s[7]);
+        assert!(s[7].contains("1m 15s"), "{:?}", s[7]);
+        assert!(s[7].contains("esc to interrupt"));
     }
 
     #[test]
@@ -1766,8 +1771,8 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         a.mode = Mode::Perm(tx);
         let s = screen(&mut a, 80, 12);
-        assert!(s[8].contains("permission needed"), "{:?}", s[8]);
-        assert!(s[8].contains("y once") && s[8].contains("a always") && s[8].contains("n no"));
+        assert!(s[7].contains("permission needed"), "{:?}", s[7]);
+        assert!(s[7].contains("y once") && s[7].contains("a always") && s[7].contains("n no"));
     }
 
     #[test]
@@ -1860,9 +1865,57 @@ mod tests {
         a.cursor = 5;
         a.refresh_picker();
         let s = screen(&mut a, 80, 20);
-        assert!(s[10].contains("@src/"), "input line: {:?}", s[10]);
-        assert!(s[11].contains("agent/"), "first candidate: {:?}", s[11]);
+        let input = s.iter().position(|l| l.contains("@src/")).expect("input");
+        // the box closes under the input, and the candidates start below that
+        assert!(s[input + 1].starts_with('╰'), "{:?}", s[input + 1]);
+        assert!(
+            s[input + 2].contains("agent/"),
+            "first candidate: {:?}",
+            s[input + 2]
+        );
         assert!(s[19].contains("/help"), "status moved: {:?}", s[19]);
+    }
+
+    /// A command shown twice is noise, and a command shown by halves is a
+    /// broken promise: the user answers a permission prompt on what is drawn.
+    #[test]
+    fn a_command_is_drawn_once_and_whole() {
+        let short = "bun test";
+        let mut a = app();
+        a.blocks.push(ChatBlock::Tool {
+            name: "shell".into(),
+            summary: short.into(),
+            detail: Some(format!("$ {short}")),
+            result: None,
+        });
+        let s = screen(&mut a, 80, 14);
+        assert_eq!(
+            s.iter().filter(|l| l.contains(short)).count(),
+            1,
+            "once, on the header line: {s:?}"
+        );
+
+        // too long for the header, so the preview comes back, and all of it
+        let long = "cargo test --workspace --all-features -- --nocapture --test-threads=1 \
+                    --skip network";
+        let mut b = app();
+        b.blocks.push(ChatBlock::Tool {
+            name: "shell".into(),
+            summary: long.into(),
+            detail: Some(format!("$ {long}")),
+            result: None,
+        });
+        let s = screen(&mut b, 60, 14);
+        let drawn: String = s
+            .iter()
+            .filter(|l| l.trim_start().starts_with('$') || l.starts_with("    "))
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in long.split_whitespace() {
+            assert!(drawn.contains(word), "{word} is missing from {drawn:?}");
+        }
+        assert!(!drawn.contains('…'), "nothing was cut: {drawn:?}");
     }
 
     #[test]

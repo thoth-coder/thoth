@@ -20,6 +20,9 @@ pub const FENCE: &str = "╌";
 /// screenful of them can be read down the left edge without any of the words:
 /// yellow still going, green done, red failed.
 pub const TOOL: &str = "●";
+/// The corner that ties a result to the call above it. Without it a result
+/// and the next line of prose are both just indented text.
+pub const RESULT: &str = "⎿";
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Startup logo. Every row is the same width, so the ramp below reads as one

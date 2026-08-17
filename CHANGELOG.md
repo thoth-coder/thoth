@@ -20,7 +20,9 @@ All notable changes to thoth are documented here. The format follows
   with made-up contents and prints it as text: the start screen, a session
   mid-task, a permission prompt, the chooser, plan mode, both pickers, the
   four permission modes, the profile screen, and the whole thing at 46
-  columns. `thoth --view` lists them and `--view-size WxH` sets the
+  columns, a turn mid-stream, a scrolled-back transcript, hostile content,
+  markdown, and a chooser with more options than rows to draw them in.
+  `thoth --view` lists them and `--view-size WxH` sets the
   terminal. Screens that only appear after a permission prompt or an
   `ask_user` call were minutes of model time away from being looked at,
   which is where their bugs were living. `cargo test every_view_draws`
@@ -59,8 +61,27 @@ All notable changes to thoth are documented here. The format follows
   the state line keeps the keys.
 - Tabs in tool results and error messages were drawn as a single character,
   so a stack trace lost its indentation.
+- On a narrow terminal the status line dropped "scrolled up" and "selecting"
+  to make room for the token counts, so the two states that explain why the
+  screen has stopped behaving were exactly the ones not shown. They win over
+  the numbers now.
 
 ### Changed
+- The input sits in a box of its own instead of under a rule. It is the one
+  part of the screen written into rather than read, and the border says so;
+  it also carries whether thoth is listening, in the colour, which saves
+  saying it in words somewhere else.
+- A tool's result hangs off the call on a corner (`⎿`) with the rest of it
+  lined up past the corner. A result and the next line of prose were both
+  just indented text before.
+- A shell command is drawn once, not twice: the preview under the call
+  repeated what the header line already said. It comes back the moment the
+  header line is too narrow to hold the whole command, and a command that
+  does not fit now wraps at its spaces instead of being cut, because a
+  permission prompt is answered on what is drawn.
+- The model's question is drawn above the input rather than below it: it is
+  asked before anything is typed, while `@path` completes what is being
+  typed, and the two belong on opposite sides of the box.
 - Markdown markers are obeyed instead of printed: `##` in front of a heading
   is dropped rather than shown next to a heading that is already bold, `-`
   becomes a bullet with the wrapped rest of the item lined up under it, `>`

@@ -59,6 +59,14 @@ pub const VIEWS: &[View] = &[
         about: "the profile screen (thoth config, /config)",
     },
     View {
+        name: "stream",
+        about: "mid-turn: thinking out loud, a half-written reply, a running tool",
+    },
+    View {
+        name: "scroll",
+        about: "a long transcript, scrolled back and at the bottom",
+    },
+    View {
         name: "select",
         about: "the mouse handed back to the terminal (ctrl+t), and a copy",
     },
@@ -97,6 +105,8 @@ pub fn render(name: &str, width: u16, height: u16) -> anyhow::Result<String> {
         "modes" => modes(width, height),
         "narrow" => chat(46, height.max(20)),
         "config" => config(width, height),
+        "stream" => stream(width, height),
+        "scroll" => scroll(width, height),
         "select" => select(width, height),
         "stress" => stress(width, height),
         "markdown" => markdown(width, height),
@@ -241,7 +251,27 @@ fn permission(w: u16, h: u16) -> Vec<Frame> {
         preview: "$ rm -rf build/ && bun run build".into(),
         reply: tx,
     });
-    vec![shot(&mut a, "a command waiting on an answer", w, h)]
+    let short = shot(&mut a, "a command waiting on an answer", w, h);
+
+    // and one too long for the header line. The rule is that the user sees
+    // the whole command before answering, so a clipped summary has to bring
+    // the `$` line back
+    let mut b = app();
+    working(&mut b);
+    let long = "cargo test --workspace --all-features -- --nocapture --test-threads=1 \
+                --skip network 2>&1 | rg -v '^ok'";
+    let (tx, rx) = oneshot::channel();
+    drop(rx);
+    b.on_agent_event(AgentEvent::ToolStart {
+        name: "shell".into(),
+        summary: long.into(),
+    });
+    b.on_agent_event(AgentEvent::Permission {
+        tool: "shell".into(),
+        preview: format!("$ {long}"),
+        reply: tx,
+    });
+    vec![short, shot(&mut b, "one too long for one line", w, h)]
 }
 
 fn choice(w: u16, h: u16) -> Vec<Frame> {
@@ -312,6 +342,53 @@ fn modes(w: u16, h: u16) -> Vec<Frame> {
         out.push(shot(&mut a, m.name(), w, h.min(12)));
     }
     out
+}
+
+/// The three shapes a turn passes through while it is still going, which is
+/// most of the time a user spends looking at thoth and the state with the
+/// fewest tests behind it.
+fn stream(w: u16, h: u16) -> Vec<Frame> {
+    let mut a = app();
+    a.blocks = vec![ChatBlock::User("ทำไม health check ถึง 500".into())];
+    a.set_busy();
+    a.on_agent_event(AgentEvent::Reasoning(
+        "the handler is in src/server.ts\nit awaits db.ping()\nthe pool is not started yet\n\
+         so ping throws and the catch returns 500"
+            .into(),
+    ));
+    let thinking = shot(&mut a, "thinking out loud: the live tail", w, h);
+    a.on_agent_event(AgentEvent::Content(
+        "The handler pings the database before the pool is".into(),
+    ));
+    let writing = shot(&mut a, "a reply arriving a word at a time", w, h);
+    a.on_agent_event(AgentEvent::ToolStart {
+        name: "shell".into(),
+        summary: "bun test src/server.test.ts".into(),
+    });
+    vec![
+        thinking,
+        writing,
+        shot(&mut a, "a tool still running", w, h),
+    ]
+}
+
+/// A transcript longer than the screen, at the bottom and scrolled back.
+fn scroll(w: u16, h: u16) -> Vec<Frame> {
+    let mut a = app();
+    a.blocks = (0..12)
+        .flat_map(|i| {
+            [
+                ChatBlock::User(format!("step {i}")),
+                ChatBlock::Assistant(format!("did step {i}, moving on")),
+            ]
+        })
+        .collect();
+    let bottom = shot(&mut a, "following the bottom", w, h);
+    a.scroll_by(-8);
+    let up = shot(&mut a, "scrolled back eight rows", w, h);
+    // past the top: it must stop there rather than run off into blank rows
+    a.scroll_by(-500);
+    vec![bottom, up, shot(&mut a, "scrolled past the top", w, h)]
 }
 
 /// What the screen says while the terminal has the mouse, which is the part

@@ -10,12 +10,12 @@ use crate::ui::render::{
     short_url, wrap_into,
 };
 use crate::ui::theme;
-use crate::ui::theme::{PROMPT, RULE, SPINNER, TOOL};
+use crate::ui::theme::{PROMPT, RESULT, SPINNER, TOOL};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Margin, Position};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 /// Rows the input may grow to before it scrolls instead. A message longer
@@ -40,34 +40,36 @@ impl App {
         let input_h = (self.input.split('\n').count().max(1) as u16)
             .min((f.area().height / 3).max(1))
             .min(INPUT_MAX_ROWS);
-        // whatever it wants, it cannot have the rest of the screen: the four
-        // fixed rows and the input come first, and at least one row of
-        // transcript stays, or the question is offering choices to someone
-        // who can no longer see what was asked
-        let room = f.area().height.saturating_sub(5 + input_h).max(1);
-        // between the input and the hints sit the rows that offer something to
-        // take, zero of them most of the time: the @path picker, or the
-        // chooser for a question from the model. Never both, because a
-        // question owns every key the picker would want
-        let pick_h = match &self.mode {
+        // whatever it wants, it cannot have the rest of the screen: the fixed
+        // rows and the input come first, and at least one row of transcript
+        // stays, or the question is offering choices to someone who can no
+        // longer see what was asked
+        let room = f.area().height.saturating_sub(6 + input_h).max(1);
+        // two sets of rows that offer something to take, zero of them most of
+        // the time. They sit on opposite sides of the input because they mean
+        // opposite things: the model's question is asked before anything is
+        // typed, and `@path` completes what is being typed right now. Never
+        // both at once, because a question owns every key the picker wants
+        let ask_h = match &self.mode {
             Mode::Choice { options, .. } => (Mode::choice_rows(options) as u16).min(room),
-            _ => self
-                .picker
-                .as_ref()
-                .map(|p| p.height().min(room))
-                .unwrap_or(0),
+            _ => 0,
         };
+        let pick_h = self
+            .picker
+            .as_ref()
+            .map(|p| p.height().min(room.saturating_sub(ask_h).max(1)))
+            .unwrap_or(0);
         // and with the height known, the highlighted row is brought into it
         if let Mode::Choice { sel, top, .. } = &mut self.mode {
-            let rows = pick_h as usize;
+            let rows = ask_h as usize;
             *top = (*top).min(*sel).max((*sel + 1).saturating_sub(rows));
         }
-        let [header_a, chat_a, state_a, rule_a, input_a, pick_a, status_a] = Layout::vertical([
+        let [header_a, chat_a, state_a, ask_a, box_a, pick_a, status_a] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(input_h),
+            Constraint::Length(ask_h),
+            Constraint::Length(input_h + 2),
             Constraint::Length(pick_h),
             Constraint::Length(1),
         ])
@@ -200,19 +202,29 @@ impl App {
         };
         f.render_widget(Paragraph::new(state), state_a);
 
-        // a single rule instead of a box: less chrome, more transcript
+        // the input sits in a box of its own. It is the one part of the
+        // screen the user writes into rather than reads, and a line drawn
+        // round it says so at a glance; the border also carries whether thoth
+        // is listening, which saves saying it in words anywhere else
+        let listening = matches!(self.mode, Mode::Input);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                RULE.repeat(rule_a.width as usize),
-                theme::muted(),
-            ))),
-            rule_a,
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(if listening {
+                    theme::accent()
+                } else {
+                    theme::muted()
+                }),
+            box_a,
         );
+        // a column of air inside the border on each side: the prompt mark
+        // touching the box reads as part of it
+        let input_a = box_a.inner(Margin::new(2, 1));
 
         // input: one row per typed line, scrolled so the row the cursor is
         // on is always among them
         let avail = input_a.width.saturating_sub(3) as usize;
-        let style = if matches!(self.mode, Mode::Input) {
+        let style = if listening {
             Style::default()
         } else {
             theme::muted()
@@ -253,9 +265,9 @@ impl App {
             ..
         } = &self.mode
         {
-            let width = pick_a.width.saturating_sub(7) as usize;
+            let width = ask_a.width.saturating_sub(7) as usize;
             let write_row = options.len();
-            let shown = (*top + pick_h as usize).min(write_row + 1);
+            let shown = (*top + ask_h as usize).min(write_row + 1);
             let lines: Vec<Line> = (*top..shown)
                 .map(|i| {
                     let text = if i == write_row {
@@ -296,7 +308,7 @@ impl App {
                     ])
                 })
                 .collect();
-            f.render_widget(Paragraph::new(Text::from(lines)), pick_a);
+            f.render_widget(Paragraph::new(Text::from(lines)), ask_a);
         }
 
         // @path picker: one row per candidate, the highlighted one reversed
@@ -351,18 +363,25 @@ impl App {
             f.render_widget(Paragraph::new(Text::from(lines)), pick_a);
         }
 
-        // status: hints on the left, live numbers and editor file on the right
-        let left_text = if !self.mouse {
-            // the wheel has stopped working and the user has to know why:
-            // this is the one state where the hints are not the useful thing
-            "selecting: drag and copy as usual  ·  ctrl+t gives the wheel back".to_string()
+        // status: hints on the left, live numbers and editor file on the right.
+        // Two of the three things the left can say are not hints at all but
+        // the answer to "why has this stopped behaving": they are worth the
+        // row even when the numbers are not
+        let (left_text, state) = if !self.mouse {
+            (
+                "selecting: drag and copy as usual  ·  ctrl+t gives the wheel back".to_string(),
+                true,
+            )
         } else if self.scroll.is_some() {
-            "scrolled up  ·  pgdn for the latest".to_string()
+            ("scrolled up  ·  pgdn for the latest".to_string(), true)
         } else {
-            format!(
-                "/help  ·  shift+tab {}  ·  ctrl+o {}",
-                self.perm_mode.name(),
-                if self.expanded { "collapse" } else { "expand" }
+            (
+                format!(
+                    "/help  ·  shift+tab {}  ·  ctrl+o {}",
+                    self.perm_mode.name(),
+                    if self.expanded { "collapse" } else { "expand" }
+                ),
+                false,
             )
         };
         let mut right_parts: Vec<String> = Vec::new();
@@ -386,9 +405,16 @@ impl App {
             // same way any other file's contents do
             right_parts.push(printable(s));
         }
-        let right = right_parts.join("  ·  ");
-        // the right side (tokens + editor file) wins over the key hints
+        // the numbers win over the key hints, and lose to a state: a user who
+        // cannot see they are scrolled up watches an empty screen and waits
         let w = status_a.width as usize;
+        while state
+            && !right_parts.is_empty()
+            && left_text.chars().count() + right_parts.join("  ·  ").chars().count() + 2 > w
+        {
+            right_parts.pop();
+        }
+        let right = right_parts.join("  ·  ");
         let (left, pad) = if left_text.chars().count() + right.chars().count() + 2 > w {
             (String::new(), w.saturating_sub(right.chars().count()))
         } else {
@@ -618,28 +644,54 @@ impl App {
                     Some(_) => Style::default().fg(theme::ADDED),
                     None => Style::default().fg(theme::BUSY),
                 };
+                let head = printable(summary);
+                let room = width.saturating_sub(name.len() + 4);
+                let shown = clip(&head, room);
                 out.push(Line::from(vec![
                     Span::styled(format!("{TOOL} "), dot),
                     Span::styled(name.clone(), theme::accent().add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
-                    Span::styled(
-                        clip(&printable(summary), width.saturating_sub(name.len() + 4)),
-                        dim,
-                    ),
+                    Span::styled(shown.clone(), dim),
                 ]));
                 if let Some(d) = detail {
-                    render_diff_body(out, d, width);
+                    // a shell call's preview is the command, which is already
+                    // on the line above. Printing it twice is noise, but only
+                    // dropping it when the line above really is the whole of
+                    // it: a clipped summary is not the command line the user
+                    // was promised they would see
+                    let echo = shown == head && *d == format!("$ {head}");
+                    if !echo {
+                        render_diff_body(out, d, width);
+                    }
                 }
+                // what came back hangs off the call on a corner, and the rest
+                // of it lines up past that corner: a result and the next line
+                // of prose are otherwise both just indented text
+                let tie = |out: &mut Vec<Line<'static>>, first: bool, text: String, s: Style| {
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            if first {
+                                format!("  {RESULT} ")
+                            } else {
+                                "    ".into()
+                            },
+                            dim,
+                        ),
+                        Span::styled(clip(&printable(&text), width.saturating_sub(4)), s),
+                    ]));
+                };
                 match result {
                     // a call with a permission prompt open has not run and
                     // may never run: this is the block being asked about, and
                     // saying "running" under it is thoth claiming to have
                     // done the thing it is standing there asking permission for
-                    None if waiting => out.push(Line::from(Span::styled(
-                        "  waiting for your answer",
+                    None if waiting => tie(
+                        out,
+                        true,
+                        "waiting for your answer".into(),
                         Style::default().fg(theme::BUSY),
-                    ))),
-                    None => out.push(Line::from(Span::styled("  running", dim))),
+                    ),
+                    None => tie(out, true, "running".into(), dim),
                     Some((content, is_error)) => {
                         let style = if *is_error { red } else { dim };
                         let lines: Vec<&str> = content.lines().collect();
@@ -648,17 +700,16 @@ impl App {
                         } else {
                             RESULT_PREVIEW_LINES
                         };
-                        for l in lines.iter().take(shown) {
-                            out.push(Line::from(Span::styled(
-                                format!("  {}", clip(&printable(l), width.saturating_sub(2))),
-                                style,
-                            )));
+                        for (i, l) in lines.iter().take(shown).enumerate() {
+                            tie(out, i == 0, (*l).to_string(), style);
                         }
                         if lines.len() > shown {
-                            out.push(Line::from(Span::styled(
-                                format!("  +{} more lines  ctrl+o", lines.len() - shown),
+                            tie(
+                                out,
+                                lines.is_empty(),
+                                format!("+{} more lines  ctrl+o", lines.len() - shown),
                                 dim_italic,
-                            )));
+                            );
                         }
                     }
                 }
