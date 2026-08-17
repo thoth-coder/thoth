@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-18
+
 ### Added
 - Copying text out. `ctrl+y` (or `/copy`) puts the last reply on the
   clipboard and `/copy all` the whole conversation; thoth asks the terminal
@@ -560,6 +562,7 @@ All notable changes to thoth are documented here. The format follows
   targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
   with install/uninstall scripts for curl | sh and irm | iex.
 
+[0.4.2]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.2
 [0.4.1]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.1
 [0.4.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.0
 [0.3.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.3.0
