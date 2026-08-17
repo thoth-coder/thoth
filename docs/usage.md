@@ -29,8 +29,16 @@
   idle.
 - `up` / `down` move in the picker, then between the lines of a multi-line
   message, and through input history when there is only one line.
-- Mouse wheel, `pgup` / `pgdn` scroll the transcript. Hold `shift` while
-  dragging to select text.
+- Mouse wheel, `pgup` / `pgdn` scroll the transcript.
+- `ctrl+y` copies the last reply to the clipboard. thoth asks the terminal to
+  do the copying (OSC 52), which works over ssh and inside tmux and needs no
+  clipboard program; a terminal that does not answer it copies nothing and
+  says nothing, so if the paste comes up empty, use `ctrl+t` instead.
+- `ctrl+t` hands the mouse back to the terminal, so click-and-drag selects
+  text the way it does everywhere else and your usual copy key works. The
+  scroll wheel belongs to the terminal while this is on; `ctrl+t` again gives
+  it back to thoth. `shift` while dragging does the same thing without the
+  key, in the terminals that support it.
 - `shift+tab` cycles how much thoth asks before it acts. The current mode is
   in the status line.
 - `ctrl+o` expands or collapses long tool outputs.
@@ -47,6 +55,7 @@
 |---|---|
 | `/config` | edit the config profiles and switch between them (`/cfg`) |
 | `/undo` | put back the files the last request changed, `/undo list` shows what is there |
+| `/copy` | copy the last reply to the clipboard, `/copy all` the whole conversation |
 | `/clear` | reset the conversation (the system prompt is rebuilt) |
 | `/compact` | summarize the conversation to free context space |
 | `/recap` | load the previous session's summary into context |

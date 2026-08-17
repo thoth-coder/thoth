@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod config;
 pub mod demo;
 pub mod input;
@@ -38,6 +39,7 @@ const HELP: &str = "commands:
   /memory        show project memory (/memory clear to wipe)
   /config        edit the config profiles and switch between them (/cfg)
   /undo          put back the files the last request changed (/undo list)
+  /copy          copy the last reply to the clipboard (/copy all: everything)
   /allow         tools always allowed here (/allow reset to clear)
   /mode          how much thoth asks: manual, accept edits, auto, plan
   /plan          short for /mode plan
@@ -60,12 +62,15 @@ keys:
                  otherwise input history
   mouse wheel / pgup / pgdn   scroll transcript
   ctrl+o         expand / collapse long tool outputs
+  ctrl+y         copy the last reply to the clipboard
+  ctrl+t         hand the mouse to the terminal so you can select and copy
+                 text yourself; ctrl+t again gives thoth the wheel back
   ctrl+c         quit
 answering:
   y / a / s / n  permission: once / always / skip it / no, stop
   up/down enter  move through thoth's options and take one (1-9 picks directly)
   last row       none of them: write your own answer instead (esc goes back)
-tips: hold shift while dragging to select text with the mouse
+tips: shift while dragging selects text in most terminals; ctrl+t works in all
       start thoth with --continue to resume this project's last conversation";
 
 /// Rows the `@path` picker may take from the transcript.
@@ -203,6 +208,11 @@ struct App {
     window: Option<u32>,
     /// Show tool outputs in full instead of a short preview (ctrl+o).
     expanded: bool,
+    /// Whether thoth is taking the mouse. It wants it for the scroll wheel,
+    /// but taking it is also what stops the terminal's own click-and-drag
+    /// selection, so `ctrl+t` hands it back for as long as the user is
+    /// selecting something.
+    mouse: bool,
     /// Wrapped-line cache for all blocks except the last (see ensure_cache).
     cache: Vec<Line<'static>>,
     cached_blocks: usize,
@@ -339,6 +349,7 @@ impl App {
     ) -> Self {
         Self {
             perm_mode: PermMode::default(),
+            mouse: true,
             model: session.model,
             base_url: session.base_url,
             profile: session.profile,
@@ -580,6 +591,8 @@ impl App {
                 self.expanded = !self.expanded;
                 self.invalidate_cache();
             }
+            KeyCode::Char('t') if ctrl => self.toggle_mouse(),
+            KeyCode::Char('y') if ctrl => self.copy_out(false),
             KeyCode::Esc => {
                 if matches!(self.mode, Mode::Busy) {
                     self.cancel();
@@ -947,6 +960,96 @@ impl App {
         let _ = reply.send(answer);
     }
 
+    /// Hands the mouse to the terminal and takes it back. thoth wants it for
+    /// the scroll wheel; the terminal wants it to let the user drag out a
+    /// selection, and only one of them can have it.
+    fn toggle_mouse(&mut self) {
+        let want = !self.mouse;
+        let mut out = std::io::stdout();
+        let done = if want {
+            execute!(out, EnableMouseCapture)
+        } else {
+            execute!(out, DisableMouseCapture)
+        };
+        if done.is_err() {
+            // the flag is what the status line promises the user, so it only
+            // moves once the terminal has actually agreed
+            self.blocks
+                .push(ChatBlock::Error("the terminal kept the mouse".into()));
+            return;
+        }
+        self.mouse = want;
+        self.blocks.push(ChatBlock::Info(
+            if want {
+                "mouse back to thoth: the wheel scrolls again"
+            } else {
+                "select with the mouse and copy the way you always do. ctrl+t when you are done"
+            }
+            .into(),
+        ));
+    }
+
+    /// The last reply, or the whole conversation, onto the clipboard.
+    fn copy_out(&mut self, all: bool) {
+        let text = self.as_text(all);
+        if text.is_empty() {
+            self.blocks
+                .push(ChatBlock::Info("nothing to copy yet".into()));
+            return;
+        }
+        let lines = text.lines().count();
+        self.blocks.push(match clipboard::copy(&text) {
+            Err(e) => ChatBlock::Error(format!("could not copy: {e}")),
+            Ok(false) => ChatBlock::Info(format!(
+                "copied the first {} characters of {lines} lines: the rest is more than a \
+                 terminal will take at once",
+                clipboard::MAX_COPY_CHARS
+            )),
+            // it is the terminal that does the copying, and a terminal that
+            // does not answer OSC 52 says nothing about it either way. Better
+            // to name the way out than to claim a copy that may not have
+            // happened
+            Ok(true) => ChatBlock::Info(format!(
+                "copied {lines} line(s). If nothing landed, this terminal does not take OSC 52: \
+                 ctrl+t and select it by hand"
+            )),
+        });
+    }
+
+    /// The transcript as plain text. Reasoning is left out: it is thoth
+    /// thinking out loud, not part of the answer anyone wants to paste.
+    fn as_text(&self, all: bool) -> String {
+        let mut out: Vec<String> = Vec::new();
+        for b in &self.blocks {
+            let piece = match b {
+                ChatBlock::Banner | ChatBlock::Reasoning(_) => continue,
+                ChatBlock::User(t) => format!("> {t}"),
+                ChatBlock::Assistant(t) => t.clone(),
+                ChatBlock::Tool {
+                    name,
+                    summary,
+                    result,
+                    ..
+                } => {
+                    let body = result.as_ref().map(|(c, _)| c.as_str()).unwrap_or("");
+                    format!("[{name} {summary}]\n{body}").trim_end().to_string()
+                }
+                ChatBlock::Diff(t) | ChatBlock::Info(t) | ChatBlock::Error(t) => t.clone(),
+            };
+            if piece.trim().is_empty() {
+                continue;
+            }
+            if all {
+                out.push(piece);
+            } else if matches!(b, ChatBlock::Assistant(_)) {
+                // not the last block: the last *reply*, which a note or a
+                // tool result after it does not stop being
+                out = vec![piece];
+            }
+        }
+        out.join("\n\n")
+    }
+
     /// A request thoth sends on the user's behalf: it goes in the transcript
     /// like anything they typed, because it is a turn they will be charged
     /// for and have to read.
@@ -1075,6 +1178,7 @@ impl App {
                 });
                 self.scroll = None;
             }
+            "copy" => self.copy_out(arg == "all"),
             "compact" => {
                 self.set_busy();
                 let _ = self.cmd_tx.send(AgentCmd::Compact);
@@ -1485,6 +1589,45 @@ mod tests {
         a.on_key(plain(KeyCode::Enter));
         assert_eq!(rx.await.unwrap(), Some(Answer::Wrote("one file".into())));
         assert_eq!(a.input, "draft", "and the draft comes back afterwards");
+    }
+
+    /// What lands on the clipboard: the last reply on its own, or the
+    /// conversation without the thinking-out-loud in it.
+    #[test]
+    fn copying_takes_the_reply_and_not_the_furniture() {
+        let mut a = app();
+        a.blocks = vec![
+            ChatBlock::Banner,
+            ChatBlock::User("add a health check".into()),
+            ChatBlock::Reasoning("looking at the routes".into()),
+            ChatBlock::Assistant("first".into()),
+            ChatBlock::Assistant("Added `/healthz`.".into()),
+            ChatBlock::Tool {
+                name: "shell".into(),
+                summary: "bun test".into(),
+                detail: None,
+                result: Some(("2 pass".into(), false)),
+            },
+            ChatBlock::Info("note: nothing was built".into()),
+        ];
+        // the last reply, not the last block: a note printed after it does
+        // not stop the reply being the thing worth pasting
+        assert_eq!(a.as_text(false), "Added `/healthz`.");
+
+        let all = a.as_text(true);
+        assert!(all.starts_with("> add a health check"), "{all}");
+        assert!(all.contains("[shell bun test]\n2 pass"), "{all}");
+        assert!(all.contains("note: nothing was built"), "{all}");
+        assert!(!all.contains("looking at the routes"), "thinking: {all}");
+        assert!(!all.contains("thoth v"), "no banner: {all}");
+
+        // and with nothing said, it says so instead of copying an empty line
+        a.blocks = vec![ChatBlock::Banner];
+        assert_eq!(a.as_text(false), "");
+        a.copy_out(false);
+        assert!(
+            matches!(a.blocks.last(), Some(ChatBlock::Info(t)) if t.contains("nothing to copy"))
+        );
     }
 
     /// Nine options and the row after them want ten rows. A short terminal

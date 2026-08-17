@@ -17,6 +17,64 @@ pub struct ShellArgs {
     pub timeout_secs: Option<u64>,
 }
 
+/// What to hand the shell so it writes to the pipe and nowhere else.
+///
+/// Redirecting stdout and stderr is not enough on Windows. A console program
+/// inherits its parent's console and can draw on it through the console api,
+/// which is how `Write-Progress`, `Invoke-WebRequest`'s progress bar and any
+/// coloured `Write-Host` land on top of thoth's interface, and how a child
+/// that changes the console mode takes the terminal's escape handling with
+/// it. CREATE_NO_WINDOW gives the child no console at all: the pipes still
+/// carry everything it means for us, and it has nothing to scribble on.
+fn own_console(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        // tokio's Command carries creation_flags itself
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// The same for the background spawn, which uses the blocking Command.
+fn own_console_std(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// The command as the shell will be given it. On Windows that means one
+/// statement in front of it: PowerShell 5.1 writes its output in the console
+/// codepage, so anything past ascii arrives as mojibake through a pipe, and
+/// `[Console]::OutputEncoding` is the setting that decides it. What the user
+/// sees in the UI is still their own command; this is the encoding the pipe
+/// is read with, not a change to what runs.
+fn shell_argv(command: &str) -> (&'static str, Vec<String>) {
+    if cfg!(windows) {
+        (
+            "powershell",
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {command}"),
+            ],
+        )
+    } else {
+        ("sh", vec!["-c".into(), command.into()])
+    }
+}
+
 /// Spawns a detached process whose output goes to a log file, so servers and
 /// watchers don't block the agent.
 fn run_background(command: &str) -> Result<String> {
@@ -28,15 +86,10 @@ fn run_background(command: &str) -> Result<String> {
     let log = std::env::temp_dir().join(format!("thoth-bg-{ts}.log"));
     let out = std::fs::File::create(&log).context("cannot create log file")?;
     let err = out.try_clone().context("cannot clone log handle")?;
-    let mut c = if cfg!(windows) {
-        let mut c = Command::new("powershell");
-        c.args(["-NoProfile", "-Command", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
+    let (program, args) = shell_argv(command);
+    let mut c = Command::new(program);
+    c.args(args);
+    own_console_std(&mut c);
     let child = c
         .stdin(StdStdio::null())
         .stdout(out)
@@ -124,15 +177,10 @@ pub async fn run(a: ShellArgs, cancel: CancellationToken) -> Result<String> {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS),
     );
-    let mut cmd = if cfg!(windows) {
-        let mut c = tokio::process::Command::new("powershell");
-        c.args(["-NoProfile", "-Command", &a.command]);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("sh");
-        c.args(["-c", &a.command]);
-        c
-    };
+    let (program, args) = shell_argv(&a.command);
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    own_console(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

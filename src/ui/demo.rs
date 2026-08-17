@@ -59,6 +59,10 @@ pub const VIEWS: &[View] = &[
         about: "the profile screen (thoth config, /config)",
     },
     View {
+        name: "select",
+        about: "the mouse handed back to the terminal (ctrl+t), and a copy",
+    },
+    View {
         name: "stress",
         about: "content that fights the renderer: wide chars, tabs, escapes, no spaces",
     },
@@ -93,6 +97,7 @@ pub fn render(name: &str, width: u16, height: u16) -> anyhow::Result<String> {
         "modes" => modes(width, height),
         "narrow" => chat(46, height.max(20)),
         "config" => config(width, height),
+        "select" => select(width, height),
         "stress" => stress(width, height),
         "markdown" => markdown(width, height),
         "nine" => nine(width, height),
@@ -307,6 +312,30 @@ fn modes(w: u16, h: u16) -> Vec<Frame> {
         out.push(shot(&mut a, m.name(), w, h.min(12)));
     }
     out
+}
+
+/// What the screen says while the terminal has the mouse, which is the part
+/// worth looking at: the wheel has stopped and the user has to be told why.
+///
+/// The flag is set rather than ctrl+t pressed. Pressing it would ask a real
+/// terminal to give the mouse up, and there is no terminal behind a view: the
+/// request would fail, and the view would show the failure instead of the
+/// screen it exists to show.
+fn select(w: u16, h: u16) -> Vec<Frame> {
+    let mut a = app();
+    working(&mut a);
+    a.mouse = false;
+    a.blocks.push(ChatBlock::Info(
+        "select with the mouse and copy the way you always do. ctrl+t when you are done".into(),
+    ));
+    let off = shot(&mut a, "the terminal has the mouse", w, h);
+    a.mouse = true;
+    a.blocks
+        .push(ChatBlock::Info("copied 12 line(s)".to_string()));
+    vec![
+        off,
+        shot(&mut a, "and thoth has it back, after a copy", w, h),
+    ]
 }
 
 /// Everything that has ever made a terminal draw the wrong thing, in one

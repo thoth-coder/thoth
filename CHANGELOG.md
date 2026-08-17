@@ -6,6 +6,12 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Copying text out. `ctrl+y` (or `/copy`) puts the last reply on the
+  clipboard and `/copy all` the whole conversation; thoth asks the terminal
+  to do it with OSC 52, so it works over ssh and inside tmux and pulls in no
+  clipboard library. `ctrl+t` hands the mouse back to the terminal so
+  click-and-drag selects text the way it does in every other program, and
+  `ctrl+t` again gives thoth the scroll wheel.
 - Slash commands complete as you type them. A `/` at the start of the
   message opens the list, with what each command does beside it, narrowing
   with every letter; `tab` or `enter` takes the highlighted one. It is the
@@ -21,6 +27,19 @@ All notable changes to thoth are documented here. The format follows
   renders all of them at two sizes.
 
 ### Fixed
+- A shell command could draw on top of the interface on Windows. Redirecting
+  stdout and stderr is not enough there: a console program inherits its
+  parent's console and can write to it through the console api, which is what
+  `Write-Progress`, `Invoke-WebRequest`'s progress bar and a coloured
+  `Write-Host` do, and a child that changes the console mode takes the
+  terminal's escape handling with it. Commands now run with no console of
+  their own.
+- PowerShell wrote its output in the console codepage, so anything past ascii
+  came back through the pipe as mojibake: Thai, Japanese and accented text in
+  a command's output was unreadable, to the user and to the model both. The
+  pipe is UTF-8 now. Commands also run `-NonInteractive`, so one that would
+  have asked a question fails instead of waiting for an answer nobody can
+  give.
 - Escape sequences from tool output reached the terminal. `cargo test`,
   `git` and `npm` emit colour the moment they think a terminal is listening
   and the shell tool captures it verbatim, so a `\x1b[31m` in a result

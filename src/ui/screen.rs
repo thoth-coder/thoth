@@ -352,7 +352,11 @@ impl App {
         }
 
         // status: hints on the left, live numbers and editor file on the right
-        let left_text = if self.scroll.is_some() {
+        let left_text = if !self.mouse {
+            // the wheel has stopped working and the user has to know why:
+            // this is the one state where the hints are not the useful thing
+            "selecting: drag and copy as usual  ·  ctrl+t gives the wheel back".to_string()
+        } else if self.scroll.is_some() {
             "scrolled up  ·  pgdn for the latest".to_string()
         } else {
             format!(

@@ -134,7 +134,7 @@ pub fn complete_commands(frag: &str) -> Vec<(String, String)> {
 /// does in a few words. A test holds this against the help text, so a command
 /// added to one and not the other fails the build rather than going missing
 /// from completion.
-pub const COMMANDS: [(&str, &str); 16] = [
+pub const COMMANDS: [(&str, &str); 17] = [
     ("help", "show this help"),
     ("clear", "clear the screen and the conversation"),
     ("compact", "summarize the conversation to free context"),
@@ -142,6 +142,7 @@ pub const COMMANDS: [(&str, &str); 16] = [
     ("memory", "show project memory"),
     ("config", "edit the config profiles"),
     ("undo", "put back the files the last request changed"),
+    ("copy", "copy the last reply to the clipboard"),
     ("allow", "tools always allowed here"),
     ("mode", "how much thoth asks before acting"),
     ("plan", "short for /mode plan"),

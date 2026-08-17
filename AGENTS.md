@@ -87,6 +87,9 @@ along those lines needs no new `pub`.
   without any of them being made public. `ui/render.rs` turns text into
   styled lines (markdown, diffs, wrapping), `ui/theme.rs` holds colors and
   glyphs, `ui/input.rs` handles `@path` attachments and completion.
+- `ui/clipboard.rs`: OSC 52, so the terminal does the copying and thoth
+  carries no clipboard library and no platform code. `ctrl+t` (mouse capture
+  off) is the way out for terminals that ignore it.
 - `ui/demo.rs`: fake sessions for every screen, printed by `thoth --view
   <name>` in a debug build. A screen that only appears after a permission
   prompt, an `ask_user` call or a plan-mode turn is otherwise minutes of
