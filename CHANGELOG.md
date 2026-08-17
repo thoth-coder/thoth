@@ -5,6 +5,33 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- thoth knows what checks a project, per stack, and says so. TypeScript,
+  JavaScript, Rust, Go, PHP, Python, Ruby, C#, C/C++ and Java/Kotlin each
+  have a row in a new table naming the command that checks the whole project
+  without running it, so the prompt can name it instead of leaving the model
+  to guess from whichever ecosystem it saw most of. Supporting another
+  language is adding a row.
+- The same table says whether running the code already was that check. For a
+  compiler it is; for TypeScript, JavaScript, PHP, Python and Ruby it is not,
+  and the prompt says so where it applies: a server that starts and answers
+  every request the test made can still be broken in every line that did not
+  execute. That case satisfied every existing rule about checking your work,
+  which is how a Bun API shipped with six type errors and a clean report.
+- A note after a request that changed code of one of those stacks and never
+  checked it. The existing "files changed and nothing was run" note cannot
+  catch this one, because something was run.
+
+### Changed
+- Errors are fixed from the checker's output now, not from reading the
+  source: never fix an error you have not read, run the command, fix exactly
+  what it printed, run it again.
+- "Restructure this", "split it up", "do it properly" with no target layout
+  named is called out as a fork for `ask_user`, with the worked example to
+  match. Several structures are right, the project cannot say which one was
+  meant, and the old rule stated the case too abstractly for a small model
+  to recognise it.
+
 ## [0.4.0] - 2026-08-17
 
 ### Added

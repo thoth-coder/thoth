@@ -1,7 +1,9 @@
 pub mod prompt;
 pub mod session;
+pub mod stack;
 pub mod undo;
 
+use crate::agent::stack::Stack;
 use crate::client::{Client, Message, StreamEvent, ToolCall, Usage};
 use crate::tools;
 use anyhow::{Result, anyhow, bail};
@@ -381,6 +383,44 @@ impl Agent {
         })
     }
 
+    /// Which of this project's stacks a call changed a file of, when running
+    /// that file would not have checked it. Every compiled stack fails loudly
+    /// on its own, so it is not in the answer: rustc refuses to emit, dotnet
+    /// refuses to build. The rest hand back a program that starts, answers the
+    /// one request the test made, and is wrong everywhere else, and the
+    /// "nothing was run" note cannot see it because something *was* run.
+    fn changed_unchecked<'a>(tc: &ToolCall, stacks: &[&'a Stack]) -> Option<&'a Stack> {
+        if !tools::changes_files(&tc.function.name) {
+            return None;
+        }
+        let args = serde_json::from_str::<Value>(&tc.function.arguments).ok()?;
+        let paths = ["path", "to"]
+            .iter()
+            .filter_map(|k| args.get(*k).and_then(|v| v.as_str()));
+        let mut owners = paths.flat_map(|p| {
+            stacks
+                .iter()
+                .filter(move |s| !s.run_checks && s.owns(p))
+                .copied()
+        });
+        owners.next()
+    }
+
+    /// Whether a shell call ran one of this project's checks. The words that
+    /// count are the stack's own, out of the same table the prompt reads.
+    fn ran_a_check(tc: &ToolCall, stacks: &[&Stack]) -> bool {
+        if tc.function.name != "shell" {
+            return false;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(&tc.function.arguments) else {
+            return false;
+        };
+        let Some(cmd) = args.get("command").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        stacks.iter().any(|s| s.checked_by(cmd))
+    }
+
     /// Whether the running mode answers the permission question by itself.
     /// Auto answers it for everything; accept-edits only for changes to
     /// files, which are the ones with a diff shown and an undo behind them.
@@ -741,6 +781,11 @@ impl Agent {
         self.call_counts.clear();
         // what this request actually did, for the note at the end of it
         let (mut changed_files, mut ran_command) = (false, false);
+        // the stacks are read once for the request: a check is a fact about
+        // the project, and the project does not change kind mid-turn
+        let stacks = stack::here();
+        let mut unchecked: Option<&Stack> = None;
+        let mut checked = false;
         self.denied = 0;
         let mut compact_pending = false;
         let mut truncations = 0u32;
@@ -866,6 +911,16 @@ impl Agent {
                          above about it building or passing was not checked here"
                             .into(),
                     ));
+                } else if let Some(s) = unchecked.filter(|_| !checked) {
+                    // the harder half of the same lie: something did run, so
+                    // the note above stays quiet, and the model has watched
+                    // its own program answer a request. None of that looked at
+                    // the code it did not reach
+                    self.send(AgentEvent::Info(format!(
+                        "note: {} changed and none of it was checked this request. Running it is \
+                         not the check here, {}",
+                        s.name, s.because
+                    )));
                 }
                 // "closing the server now" and then stopping leaves it
                 // holding the port for the rest of the day. Whether it is
@@ -953,6 +1008,8 @@ impl Agent {
                     self.forget_reads_of(tc);
                     changed_files |= Self::changed_code(tc);
                     ran_command |= tc.function.name == "shell";
+                    unchecked = unchecked.or_else(|| Self::changed_unchecked(tc, &stacks));
+                    checked |= Self::ran_a_check(tc, &stacks);
                 }
             }
             if token.is_cancelled() {
@@ -1413,6 +1470,67 @@ mod tests {
             "{\"path\":\"notes\"}"
         )));
         assert!(!Agent::changed_code(&call("shell", "{\"command\":\"ls\"}")));
+    }
+
+    /// A stack whose runtime does not check it needs its own pair, because
+    /// the note they feed fires in the case the one above cannot see: a
+    /// command did run, it just was not a check. Which words count is the
+    /// table's business, not this loop's; what is tested here is that the
+    /// loop asks it about the right stacks and the right calls.
+    #[test]
+    fn a_check_is_recognised_and_running_the_file_is_not() {
+        let call = |name: &str, args: &str| ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+        };
+        let cmd = |c: &str| {
+            call(
+                "shell",
+                &format!("{{\"command\":{}}}", serde_json::json!(c)),
+            )
+        };
+        let listing =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| (*s).to_string()).collect() };
+        let ts = stack::detect(&listing(&["tsconfig.json", "package.json"]));
+        let rust = stack::detect(&listing(&["Cargo.toml"]));
+
+        let changed =
+            |tc: &ToolCall, st: &[&'static Stack]| Agent::changed_unchecked(tc, st).map(|s| s.name);
+        assert_eq!(
+            changed(&call("write_file", "{\"path\":\"src/index.ts\"}"), &ts),
+            Some("TypeScript")
+        );
+        assert_eq!(
+            changed(
+                &call("move_file", "{\"from\":\"a.md\",\"to\":\"App.TSX\"}"),
+                &ts
+            ),
+            Some("TypeScript")
+        );
+        // the compiler already read every line of it, so there is nothing to
+        // say: a stack that checks itself never reaches the note
+        assert_eq!(
+            changed(&call("write_file", "{\"path\":\"src/main.rs\"}"), &rust),
+            None
+        );
+        // and a file belonging to no stack that is here is not this note's
+        assert_eq!(
+            changed(&call("write_file", "{\"path\":\"src/main.rs\"}"), &ts),
+            None
+        );
+        assert_eq!(changed(&call("shell", "{\"command\":\"ls\"}"), &ts), None);
+
+        assert!(Agent::ran_a_check(&cmd("bunx tsc --noEmit"), &ts));
+        assert!(!Agent::ran_a_check(&cmd("bun index.ts"), &ts));
+        // it has to be a shell call, not a file tool that mentions one
+        assert!(!Agent::ran_a_check(
+            &call("write_file", "{\"path\":\"tsc.md\"}"),
+            &ts
+        ));
     }
 
     /// What each mode answers by itself, and what it still leaves to the

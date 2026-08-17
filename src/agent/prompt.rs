@@ -17,35 +17,35 @@ fn project_context(window: Option<u32>) -> String {
         "(empty directory)".to_string()
     } else {
         let total = entries.len();
-        let mut s = entries.into_iter().take(40).collect::<Vec<_>>().join("  ");
+        let mut s = entries
+            .iter()
+            .take(40)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("  ");
         if total > 40 {
             s.push_str(&format!("  ... +{} more", total - 40));
         }
         s
     };
 
-    let has = |f: &str| std::path::Path::new(f).exists();
-    let mut stack: Vec<&str> = Vec::new();
+    // Two different questions, kept apart on purpose. Which languages are
+    // here is the `stack` table's answer, the same one the checking rules
+    // read, so the two can never name different projects. Which runner drives
+    // them is a lockfile question and lives here.
+    let has = |f: &str| entries.iter().any(|e| e == f);
+    let mut stack: Vec<String> = Vec::new();
     if has("bun.lock") || has("bun.lockb") || has("bunfig.toml") {
-        stack.push("Bun (use `bun`, not npm/node)");
+        stack.push("Bun (use `bun`, not npm/node)".into());
     } else if has("pnpm-lock.yaml") {
-        stack.push("Node.js with pnpm");
+        stack.push("Node.js with pnpm".into());
     } else if has("yarn.lock") {
-        stack.push("Node.js with yarn");
-    } else if has("package-lock.json") || has("package.json") {
-        stack.push("Node.js with npm");
+        stack.push("Node.js with yarn".into());
+    } else if has("package-lock.json") {
+        stack.push("Node.js with npm".into());
     }
-    if has("tsconfig.json") {
-        stack.push("TypeScript (write .ts, NOT .js)");
-    }
-    if has("Cargo.toml") {
-        stack.push("Rust (cargo)");
-    }
-    if has("go.mod") {
-        stack.push("Go");
-    }
-    if has("pyproject.toml") || has("requirements.txt") {
-        stack.push("Python");
+    for s in crate::agent::stack::detect(&entries) {
+        stack.push(s.name.into());
     }
     let mut out = format!("- Top-level files: {listing}");
     if !stack.is_empty() {
@@ -141,7 +141,7 @@ fn civil_date(secs: u64) -> String {
 /// Rules that only apply when the thing they talk about is there. Rules for
 /// what is absent cost tokens on every single request and hand the model
 /// choices it cannot take; a 16k window has room for neither.
-fn situational_rules(in_repo: bool, editor: bool) -> String {
+fn situational_rules(in_repo: bool, editor: bool, stacks: &[&super::stack::Stack]) -> String {
     let mut out = String::new();
     if in_repo {
         out.push_str(
@@ -161,10 +161,30 @@ file that could break the build."
 with the shell tool before you say the task is finished, not only at the very end of a long task: \
 after each file that could break the build."
     });
+    // Naming the command is worth its tokens on its own: a model left to
+    // guess picks the one from whichever ecosystem it saw most of, which is
+    // how a Bun project gets `npm run build` and a Makefile gets a hand-rolled
+    // gcc line. The table in `stack` says what checks each kind of project;
+    // this only reads it, and knows the name of no language itself.
+    for s in stacks {
+        out.push_str(&format!("\n- Check the {} with {}.", s.name, s.check));
+        if !s.run_checks {
+            // and for these, every other rule above is already satisfied by
+            // having run the code, which is exactly why the check gets
+            // skipped: the server started, the request came back, done
+            out.push_str(&format!(
+                " Running it is NOT that check: {}, so a file that starts up and answers a \
+request can still be broken in every line that did not execute. Check after writing a file, \
+not once at the end.",
+                s.because
+            ));
+        }
+    }
     out.push_str(
-        "\n- If a build or test command fails, read the error and fix the cause. Never report a \
-task as done over a failing build, and never say a test passed without having run it. If it \
-cannot be run here, say which command you would have used and that it did not run.",
+        "\n- If a build, check or test command fails, read the error and fix the cause. Never fix \
+an error you have not read: run the command, fix exactly what it printed, run it again. Never \
+report a task as done over a failing build, and never say a test passed without having run it. \
+If it cannot be run here, say which command you would have used and that it did not run.",
     );
     out
 }
@@ -234,7 +254,8 @@ pub fn system_prompt(window: Option<u32>, max_turns: usize, model: &str) -> Stri
     let date = today_utc();
     let repo = git_context();
     let git = repo.as_ref().map(|g| format!("\n{g}")).unwrap_or_default();
-    let situational = situational_rules(repo.is_some(), crate::editor::connected());
+    let stacks = super::stack::here();
+    let situational = situational_rules(repo.is_some(), crate::editor::connected(), &stacks);
     let project = project_context(window);
     let write_cap = crate::tools::write_cap(window);
     // Examples are the first thing to go when the window is small. They
@@ -264,6 +285,14 @@ lists the commands and keys, and bugs go to https://github.com/thoth-coder/thoth
   edit_file src/server.ts            one exact snippet, nothing else touched
   shell \"npm test\"                   -> passes
   \"Fixed: the handler returned before the promise resolved. npm test passes.\"
+
+A task with more than one right answer, asked about before any of it is done:
+  \"restructure this project\"
+  ask_user question \"Which layout?\" options [
+    \"one file per resource: src/routes/todos.ts, src/db.ts\",
+    \"keep index.ts, move only the handlers to src/handlers/\",
+    \"controllers / services / models\" ]
+  ...then build the one they picked, and nothing else.
 
 "
     } else {
@@ -376,6 +405,15 @@ them, call ask_user with the question and two to four options, safest first. Use
 the work, never after. A fork you can settle by reading the project is not one: read it. A fork \
 with an obvious answer is not one either: take the obvious option, say in one clause that you \
 took it, and carry on.
+- \"restructure this\", \"split it up\", \"do it properly\", \"make it better\" with no target \
+layout named is exactly that fork. Several structures are right, the project cannot tell you \
+which one they meant, and moving files to the wrong one costs them the review. Call ask_user with \
+the two or three layouts you would choose between, described in one line each, before you touch a \
+single file.
+- A question for the user is a tool call, not a sentence. If you are about to end a turn asking \
+them which way to go, that turn should have been an ask_user call with those choices as its \
+options: written out as text it is one more paragraph to read and type an answer to, and as \
+ask_user it is a key to press.
 - If what the user says about the code is not what the code does, say so in one line before \
 anything else: \"divide already returns None, it does not panic\". Then do what they asked, or \
 ask which they meant when the difference changes the answer. Carrying out a request built on a \
@@ -424,13 +462,25 @@ mod tests {
 
     #[test]
     fn rules_for_what_is_not_there_are_left_out() {
-        let all = situational_rules(true, true);
+        let names = |n: &[&str]| -> Vec<String> { n.iter().map(|s| (*s).to_string()).collect() };
+        let ts = crate::agent::stack::detect(&names(&["tsconfig.json"]));
+        let all = situational_rules(true, true, &ts);
         assert!(all.contains("git commit"), "{all}");
         assert!(all.contains("`problems` tool"), "{all}");
+        // the command comes out of the table, and the warning with it
+        assert!(all.contains("tsc --noEmit"), "{all}");
+        assert!(all.contains("Running it is NOT that check"), "{all}");
 
-        let none = situational_rules(false, false);
+        // a stack the compiler checks gets its command named and no warning
+        let rust = crate::agent::stack::detect(&names(&["Cargo.toml"]));
+        let compiled = situational_rules(false, false, &rust);
+        assert!(compiled.contains("cargo check"), "{compiled}");
+        assert!(!compiled.contains("NOT that check"), "{compiled}");
+
+        let none = situational_rules(false, false, &[]);
         assert!(!none.contains("git"), "no repo, no git rules: {none}");
         assert!(!none.contains("`problems`"), "no editor, no tool: {none}");
+        assert!(!none.contains("Check the"), "no stack, no command: {none}");
         // but the rule it replaces still has to be said
         assert!(none.contains("run its tests with the shell tool"), "{none}");
         // and the one that does not depend on anything is always there
@@ -527,12 +577,14 @@ mod budget {
     #[ignore]
     fn prompt_budget() {
         let est = |s: &str| s.len() / 4;
-        let situational = super::situational_rules(true, true).len()
-            - super::situational_rules(false, false).len()
+        let ts = crate::agent::stack::detect(&["tsconfig.json".to_string()]);
+        let situational = super::situational_rules(true, true, &ts).len()
+            - super::situational_rules(false, false, &[]).len()
             + crate::tools::definitions(true).to_string().len()
             - crate::tools::definitions(false).to_string().len();
         println!(
-            "\nof which situational (git rules, editor rule and tool): {situational} chars \
+            "\nof which situational (git, editor, stack-check rules and the editor tool): \
+             {situational} chars \
              ~{} tokens, dropped when they do not apply",
             situational / 4
         );

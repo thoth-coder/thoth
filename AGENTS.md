@@ -57,6 +57,12 @@ along those lines needs no new `pub`.
 - `agent/prompt.rs`: system prompt. Environment (cwd, os, date, git branch),
   project scan, guardrail rules, instruction file (THOTH.md/AGENTS.md/
   CLAUDE.md, pointers followed), project memory.
+- `agent/stack.rs`: what kind of project this is and what checks it. One
+  table, one row per stack (marker files, extensions, the check command, the
+  words that mean a check ran, and whether running the code already was that
+  check). The prompt reads it to name the command, the agent loop reads it to
+  notice code that was changed and never checked. Supporting another language
+  is adding a row: nothing else in thoth may name a language or a tool.
 - `agent/undo.rs`: what a file looked like before thoth changed it. Each
   request is one checkpoint under `~/.thoth/projects/<key>/undo/`; `/undo`
   puts the newest one back and leaves alone anything that changed since.
@@ -106,6 +112,13 @@ along those lines needs no new `pub`.
 - Guardrails go in code, not in the prompt, whenever possible. See the
   read registry in `tools/fs.rs`: write_file needs every line of a file
   covered by earlier reads, not just "a read happened".
+- thoth is not a TypeScript tool or a Rust tool. No language, framework,
+  file extension or shell command belongs anywhere but a table: `tsc`,
+  `cargo`, `php -l` and the rest live in `agent/stack.rs` and nowhere else.
+  If a fix wants a rule about one language, the fix is a row plus a rule
+  written in terms of the row's fields. Anything else is a stack that
+  happens to be the one being tested that day, and it strands every other
+  language the user works in.
 - Anything that touches the user's machine must be visible in the UI: full
   command lines, full diffs, even when auto-approved.
 - "Always allow" is scoped, never a blanket grant: shell is keyed by
