@@ -11,6 +11,15 @@ pub const CODE: Color = Color::LightGreen;
 
 pub const PROMPT: &str = "❯ ";
 pub const RULE: &str = "─";
+/// Markdown drawn rather than spelled out: a list marker, the bar down the
+/// side of a quote, and the rule that stands in for a ``` fence.
+pub const BULLET: &str = "•";
+pub const QUOTE: &str = "│";
+pub const FENCE: &str = "╌";
+/// The dot in front of a tool call. Coloured by how the call went, so a
+/// screenful of them can be read down the left edge without any of the words:
+/// yellow still going, green done, red failed.
+pub const TOOL: &str = "●";
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Startup logo. Every row is the same width, so the ramp below reads as one

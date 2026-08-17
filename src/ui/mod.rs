@@ -1,4 +1,5 @@
 pub mod config;
+pub mod demo;
 pub mod input;
 pub mod render;
 mod screen;
@@ -7,9 +8,10 @@ pub mod theme;
 use crate::agent::{AgentCmd, AgentEvent, Answer, PermMode, PermReply};
 use crate::ui::config::{ConfigAction, ConfigScreen};
 use crate::ui::input::{
-    byte_idx, complete_candidates, cwd, expand_mentions, mention_at, split_path_fragment,
+    byte_idx, command_at, complete_candidates, complete_commands, cwd, expand_mentions, mention_at,
+    split_path_fragment,
 };
-use crate::ui::render::fmt_usd;
+use crate::ui::render::{fmt_usd, printable};
 use crate::ui::theme::SPINNER;
 use anyhow::Result;
 use ratatui::crossterm::event::{
@@ -45,6 +47,7 @@ const HELP: &str = "commands:
   /models        list models available on the server
   /quit          exit
 input:
+  /              a list of these commands opens as you type; tab takes one
   @path          attach a file to your message (a file picker opens as you type)
   !command       run a command yourself; its output goes into the context
 keys:
@@ -70,12 +73,17 @@ const PICKER_ROWS: usize = 8;
 
 /// The list of paths shown under the input while an `@path` is being typed.
 struct Picker {
-    /// Char index of the `@` that opened it.
+    /// Char index of the `@` or `/` that opened it.
     at: usize,
     /// Directory part already typed, e.g. "src/". Kept so accepting an entry
-    /// can rebuild the whole mention.
+    /// can rebuild the whole mention. Empty for commands, which have no path
+    /// in front of them, and that is the whole difference: taking a row is
+    /// the same operation either way.
     dir: String,
     items: Vec<String>,
+    /// What each row is, drawn after the name. Empty for paths, where the
+    /// name is the whole story.
+    notes: Vec<String>,
     sel: usize,
     /// First visible row, so a long directory scrolls instead of growing.
     top: usize,
@@ -132,6 +140,11 @@ enum Mode {
         options: Vec<String>,
         /// Highlighted row. `options.len()` is the write-your-own row.
         sel: usize,
+        /// First row drawn. Nine options and the row after them want ten
+        /// rows, which a short terminal does not have; the drawing code moves
+        /// this to keep `sel` among the ones on screen, the same way the
+        /// transcript's own scroll is settled while drawing.
+        top: usize,
         /// Set while they are writing that answer, holding whatever was
         /// half-typed in the input box when the question arrived: a question
         /// turning up is not a reason to lose a draft.
@@ -378,8 +391,12 @@ impl App {
             Event::Paste(s) if !matches!(self.mode, Mode::Perm(_)) && !self.picking() => {
                 // pasted code keeps its lines now that the input has them.
                 // A lone \r is a line break too, and leaving it in would
-                // draw the rest of the line over the start of it
-                let s = s.replace("\r\n", "\n").replace('\r', "\n");
+                // draw the rest of the line over the start of it. Everything
+                // else a clipboard can carry (escape sequences from a
+                // terminal scrollback, most of all) comes out here, so the
+                // buffer holds only what the user can see, and the model is
+                // sent only what the user meant
+                let s = printable(&s.replace("\r\n", "\n").replace('\r', "\n"));
                 self.insert_str(&s);
                 self.picker_off = false;
                 self.refresh_picker();
@@ -731,15 +748,16 @@ impl App {
                 self.mode = Mode::Choice {
                     options,
                     sel: 0,
+                    top: 0,
                     typing: None,
                     reply,
                 };
             }
             AgentEvent::PlanReady => {
-                self.blocks.push(ChatBlock::Info(
-                    "plan ready.  y do it (accept edits)   a do it, ask each time   n keep planning"
-                        .into(),
-                ));
+                // the keys are on the state line one row down for as long as
+                // the question is open, so saying them here too puts the same
+                // sentence on screen twice
+                self.blocks.push(ChatBlock::Info("plan ready".into()));
                 self.mode = Mode::PlanChoice;
             }
             AgentEvent::TurnEnd => {
@@ -950,7 +968,20 @@ impl App {
     /// after every change to the input, so the list always matches the line.
     fn refresh_picker(&mut self) {
         let chars: Vec<char> = self.input.chars().collect();
-        let Some((at, typed)) = mention_at(&chars, self.cursor) else {
+        // a mention and a command cannot both be under the cursor: one starts
+        // with @ anywhere, the other with / at the very start
+        let found = match mention_at(&chars, self.cursor) {
+            Some((at, typed)) => {
+                let (dir, frag) = split_path_fragment(&typed);
+                let items = complete_candidates(&cwd().join(dir), frag);
+                Some((at, dir.to_string(), items, Vec::new()))
+            }
+            None => command_at(&chars, self.cursor).map(|(at, typed)| {
+                let (items, notes) = complete_commands(&typed).into_iter().unzip();
+                (at, String::new(), items, notes)
+            }),
+        };
+        let Some((at, dir, items, notes)) = found else {
             self.picker = None;
             self.picker_off = false;
             return;
@@ -958,8 +989,6 @@ impl App {
         if self.picker_off {
             return;
         }
-        let (dir, frag) = split_path_fragment(&typed);
-        let items = complete_candidates(&cwd().join(dir), frag);
         if items.is_empty() {
             self.picker = None;
             return;
@@ -974,8 +1003,9 @@ impl App {
         }
         self.picker = Some(Picker {
             at,
-            dir: dir.to_string(),
+            dir,
             items,
+            notes,
             sel: 0,
             top: 0,
         });
@@ -1388,7 +1418,7 @@ mod tests {
         let rx = ask(&mut a);
         let s = screen(&mut a, 80, 16);
         assert!(
-            s.iter().any(|l| l.contains("1 serde")),
+            s.iter().any(|l| l.contains("1  serde")),
             "the options have to be on screen: {s:?}"
         );
         assert!(
@@ -1455,6 +1485,42 @@ mod tests {
         a.on_key(plain(KeyCode::Enter));
         assert_eq!(rx.await.unwrap(), Some(Answer::Wrote("one file".into())));
         assert_eq!(a.input, "draft", "and the draft comes back afterwards");
+    }
+
+    /// Nine options and the row after them want ten rows. A short terminal
+    /// has fewer, and the ones it cannot show must still be reachable and
+    /// still be admitted to.
+    #[tokio::test]
+    async fn a_chooser_taller_than_the_screen_scrolls() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut a = app();
+        let (tx, rx) = oneshot::channel();
+        a.on_agent_event(AgentEvent::Choice {
+            question: "which".into(),
+            options: (1..=9).map(|i| format!("opt{i}")).collect(),
+            reply: tx,
+        });
+        let s = screen(&mut a, 60, 12);
+        assert!(s.iter().any(|l| l.contains("opt1")), "{s:?}");
+        assert!(
+            !s.iter().any(|l| l.contains("opt9")),
+            "no room for it: {s:?}"
+        );
+        assert!(
+            s.iter().any(|l| l.contains("more")),
+            "and it has to say so: {s:?}"
+        );
+        // at least one row of what was asked survives the list
+        assert!(s.iter().any(|l| l.contains("which")), "{s:?}");
+
+        for _ in 0..8 {
+            a.on_key(plain(KeyCode::Down));
+        }
+        let s = screen(&mut a, 60, 12);
+        assert!(s.iter().any(|l| l.contains("opt9")), "walked to it: {s:?}");
+        assert!(!s.iter().any(|l| l.contains("opt1")), "{s:?}");
+        a.on_key(plain(KeyCode::Enter));
+        assert_eq!(rx.await.unwrap(), Some(Answer::Picked("opt9".into())));
     }
 
     /// Esc while writing goes back to the list rather than answering: the

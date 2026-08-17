@@ -5,7 +5,52 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Slash commands complete as you type them. A `/` at the start of the
+  message opens the list, with what each command does beside it, narrowing
+  with every letter; `tab` or `enter` takes the highlighted one. It is the
+  same picker `@path` already used.
+- `thoth --view <name>` in a debug build draws any screen of the interface
+  with made-up contents and prints it as text: the start screen, a session
+  mid-task, a permission prompt, the chooser, plan mode, both pickers, the
+  four permission modes, the profile screen, and the whole thing at 46
+  columns. `thoth --view` lists them and `--view-size WxH` sets the
+  terminal. Screens that only appear after a permission prompt or an
+  `ask_user` call were minutes of model time away from being looked at,
+  which is where their bugs were living. `cargo test every_view_draws`
+  renders all of them at two sizes.
+
+### Fixed
+- Escape sequences from tool output reached the terminal. `cargo test`,
+  `git` and `npm` emit colour the moment they think a terminal is listening
+  and the shell tool captures it verbatim, so a `\x1b[31m` in a result
+  repainted the rest of the screen and `\x1b[2J` wiped it. Every line thoth
+  draws now has its escapes, control characters and bidi overrides taken out
+  first, wherever it came from: tool output, a file, a web page, the model's
+  own reply, the model name the server gave, or a paste.
+- A question with more options than the terminal had rows drew as many as
+  fitted and no more: the rest could be walked onto with the arrows but
+  never seen, and the question itself could be pushed off the screen. The
+  list scrolls with the highlight now, says how many are below it, and never
+  takes the last row of the transcript.
+- A tool call with a permission prompt open said "running" underneath it.
+  It has not run, and may never run: it now says it is waiting for you.
+- "plan ready" and its three keys were written into the transcript and drawn
+  again on the state line one row below. The transcript keeps the moment,
+  the state line keeps the keys.
+- Tabs in tool results and error messages were drawn as a single character,
+  so a stack trace lost its indentation.
+
 ### Changed
+- Markdown markers are obeyed instead of printed: `##` in front of a heading
+  is dropped rather than shown next to a heading that is already bold, `-`
+  becomes a bullet with the wrapped rest of the item lined up under it, `>`
+  becomes a bar down the side, a ``` fence becomes a rule carrying the
+  language, and `---` becomes a rule.
+- Each tool call is marked with a dot coloured by how it went: still going,
+  done, failed. A screenful of them reads down the left edge.
+- The start screen names the three things nobody discovers by typing a
+  sentence at thoth: `/`, `@` and shift+tab.
 - The chooser for a question from the model is a list you move through with
   `up`/`down` and take with `enter`, drawn under the input with the
   highlighted row marked. `1`-`9` still picks one straight off.

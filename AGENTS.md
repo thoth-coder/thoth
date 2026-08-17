@@ -87,6 +87,13 @@ along those lines needs no new `pub`.
   without any of them being made public. `ui/render.rs` turns text into
   styled lines (markdown, diffs, wrapping), `ui/theme.rs` holds colors and
   glyphs, `ui/input.rs` handles `@path` attachments and completion.
+- `ui/demo.rs`: fake sessions for every screen, printed by `thoth --view
+  <name>` in a debug build. A screen that only appears after a permission
+  prompt, an `ask_user` call or a plan-mode turn is otherwise minutes of
+  model time away, so it never gets looked at and the bugs stay. Child
+  module of `ui`, so it builds an `App` and sets its private fields.
+  `every_view_draws` renders all of them at two sizes on `cargo test`; a new
+  screen means a new view here.
 - `ui/config.rs`: the profile screen. One struct drives both `thoth config`
   (its own event loop) and `/config` (the App holds it and forwards keys),
   so the two cannot drift. Saving hands back a `Config` that the agent

@@ -6,11 +6,11 @@
 use super::{App, ChatBlock, Mode, RESULT_PREVIEW_LINES};
 use crate::ui::input::cwd;
 use crate::ui::render::{
-    clip, expand_tabs, fmt_elapsed, fmt_k, fmt_usd, home_relative, render_diff_body,
-    render_markdown, short_url, wrap_into,
+    clip, fmt_elapsed, fmt_k, fmt_usd, home_relative, printable, render_diff_body, render_markdown,
+    short_url, wrap_into,
 };
 use crate::ui::theme;
-use crate::ui::theme::{PROMPT, RULE, SPINNER};
+use crate::ui::theme::{PROMPT, RULE, SPINNER, TOOL};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Modifier, Style};
@@ -32,15 +32,7 @@ impl App {
         }
         // one line of chrome at the top, one status line above the input and
         // one hint line below it: everything else belongs to the transcript.
-        // the @path picker sits between the input and the hints, and is zero
-        // rows tall while it is closed
-        // and the chooser for a question from the model takes the same rows:
-        // the two are never up at once, a question owns the keys the picker
-        // would want
-        let pick_h = match &self.mode {
-            Mode::Choice { options, .. } => Mode::choice_rows(options) as u16,
-            _ => self.picker.as_ref().map(|p| p.height()).unwrap_or(0),
-        };
+        //
         // the input is as tall as the message written in it, up to a third of
         // the screen: past that the transcript it is a reply to matters more
         // split, not lines(): a message ending in a break has an empty last
@@ -48,6 +40,28 @@ impl App {
         let input_h = (self.input.split('\n').count().max(1) as u16)
             .min((f.area().height / 3).max(1))
             .min(INPUT_MAX_ROWS);
+        // whatever it wants, it cannot have the rest of the screen: the four
+        // fixed rows and the input come first, and at least one row of
+        // transcript stays, or the question is offering choices to someone
+        // who can no longer see what was asked
+        let room = f.area().height.saturating_sub(5 + input_h).max(1);
+        // between the input and the hints sit the rows that offer something to
+        // take, zero of them most of the time: the @path picker, or the
+        // chooser for a question from the model. Never both, because a
+        // question owns every key the picker would want
+        let pick_h = match &self.mode {
+            Mode::Choice { options, .. } => (Mode::choice_rows(options) as u16).min(room),
+            _ => self
+                .picker
+                .as_ref()
+                .map(|p| p.height().min(room))
+                .unwrap_or(0),
+        };
+        // and with the height known, the highlighted row is brought into it
+        if let Mode::Choice { sel, top, .. } = &mut self.mode {
+            let rows = pick_h as usize;
+            *top = (*top).min(*sel).max((*sel + 1).saturating_sub(rows));
+        }
         let [header_a, chat_a, state_a, rule_a, input_a, pick_a, status_a] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
@@ -64,15 +78,18 @@ impl App {
         // the two sides do not both fit
         let chip = format!(" thoth v{} ", env!("CARGO_PKG_VERSION"));
         let tag = "  agentic coding";
-        let url = short_url(&self.base_url);
+        // the server names itself, and a name is a place to hide an escape
+        // sequence in something drawn on every single frame
+        let url = printable(&short_url(&self.base_url));
+        let model = printable(&self.model);
         let hw = header_a.width as usize;
         // the profile name rides with the model and server: they are what it
         // decides, and they move together when it is switched
         let prof = match &self.profile {
-            Some(p) => format!("{p}  "),
+            Some(p) => format!("{}  ", printable(p)),
             None => String::new(),
         };
-        let right_len = prof.chars().count() + self.model.chars().count() + 2 + url.chars().count();
+        let right_len = prof.chars().count() + model.chars().count() + 2 + url.chars().count();
         let mut header = vec![Span::styled(
             chip.clone(),
             theme::accent().add_modifier(Modifier::REVERSED),
@@ -86,7 +103,7 @@ impl App {
             " ".repeat(hw.saturating_sub(left_len + right_len)),
         ));
         header.push(Span::styled(prof, theme::muted_italic()));
-        header.push(Span::styled(self.model.clone(), theme::accent()));
+        header.push(Span::styled(model, theme::accent()));
         header.push(Span::styled(format!("  {url}"), theme::muted()));
         f.render_widget(Paragraph::new(Line::from(header)), header_a);
 
@@ -231,25 +248,39 @@ impl App {
         if let Mode::Choice {
             options,
             sel,
+            top,
             typing,
             ..
         } = &self.mode
         {
-            let width = pick_a.width.saturating_sub(6) as usize;
-            let last = options.len();
-            let lines: Vec<Line> = (0..=last)
+            let width = pick_a.width.saturating_sub(7) as usize;
+            let write_row = options.len();
+            let shown = (*top + pick_h as usize).min(write_row + 1);
+            let lines: Vec<Line> = (*top..shown)
                 .map(|i| {
-                    let text = if i == last {
+                    let text = if i == write_row {
                         match typing {
                             Some(_) => "something else, type it below".to_string(),
-                            None => "something else (type your own answer)".to_string(),
+                            None => "something else, type your own answer".to_string(),
                         }
                     } else {
-                        options[i].clone()
+                        printable(&options[i])
+                    };
+                    // more rows below than fit: the last one on screen says
+                    // so, in its own span, or on the highlighted row the
+                    // marker would read as part of the option
+                    let hidden = (write_row + 1).saturating_sub(shown);
+                    let (text, more) = if hidden > 0 && i + 1 == shown {
+                        (
+                            clip(&text, width.saturating_sub(10)),
+                            format!("  +{hidden} more"),
+                        )
+                    } else {
+                        (text, String::new())
                     };
                     let style = if i == *sel {
                         theme::accent().add_modifier(Modifier::REVERSED)
-                    } else if i == last {
+                    } else if i == write_row {
                         theme::muted()
                     } else {
                         theme::accent()
@@ -259,8 +290,9 @@ impl App {
                             if i == *sel { " > " } else { "   " },
                             Style::default().fg(theme::BUSY),
                         ),
-                        Span::styled(format!("{} ", i + 1), theme::muted()),
+                        Span::styled(format!("{}  ", i + 1), theme::muted()),
                         Span::styled(clip(&text, width), style),
+                        Span::styled(more, theme::muted()),
                     ])
                 })
                 .collect();
@@ -272,18 +304,21 @@ impl App {
             let rows = pick_h as usize;
             let last = p.top + rows;
             let width = pick_a.width.saturating_sub(2) as usize;
-            let lines: Vec<Line> = p.items[p.top..last.min(p.items.len())]
+            let shown = &p.items[p.top..last.min(p.items.len())];
+            // a command list gets a column: the names are short and what each
+            // one does is the part being read, so it has to start in the same
+            // place on every row. Paths carry no note and need no column
+            let col = if p.notes.is_empty() {
+                0
+            } else {
+                shown.iter().map(|i| i.chars().count()).max().unwrap_or(0)
+            };
+            let lines: Vec<Line> = shown
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
                     let idx = p.top + i;
                     let more = p.items.len().saturating_sub(last);
-                    // the bottom row doubles as the "there is more" marker
-                    let text = if more > 0 && idx + 1 == last {
-                        format!("{item}  +{more} more")
-                    } else {
-                        item.clone()
-                    };
                     let style = if idx == p.sel {
                         theme::accent().add_modifier(Modifier::REVERSED)
                     } else if item.ends_with('/') {
@@ -291,9 +326,25 @@ impl App {
                     } else {
                         theme::muted()
                     };
+                    // a command says what it does; a path is its own answer.
+                    // the bottom row also carries the "there is more" marker,
+                    // at the end so it cannot be read as part of either
+                    let mut note = p.notes.get(idx).cloned().unwrap_or_default();
+                    if more > 0 && idx + 1 == last {
+                        note.push_str(&format!("  +{more} more"));
+                    }
+                    let room = width.saturating_sub(note.chars().count() + 2);
                     Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(clip(&text, width), style),
+                        Span::styled(format!("{:<col$}", clip(item, room.max(8))), style),
+                        Span::styled(
+                            if note.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  {note}")
+                            },
+                            theme::muted(),
+                        ),
                     ])
                 })
                 .collect();
@@ -327,7 +378,9 @@ impl App {
             right_parts.push(fmt_usd(s));
         }
         if let Some(s) = &self.editor_status {
-            right_parts.push(s.clone());
+            // written by the editor extension into a file, so it arrives the
+            // same way any other file's contents do
+            right_parts.push(printable(s));
         }
         let right = right_parts.join("  ·  ");
         // the right side (tokens + editor file) wins over the key hints
@@ -501,11 +554,22 @@ impl App {
             theme::muted(),
         )));
         out.push(Line::default());
-        out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("/help", theme::key()),
-            Span::styled("  commands and keys", theme::muted()),
-        ]));
+        // three things nobody finds by typing a sentence at it, on the one
+        // screen that has room to say them
+        for (key, what) in [
+            (
+                "/",
+                "commands, with a list as you type. /help for all of it",
+            ),
+            ("@", "attach a file to the message"),
+            ("shift+tab", "how much thoth asks before it acts"),
+        ] {
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{key:<9}  "), theme::key()),
+                Span::styled(clip(what, width.saturating_sub(13)), theme::muted()),
+            ]));
+        }
     }
 
     fn render_block(&self, bi: usize, out: &mut Vec<Line<'static>>, width: usize) {
@@ -524,7 +588,7 @@ impl App {
                     let tail: Vec<&str> = t.lines().rev().take(3).collect();
                     for l in tail.into_iter().rev() {
                         out.push(Line::from(Span::styled(
-                            format!("  {}", clip(&expand_tabs(l), width.saturating_sub(2))),
+                            format!("  {}", clip(&printable(l), width.saturating_sub(2))),
                             dim_italic,
                         )));
                     }
@@ -542,15 +606,35 @@ impl App {
                 detail,
                 result,
             } => {
+                // one dot per call, coloured by how the call went, so a
+                // screenful reads down the left edge without any of the words
+                let waiting = is_last && matches!(self.mode, Mode::Perm(_));
+                let dot = match result {
+                    Some((_, true)) => theme::danger(),
+                    Some(_) => Style::default().fg(theme::ADDED),
+                    None => Style::default().fg(theme::BUSY),
+                };
                 out.push(Line::from(vec![
+                    Span::styled(format!("{TOOL} "), dot),
                     Span::styled(name.clone(), theme::accent().add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
-                    Span::styled(clip(summary, width.saturating_sub(name.len() + 2)), dim),
+                    Span::styled(
+                        clip(&printable(summary), width.saturating_sub(name.len() + 4)),
+                        dim,
+                    ),
                 ]));
                 if let Some(d) = detail {
                     render_diff_body(out, d, width);
                 }
                 match result {
+                    // a call with a permission prompt open has not run and
+                    // may never run: this is the block being asked about, and
+                    // saying "running" under it is thoth claiming to have
+                    // done the thing it is standing there asking permission for
+                    None if waiting => out.push(Line::from(Span::styled(
+                        "  waiting for your answer",
+                        Style::default().fg(theme::BUSY),
+                    ))),
                     None => out.push(Line::from(Span::styled("  running", dim))),
                     Some((content, is_error)) => {
                         let style = if *is_error { red } else { dim };
@@ -562,7 +646,7 @@ impl App {
                         };
                         for l in lines.iter().take(shown) {
                             out.push(Line::from(Span::styled(
-                                format!("  {}", clip(&expand_tabs(l), width.saturating_sub(2))),
+                                format!("  {}", clip(&printable(l), width.saturating_sub(2))),
                                 style,
                             )));
                         }

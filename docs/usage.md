@@ -22,8 +22,9 @@
   first one. Where none of them get through, end the line with `\` and
   press `enter`: the backslash becomes the line break. The input grows to
   fit, up to ten rows.
-- `tab` or `enter` takes the highlighted path while the `@path` picker is
-  open.
+- A `/` at the start of the message opens the list of slash commands, with
+  what each one does, narrowing as you type. `tab` or `enter` takes the
+  highlighted one. The same picker completes `@path` anywhere in the line.
 - `esc` closes the picker, interrupts generation, or clears the input when
   idle.
 - `up` / `down` move in the picker, then between the lines of a multi-line

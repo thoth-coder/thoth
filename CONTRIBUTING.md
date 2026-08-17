@@ -13,6 +13,26 @@ For end-to-end testing you need a local model server:
 Network tests are opt-in: `cargo test -- --ignored` (they hit DuckDuckGo and
 example.com).
 
+## Working on the interface
+
+Most of thoth's screens only appear once something else has happened: a
+permission prompt needs a tool that asks, the chooser needs the model to call
+`ask_user`, the plan banner needs a whole plan-mode turn. Waiting on a local
+model for each look is minutes per change, which is why bugs live in those
+screens. So a debug build draws any of them on demand:
+
+```sh
+cargo run -- --view                          # what there is
+cargo run -- --view choice                   # every frame of that screen
+cargo run -- --view chat --view-size 46x20   # and at a size that hurts
+```
+
+The output is plain text, so it can be read, diffed and pasted into an issue.
+`cargo test every_view_draws` walks all of them at two sizes, which is the
+only test some of those screens have: a panic in one nobody opened today
+still fails the build. A new screen means a new view in `src/ui/demo.rs`.
+Views are refused in a release build.
+
 ## Before opening a PR
 
 - `cargo fmt`, then `cargo clippy -- -D warnings` passes. CI fails on any

@@ -48,6 +48,41 @@ struct Args {
     /// Lasts for this run only; shift+tab changes it in the TUI
     #[arg(long, value_name = "MODE")]
     mode: Option<String>,
+    /// Print a screen of the interface with made-up contents and exit, for
+    /// working on the UI without waiting for a model to reach that state.
+    /// Bare `--view` lists what there is. Debug builds only
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    view: Option<String>,
+    /// Size for --view, e.g. 100x30
+    #[arg(long, value_name = "WxH", default_value = "100x30")]
+    view_size: String,
+}
+
+/// `--view` exists so a UI state that normally needs a model behind it can be
+/// looked at in one command. Refused in a release build: it is a development
+/// tool, and a user who reaches for it has misread something. The code is
+/// still compiled there, so clippy and the release build check it like the
+/// rest, which is worth more than the few kilobytes of demo transcript.
+fn run_view(name: &str, size: &str) -> Result<()> {
+    if !cfg!(debug_assertions) {
+        bail!("--view is for debug builds. cargo run -- --view {name}");
+    }
+    if name.is_empty() {
+        println!("thoth --view <name> [--view-size WxH]\n");
+        for v in ui::demo::VIEWS {
+            println!("  {:<12} {}", v.name, v.about);
+        }
+        return Ok(());
+    }
+    let (w, h) = size
+        .split_once(['x', 'X'])
+        .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+        .ok_or_else(|| anyhow!("--view-size wants something like 100x30, not {size}"))?;
+    if w < 20 || h < 6 {
+        bail!("--view-size {size} is too small to draw anything into");
+    }
+    print!("{}", ui::demo::render(name, w, h)?);
+    Ok(())
 }
 
 #[derive(clap::Subcommand)]
@@ -79,6 +114,12 @@ async fn main() -> Result<()> {
         Some(Cmd::Upgrade) => return upgrade::run().await,
         Some(Cmd::Config { action }) => return run_config(action),
         None => {}
+    }
+    // before any of the config and network work below: a view needs nothing
+    // but the drawing code, and asking for one on a machine with no model
+    // running has to still show the screen
+    if let Some(name) = &args.view {
+        return run_view(name, &args.view_size);
     }
     let (cfg, profile) = config::load(config::Overrides {
         profile: args.profile,

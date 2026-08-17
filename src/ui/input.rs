@@ -99,6 +99,60 @@ pub fn mention_at(chars: &[char], cursor: usize) -> Option<(usize, String)> {
     Some((start, chars[start + 1..cur].iter().collect()))
 }
 
+/// The slash command being typed, as (index of the `/`, what follows it).
+/// Only at the very start of the message, and only while it is still one
+/// word: a `/` further in is a path, and a space means the command is
+/// settled and an argument is being written.
+pub fn command_at(chars: &[char], cursor: usize) -> Option<(usize, String)> {
+    if chars.first() != Some(&'/') {
+        return None;
+    }
+    let cur = cursor.min(chars.len());
+    if cur == 0 {
+        return None;
+    }
+    let typed: Vec<char> = chars[1..cur].to_vec();
+    if typed.iter().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((0, typed.into_iter().collect()))
+}
+
+/// Commands whose name starts with `frag`, with what each one does. Matched
+/// case-insensitively, and an empty fragment lists every one of them: a bare
+/// `/` is the question "what is there".
+pub fn complete_commands(frag: &str) -> Vec<(String, String)> {
+    let lower = frag.to_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(&lower))
+        .map(|(name, note)| ((*name).to_string(), (*note).to_string()))
+        .collect()
+}
+
+/// The slash commands, in the order `/help` lists them, with what each one
+/// does in a few words. A test holds this against the help text, so a command
+/// added to one and not the other fails the build rather than going missing
+/// from completion.
+pub const COMMANDS: [(&str, &str); 16] = [
+    ("help", "show this help"),
+    ("clear", "clear the screen and the conversation"),
+    ("compact", "summarize the conversation to free context"),
+    ("recap", "load the previous session's summary"),
+    ("memory", "show project memory"),
+    ("config", "edit the config profiles"),
+    ("undo", "put back the files the last request changed"),
+    ("allow", "tools always allowed here"),
+    ("mode", "how much thoth asks before acting"),
+    ("plan", "short for /mode plan"),
+    ("status", "profile, model, api, tokens, cost, uptime"),
+    ("init", "analyze the project and write THOTH.md"),
+    ("model", "switch model"),
+    ("models", "list the models on the server"),
+    ("quit", "exit"),
+    ("cfg", "short for /config"),
+];
+
 /// "src/too" -> ("src/", "too"); "too" -> ("", "too").
 pub fn split_path_fragment(typed: &str) -> (&str, &str) {
     match typed.rfind(['/', '\\']) {
@@ -174,6 +228,65 @@ mod tests {
         assert_eq!(labels.len(), 2);
         assert!(labels[0].contains("no such file"));
         assert_eq!(attached.matches("<file").count(), 1);
+    }
+
+    /// Completion offers what `/help` documents, or it offers a command the
+    /// user cannot run and hides one they can.
+    #[test]
+    fn the_command_list_matches_the_help_text() {
+        let documented: Vec<String> = crate::ui::HELP
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix('/'))
+            .map(|l| {
+                l.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+        for name in &documented {
+            assert!(
+                COMMANDS.iter().any(|(c, _)| c == name),
+                "/{name} is in the help and not in completion"
+            );
+        }
+        for (name, note) in COMMANDS {
+            // the two aliases are documented inside another command's line
+            if ["cfg", "plan"].contains(&name) {
+                continue;
+            }
+            assert!(
+                documented.iter().any(|d| d == name),
+                "/{name} completes and is not in the help"
+            );
+            assert!(!note.is_empty(), "/{name} has nothing to say for itself");
+        }
+    }
+
+    #[test]
+    fn completes_slash_commands() {
+        let at = |s: &str, cur: usize| {
+            let chars: Vec<char> = s.chars().collect();
+            command_at(&chars, cur)
+        };
+        assert_eq!(at("/mod", 4), Some((0, "mod".into())));
+        // a bare slash is a question about what there is
+        assert_eq!(at("/", 1), Some((0, String::new())));
+        // once there is an argument the command is settled
+        assert_eq!(at("/model qwen", 11), None);
+        assert_eq!(at("/model ", 7), None);
+        // and a slash that is not the first thing typed is a path
+        assert_eq!(at("look at src/main.rs", 15), None);
+        assert_eq!(at("", 0), None);
+
+        let names: Vec<String> = complete_commands("mod")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["mode", "model", "models"]);
+        assert_eq!(complete_commands("MODEL").len(), 2, "case does not matter");
+        assert_eq!(complete_commands("").len(), COMMANDS.len());
+        assert!(complete_commands("zzz").is_empty());
     }
 
     #[test]

@@ -2,12 +2,66 @@
 //! wrapping and clipping.
 
 use crate::ui::theme;
+use crate::ui::theme::{BULLET, FENCE, QUOTE, RULE};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub fn expand_tabs(s: &str) -> String {
-    s.replace('\t', "    ")
+/// A line as it can safely be drawn: tabs opened out, escape sequences and
+/// control characters taken out of it.
+///
+/// Almost nothing thoth draws was written by thoth. `cargo test`, `git` and
+/// `npm` all emit colour the moment they think a terminal is listening, and
+/// the shell tool captures that verbatim; a file, a web page or a model's
+/// reply can carry anything at all. Drawn as they arrive, `\x1b[31m` repaints
+/// the rest of the screen, `\x1b[2J` wipes it, an OSC sequence retitles the
+/// window, and a right-to-left override makes a diff read as the opposite of
+/// what it will do. The terminal answers to thoth, not to the last program it
+/// happened to run.
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one byte in 0x40..=0x7e ends it
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: runs to a bell or to ESC \
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // anything else after ESC is a two-character sequence and
+                // leaves with it
+                _ => {}
+            },
+            // the bidi overrides are not formatting, they are a way to show
+            // one thing and mean another, which is the whole of the trojan
+            // source trick
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {}
+            // a line break is the one control character with a meaning here.
+            // The renderers split on it long before this and never see one;
+            // a paste is full of them and they are the point
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn fmt_k(n: u64) -> String {
@@ -69,7 +123,7 @@ pub fn home_relative(path: &std::path::Path) -> String {
 pub fn render_diff_body(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
     let dim = theme::muted();
     for l in text.lines() {
-        let l = expand_tabs(l);
+        let l = printable(l);
         let style = match l.chars().next() {
             Some('+') => Style::default().fg(theme::ADDED),
             Some('-') => theme::danger(),
@@ -84,23 +138,37 @@ pub fn render_diff_body(out: &mut Vec<Line<'static>>, text: &str, width: usize) 
     }
 }
 
-/// Lightweight markdown rendering: code fences, headings, quotes,
+/// Lightweight markdown rendering: code fences, headings, quotes, lists,
 /// `inline code` and **bold**.
+///
+/// The markers are read and then dropped, not printed. `###` in front of a
+/// heading is instruction to the renderer, and leaving it on screen next to a
+/// heading that is already bold says the same thing twice in the uglier of
+/// the two ways.
 pub fn render_markdown(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
     let mut in_fence = false;
     for src in text.lines() {
         let trimmed = src.trim_start();
         if trimmed.starts_with("```") {
             in_fence = !in_fence;
+            // opening: a rule with the language on it, so a block of code is
+            // bounded by something quieter than three backticks
+            let lang = trimmed.trim_start_matches('`').trim();
+            let label = if in_fence && !lang.is_empty() {
+                format!("{FENCE}{FENCE} {} ", printable(lang))
+            } else {
+                format!("{FENCE}{FENCE}")
+            };
+            let rule = FENCE.repeat(width.saturating_sub(label.chars().count()).min(24));
             out.push(Line::from(Span::styled(
-                clip(&expand_tabs(src), width),
+                clip(&format!("{label}{rule}"), width),
                 theme::muted(),
             )));
             continue;
         }
         if in_fence {
             out.push(Line::from(Span::styled(
-                format!("  {}", clip(&expand_tabs(src), width.saturating_sub(2))),
+                format!("  {}", clip(&printable(src), width.saturating_sub(2))),
                 Style::default().fg(theme::CODE),
             )));
             continue;
@@ -109,16 +177,61 @@ pub fn render_markdown(out: &mut Vec<Line<'static>>, text: &str, width: usize) {
             out.push(Line::default());
             continue;
         }
-        let base = if trimmed.starts_with('#') {
-            theme::accent().add_modifier(Modifier::BOLD)
-        } else if trimmed.starts_with('>') {
-            theme::muted()
-        } else {
-            Style::default()
-        };
-        for piece in textwrap::wrap(&expand_tabs(src), width.max(2)) {
-            out.push(Line::from(inline_spans(&piece, base)));
+        // a thematic break is a line, and drawing it as one costs nothing
+        if matches!(trimmed, "---" | "***" | "___" | "* * *") {
+            out.push(Line::from(Span::styled(
+                RULE.repeat(width.min(24)),
+                theme::muted(),
+            )));
+            continue;
         }
+        let indent = src.len() - trimmed.len();
+        let pad = " ".repeat(indent.min(width / 2));
+        if let Some(rest) = heading(trimmed) {
+            out.push(Line::from(inline_spans(
+                &clip(&printable(rest), width),
+                theme::accent().add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        let (marker, body, base) = if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            (format!("{pad}{BULLET} "), rest, Style::default())
+        } else if let Some(rest) = trimmed.strip_prefix("> ") {
+            (format!("{pad}{QUOTE} "), rest, theme::muted())
+        } else {
+            (pad.clone(), trimmed, Style::default())
+        };
+        // the marker is drawn once and the wrapped rest lines up under it, so
+        // a list item that runs onto a second line still reads as one item
+        let hang = marker.chars().count();
+        let body_w = width.saturating_sub(hang).max(2);
+        for (n, piece) in textwrap::wrap(&printable(body), body_w).iter().enumerate() {
+            let mut spans = vec![Span::styled(
+                if n == 0 {
+                    marker.clone()
+                } else {
+                    " ".repeat(hang)
+                },
+                theme::muted(),
+            )];
+            spans.extend(inline_spans(piece, base));
+            out.push(Line::from(spans));
+        }
+    }
+}
+
+/// `## Heading` -> `Heading`. One to six hashes and then a space, which is
+/// what stops `#!/bin/sh` and `#42` from being read as one.
+fn heading(trimmed: &str) -> Option<&str> {
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) {
+        trimmed[hashes..].strip_prefix(' ').map(str::trim_start)
+    } else {
+        None
     }
 }
 
@@ -216,7 +329,7 @@ pub fn wrap_into(
             out.push(Line::default());
             continue;
         }
-        for piece in textwrap::wrap(src, w) {
+        for piece in textwrap::wrap(&printable(src), w) {
             let mut spans = Vec::new();
             if first {
                 spans.push(Span::styled(prefix.to_string(), prefix_style));
@@ -254,5 +367,70 @@ mod tests {
         let clipped = clip("aaaaaaaaaa", 5);
         assert!(clipped.ends_with('…'));
         assert!(clipped.chars().count() <= 5);
+    }
+
+    /// Nothing a tool, a file or a model sends may reach the terminal as an
+    /// instruction to it.
+    #[test]
+    fn escape_sequences_never_reach_the_terminal() {
+        // colour, and the reset after it
+        assert_eq!(printable("\u{1b}[31merror\u{1b}[0m: no"), "error: no");
+        // a clear-screen, a cursor move, a scroll region
+        assert_eq!(printable("a\u{1b}[2Jb\u{1b}[10;20Hc\u{1b}[1;5r"), "abc");
+        // an OSC that retitles the window, ended either way it may be ended
+        assert_eq!(printable("x\u{1b}]0;pwned\u{7}y"), "xy");
+        assert_eq!(printable("x\u{1b}]0;pwned\u{1b}\\y"), "xy");
+        // a two-character escape
+        assert_eq!(printable("a\u{1b}=b"), "ab");
+        // a bell, a backspace, a stray carriage return
+        assert_eq!(printable("a\u{7}b\u{8}c\rd"), "abcd");
+        // and the overrides that make text read as its own reverse
+        assert_eq!(printable("del\u{202e}txt.exe"), "deltxt.exe");
+        // tabs open out, and a line break is left alone: a paste is made of
+        // them and the renderers have split on them long before this
+        assert_eq!(printable("a\tb\nc"), "a    b\nc");
+        // an escape at the very end runs out of input rather than off the end
+        assert_eq!(printable("a\u{1b}"), "a");
+        assert_eq!(printable("a\u{1b}["), "a");
+    }
+
+    fn md(text: &str, width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        render_markdown(&mut out, text, width);
+        out.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// A marker is an instruction to the renderer. Printing it as well as
+    /// obeying it says the same thing twice, in the uglier of the two ways.
+    #[test]
+    fn markdown_markers_are_obeyed_not_printed() {
+        assert_eq!(md("## Heading", 40), ["Heading"]);
+        // but only where it is a heading: a shebang and an issue number are
+        // not, and neither is a run of seven
+        assert_eq!(md("#!/bin/sh", 40), ["#!/bin/sh"]);
+        assert_eq!(md("#42 is open", 40), ["#42 is open"]);
+        assert_eq!(md("####### deep", 40), ["####### deep"]);
+
+        assert_eq!(
+            md("- one\n* two\n+ three", 40),
+            ["• one", "• two", "• three"]
+        );
+        assert_eq!(md("> quoted", 40), ["│ quoted"]);
+        // a numbered list keeps its numbers, which carry meaning
+        assert_eq!(md("1. first", 40), ["1. first"]);
+        // the rest of a wrapped item lines up under the first word, not
+        // under the bullet
+        assert_eq!(
+            md("- aaaa bbbb cccc dddd", 12),
+            ["• aaaa bbbb", "  cccc dddd"]
+        );
+        // an indented item keeps its level
+        assert_eq!(md("  - nested", 40), ["  • nested"]);
+
+        let fence = md("```rust\nfn x() {}\n```", 40);
+        assert!(fence[0].starts_with("╌╌ rust"), "{fence:?}");
+        assert_eq!(fence[1], "  fn x() {}");
+        assert!(!fence[2].contains('`'), "{fence:?}");
+        assert!(md("---", 40)[0].starts_with('─'));
     }
 }
