@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-08-18
+
 ### Changed
 - The binary is a third smaller: 8.4 MB to 5.7 MB on Windows. Link-time
   optimization across the whole program, one codegen unit, symbols stripped,
@@ -571,6 +573,7 @@ All notable changes to thoth are documented here. The format follows
   targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
   with install/uninstall scripts for curl | sh and irm | iex.
 
+[0.4.3]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.3
 [0.4.2]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.2
 [0.4.1]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.1
 [0.4.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.0
