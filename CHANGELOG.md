@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-18
+
 ### Added
 - thoth knows what checks a project, per stack, and says so. TypeScript,
   JavaScript, Rust, Go, PHP, Python, Ruby, C#, C/C++ and Java/Kotlin each
@@ -462,6 +464,8 @@ All notable changes to thoth are documented here. The format follows
   targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
   with install/uninstall scripts for curl | sh and irm | iex.
 
+[0.4.1]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.1
+[0.4.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.0
 [0.3.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.3.0
 [0.2.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.2.0
 [0.1.0]: https://github.com/thoth-coder/thoth/releases/tag/v0.1.0
