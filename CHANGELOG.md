@@ -5,6 +5,55 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A request that changed code and ran nothing against it gets one more turn,
+  with thoth asking for the check by name before the request ends. The note
+  that said so was already there, but it told the user, after the model had
+  stopped and could no longer act on it. In a run of six Rust projects the
+  one case where nothing was ever run was also the one that compiled cleanly
+  and did nothing at run time: five tasks spawned into a channel that
+  collected zero results. Asked to check its own work, the model found it and
+  fixed it. Once per request, and only where the project has a check to name.
+
+### Fixed
+- A file cannot be written whole twice in one request with nothing run
+  against it in between. The model would write a file, be told nothing by
+  anyone, decide on its own that it was wrong, and write the whole thing
+  again: four passes over the same 330 lines in one request, each costing a
+  full generation and each made out of the same guesses as the last. The
+  refusal names this project's check, out of the same table everything else
+  reads, and points at `edit_file` for changing the part that is actually
+  broken. A check running clears it, and so does writing a different file.
+- `2>&1` is taken out of a command on Windows. PowerShell does not merge a
+  native program's stderr into its stdout the way `sh` does: it wraps every
+  line in an ErrorRecord, so `cargo check 2>&1` came back as a
+  NativeCommandError with a caret diagram around the word "Compiling" and
+  the real error buried underneath, and a command that succeeded was marked
+  as failed. Both streams were already captured and labelled separately.
+- A repeated tool call is only stopped when its answer repeats too. thoth
+  hands out a background log path and asks the model to watch that file,
+  then refused the third read with "the result will not change" while the
+  build was still writing to it. The one call thoth asks to be made twice
+  was the one it punished.
+- A background command says how to wait for it, in the shell it will be run
+  in, instead of "wait a moment first" with nothing that could do the
+  waiting. Reading a log in a tight loop only ever shows the same bytes.
+- A command that fails because the shell rejected the syntax says which
+  shell it is. `&&` between two commands is a parse error on Windows and
+  cost a whole turn every time a model wrote one out of `sh` habit.
+- A model call that stops answering no longer hangs thoth for ever. Only the
+  connection had a timeout, so a server that accepted it and then went quiet
+  left the spinner turning and the elapsed timer counting with nothing behind
+  either, which looks exactly like a slow model and never ends. Silence
+  before the first byte is allowed ten minutes, because on a large local
+  model the whole prompt is evaluated before a single token comes back;
+  silence in the middle of a reply is allowed two, because by then tokens
+  arrive steadily and a long gap is a stream that has stopped.
+- A project created during the request is now recognised once its manifest
+  exists. The stack was read once at the start, so "build me a project"
+  began in a directory with nothing to detect, and nothing the model ran
+  afterwards counted as a check.
+
 ## [0.4.3] - 2026-08-18
 
 ### Changed

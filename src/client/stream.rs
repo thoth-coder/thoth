@@ -2,9 +2,71 @@
 //! in the reasoning channel, and tool calls a model wrote as text instead of
 //! sending as tool_calls. Shared by the OpenAI and Ollama transports;
 //! Anthropic sends proper blocks and needs none of it.
+//!
+//! And how long to wait for the next piece of one, which all three need.
 
 use super::{AssistantTurn, FunctionCall, StreamEvent, ToolCall};
+use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::time::Duration;
+
+/// How long a stream may say nothing before the first byte of the reply.
+///
+/// This is the model reading the request, and on a local server with a large
+/// model half in system memory it is genuinely minutes: the whole prompt has
+/// to be evaluated before a single token comes back. Cutting that off would
+/// break thoth on exactly the hardware it is written for.
+const FIRST_BYTE_SILENCE: Duration = Duration::from_secs(600);
+
+/// How long it may say nothing once it has started talking.
+///
+/// Tokens arrive steadily by then, so a long gap is not a slow model, it is
+/// a stream that has stopped. Without a limit here thoth waits on it for
+/// ever, with the spinner still turning and the elapsed timer still
+/// counting, which is indistinguishable from working and is the worst thing
+/// it could show.
+const MID_STREAM_SILENCE: Duration = Duration::from_secs(120);
+
+/// The next chunk of a response body, or an error naming the wait if the
+/// server has gone quiet. `None` is the ordinary end of the stream.
+///
+/// `connect_timeout` covers getting the connection and nothing after it: a
+/// server that accepts the connection and then never sends a byte is a hang
+/// with no end, and it is not a rare shape of failure.
+pub(super) async fn next_chunk<S, B>(stream: &mut S, started: bool) -> Result<Option<B>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<B>> + Unpin,
+{
+    let limit = if started {
+        MID_STREAM_SILENCE
+    } else {
+        FIRST_BYTE_SILENCE
+    };
+    within(stream, limit, started).await
+}
+
+/// The waiting itself, with the limit handed to it. Kept apart from the two
+/// constants so a test can reach it without waiting out a real one.
+async fn within<S, B>(stream: &mut S, limit: Duration, started: bool) -> Result<Option<B>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<B>> + Unpin,
+{
+    match tokio::time::timeout(limit, stream.next()).await {
+        Ok(Some(chunk)) => Ok(Some(chunk.context("stream error")?)),
+        Ok(None) => Ok(None),
+        Err(_) if started => bail!(
+            "the server stopped sending after {}s in the middle of the reply. The reply so far \
+             is kept; ask again to carry on",
+            limit.as_secs()
+        ),
+        Err(_) => bail!(
+            "no reply from the server after {}s. It accepted the connection and then sent \
+             nothing: check that the model is loaded and the server is not stuck",
+            limit.as_secs()
+        ),
+    }
+}
 
 /// Routes `<think>…</think>` spans that some models emit inside `content`
 /// to reasoning instead. Tags can be split across stream chunks.
@@ -539,5 +601,52 @@ mod tests {
             run("{\"name\": \"grep\", \"arguments\": \"{\\\"pattern\\\": \\\"x\\\"}\"}");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.arguments, "{\"pattern\": \"x\"}");
+    }
+
+    /// A server that accepts the connection and then says nothing is a hang
+    /// with no end of its own: `connect_timeout` is already satisfied, and
+    /// the spinner keeps turning as if it were working. This is the shape of
+    /// failure the limits exist for, so the limits have to be reachable.
+    #[tokio::test]
+    async fn a_stream_that_goes_quiet_gives_up_and_says_which_silence_it_was() {
+        let quiet = || {
+            Box::pin(futures_util::stream::once(async {
+                // longer than any limit this test hands it
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok::<Vec<u8>, reqwest::Error>(Vec::new())
+            }))
+        };
+        let tick = Duration::from_millis(20);
+
+        // stopped halfway: the reply so far is worth keeping
+        let err = within(&mut quiet(), tick, true)
+            .await
+            .expect_err("silence past the limit is an error, not a longer wait");
+        assert!(format!("{err:#}").contains("stopped sending"), "{err:#}");
+
+        // never started: the model or the server is the thing to look at
+        let err = within(&mut quiet(), tick, false)
+            .await
+            .expect_err("silence past the limit is an error, not a longer wait");
+        let said = format!("{err:#}");
+        assert!(said.contains("accepted the connection"), "{said}");
+
+        // and a stream that answers inside the limit is left alone
+        let mut fast = Box::pin(futures_util::stream::once(async {
+            Ok::<Vec<u8>, reqwest::Error>(b"hello".to_vec())
+        }));
+        let got = within(&mut fast, Duration::from_secs(5), true)
+            .await
+            .expect("an answer in time is not a timeout");
+        assert_eq!(got.as_deref(), Some(&b"hello"[..]));
+    }
+
+    /// The two waits are not the same wait. Before the first byte the model
+    /// is reading the request, which on a large local model half in system
+    /// memory is genuinely minutes, and cutting that off would break thoth
+    /// on the hardware it is written for.
+    #[test]
+    fn waiting_to_start_is_allowed_longer_than_stopping_halfway() {
+        assert!(FIRST_BYTE_SILENCE > MID_STREAM_SILENCE);
     }
 }

@@ -67,11 +67,73 @@ fn shell_argv(command: &str) -> (&'static str, Vec<String>) {
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
                 "-Command".into(),
-                format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {command}"),
+                format!(
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; {}",
+                    drop_stderr_merge(command)
+                ),
             ],
         )
     } else {
         ("sh", vec!["-c".into(), command.into()])
+    }
+}
+
+/// Takes `2>&1` out of a command on Windows, where it does the opposite of
+/// what whoever wrote it meant.
+///
+/// PowerShell 5.1 does not merge a native program's stderr into its stdout.
+/// It wraps every stderr line in an ErrorRecord, so a build that printed one
+/// ordinary progress line comes back as a NativeCommandError carrying the
+/// command text, a caret diagram and a FullyQualifiedErrorId, and the real
+/// output is buried under PowerShell's own account of it. It also sets the
+/// failure flag on a command that succeeded. Both streams are captured and
+/// handed over whole and labelled either way, so the redirect buys nothing
+/// and costs the output's readability. This is the one thing a model writes
+/// out of `sh` habit that quietly corrupts what it gets back, rather than
+/// failing where it can see it.
+///
+/// Every standalone one goes, not only a trailing one: it is as wrong in the
+/// middle of a pipeline as at the end. It has to be its own word, so
+/// `echo 12>&1` and `cmd 2>file` are left alone. A literal `2>&1` inside a
+/// quoted string would go too, which is worth the exchange: a command that
+/// wants to print those four characters is rarer than a build whose output
+/// comes back unreadable.
+fn drop_stderr_merge(command: &str) -> String {
+    const TOKEN: &str = "2>&1";
+    if !cfg!(windows) || !command.contains(TOKEN) {
+        return command.to_string();
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while let Some(i) = rest.find(TOKEN) {
+        let after = &rest[i + TOKEN.len()..];
+        let standalone = rest[..i].ends_with([' ', '\t'])
+            && after
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || c == '|' || c == ';');
+        if standalone {
+            out.push_str(rest[..i].trim_end());
+            // keep one space so `a 2>&1 b` does not become `ab`, but not in
+            // front of a separator that never wanted one
+            if after
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace() && c != ';' && c != '|')
+            {
+                out.push(' ');
+            }
+        } else {
+            out.push_str(&rest[..i + TOKEN.len()]);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    let trimmed = out.trim_end();
+    if trimmed.len() == out.len() {
+        out
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -98,15 +160,40 @@ fn run_background(command: &str) -> Result<String> {
         .context("failed to spawn background process")?;
     let pid = child.id();
     started_here().lock().unwrap().push(pid);
-    let kill_hint = if cfg!(windows) {
-        format!("taskkill /PID {pid} /T /F")
+    let (kill_hint, wait_hint) = if cfg!(windows) {
+        (format!("taskkill /PID {pid} /T /F"), "Start-Sleep 15")
     } else {
-        format!("kill {pid}")
+        (format!("kill {pid}"), "sleep 15")
     };
     Ok(format!(
-        "Started in background: pid {pid}\nOutput is being written to: {}\nCheck it with read_file on that path (wait a moment first). Stop the process when done with shell: {kill_hint}",
+        "Started in background: pid {pid}\nOutput is being written to: {}\n\
+         It has produced nothing yet. Let it run before looking: shell `{wait_hint}`, then \
+         read_file on that path, and again if it has not finished. Reading it in a tight loop \
+         only shows you the same bytes.\nStop the process when done with shell: {kill_hint}",
         log.display()
     ))
+}
+
+/// A failure that is the shell rejecting the syntax rather than the program
+/// disagreeing with anything, said in a way that names the fix.
+///
+/// This is one command's shell, not a language: the same sentence written for
+/// `sh` is a parse error in Windows PowerShell, and a model that has read far
+/// more `sh` than PowerShell writes it that way roughly every time. Left
+/// alone it costs a whole turn per occurrence, and the model has to infer the
+/// fix from a caret diagram.
+fn shell_syntax_hint(stderr: &str) -> Option<&'static str> {
+    if !cfg!(windows) {
+        return None;
+    }
+    // PowerShell 5.1 has no pipeline chain operators and no ternary
+    if stderr.contains("&&") || stderr.contains("||") {
+        return Some(
+            "hint: this shell is Windows PowerShell 5.1, where `&&` and `||` are not operators. \
+             Run the parts as separate commands, or join them with `;` to run both regardless.",
+        );
+    }
+    None
 }
 
 /// Pids thoth put into the background. A model that starts a server and
@@ -235,6 +322,10 @@ pub async fn run(a: ShellArgs, cancel: CancellationToken) -> Result<String> {
             .map(|c| c.to_string())
             .unwrap_or_else(|| "?".into());
         s.push_str(&format!("(command FAILED, exit code: {code})\n"));
+        if let Some(h) = shell_syntax_hint(&stderr) {
+            s.push_str(h);
+            s.push('\n');
+        }
     } else if s.is_empty() {
         s = "(command succeeded, exit code 0, no output)".into();
     }
@@ -287,5 +378,50 @@ mod tests {
             "captured {} bytes",
             out.len()
         );
+    }
+
+    /// PowerShell does not merge a native program's stderr into its stdout
+    /// the way `sh` does: it wraps each line in an ErrorRecord, so a build
+    /// that printed one ordinary progress line comes back as a
+    /// NativeCommandError with a caret diagram around it and the real output
+    /// buried underneath. Both streams are captured and labelled anyway.
+    #[test]
+    fn a_trailing_stderr_merge_comes_off_the_command() {
+        let go = |c: &str| drop_stderr_merge(c);
+        if !cfg!(windows) {
+            // sh merges the streams the way the words say, so nothing to do
+            assert_eq!(go("cargo check 2>&1"), "cargo check 2>&1");
+            return;
+        }
+        assert_eq!(go("cargo check 2>&1"), "cargo check");
+        assert_eq!(go("cargo check 2>&1   "), "cargo check");
+        assert_eq!(go("cargo check	2>&1"), "cargo check");
+        // as wrong in the middle of a pipeline as at the end
+        assert_eq!(
+            go("cargo build 2>&1 | Select-Object -First 5"),
+            "cargo build | Select-Object -First 5"
+        );
+        assert_eq!(
+            go("a --version 2>&1; b --version 2>&1"),
+            "a --version; b --version"
+        );
+        // but it has to be its own word
+        assert_eq!(go("echo 12>&1"), "echo 12>&1");
+        assert_eq!(go("cargo check 2>log"), "cargo check 2>log");
+        assert_eq!(go("cargo check"), "cargo check");
+    }
+
+    /// A shell rejecting the syntax is not the program disagreeing with
+    /// anything, and the caret diagram it prints does not say which shell
+    /// this is. Left alone it costs a whole turn every time.
+    #[test]
+    fn a_posix_ism_on_powershell_is_named_as_one() {
+        let hint = shell_syntax_hint("The token '&&' is not a valid statement separator");
+        if cfg!(windows) {
+            assert!(hint.expect("windows names it").contains(";"));
+        } else {
+            assert!(hint.is_none(), "sh has these operators, nothing to say");
+        }
+        assert!(shell_syntax_hint("no such file or directory").is_none());
     }
 }

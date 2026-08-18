@@ -198,11 +198,18 @@ pub struct Agent {
     /// Read-only call (name + arguments) to the id of the message holding
     /// its latest result, so an older identical one can be dropped.
     repeated: std::collections::HashMap<String, String>,
-    /// Identical tool calls (name + arguments) seen in the current request,
-    /// so a model going in circles is stopped. Reset with `repeated`: both
-    /// only make sense while the results they talk about are still in
-    /// `messages`, and a compaction takes those away.
-    call_counts: std::collections::HashMap<String, u32>,
+    /// Tool calls (name + arguments) seen in the current request that came
+    /// back with the same answer as the time before, and a hash of that
+    /// answer. A model going in circles is stopped; a model watching
+    /// something change is not, which is the reason for the hash. Reset with
+    /// `repeated`: both only make sense while the results they talk about
+    /// are still in `messages`, and a compaction takes those away.
+    call_counts: std::collections::HashMap<String, (u32, u64)>,
+    /// Files written whole in this request, and how many times, cleared
+    /// whenever a check runs. A second write of a file the model has not
+    /// found out anything about since the first is the expensive mistake
+    /// this catches.
+    rewrites: std::collections::HashMap<String, u32>,
     /// The language the user last wrote in, when it is not a Latin-script
     /// one. Kept because the reminder rides on the user message, and a
     /// compaction throws every user message away.
@@ -255,6 +262,7 @@ impl Agent {
             said_undo: false,
             repeated: std::collections::HashMap::new(),
             call_counts: std::collections::HashMap::new(),
+            rewrites: std::collections::HashMap::new(),
             reply_language: None,
             perm_mode: PermMode::default(),
             denied: 0,
@@ -421,6 +429,91 @@ impl Agent {
                 .copied()
         });
         owners.next()
+    }
+
+    /// Records what a call answered, so the next identical one can be told
+    /// apart from the same question asked twice.
+    ///
+    /// The breaker is there to stop a model going in circles, and its whole
+    /// claim is that running this again would tell it nothing new. That is
+    /// only true when the answer has not moved. A log being written to is
+    /// the case that proves it: thoth hands the model a path and asks it to
+    /// watch that file, so the one call thoth told it to make repeatedly
+    /// must not be the one thoth punishes it for. A different answer starts
+    /// the count again; the same answer three times over is a circle.
+    fn note_answer(&mut self, key: String, content: &str) {
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            content.hash(&mut h);
+            h.finish()
+        };
+        self.call_counts
+            .entry(key)
+            .and_modify(|(n, prev)| {
+                if *prev == digest {
+                    *n += 1;
+                } else {
+                    *n = 1;
+                    *prev = digest;
+                }
+            })
+            .or_insert((1, digest));
+    }
+
+    /// The file a call throws away and writes again from scratch, if it does.
+    ///
+    /// `edit_file` changes part of a file and is how a mistake in one is
+    /// meant to be fixed. `write_file` replaces the whole thing, and doing
+    /// that twice to the same path with nothing learned in between means the
+    /// second version was written out of exactly the knowledge that produced
+    /// the first. Matched on the file name, the way `forget_reads_of` does
+    /// it, because one call may name the file relatively and the next
+    /// absolutely.
+    fn overwritten(tc: &ToolCall) -> Option<String> {
+        if tc.function.name != "write_file" {
+            return None;
+        }
+        let args = serde_json::from_str::<Value>(&tc.function.arguments).ok()?;
+        let p = args.get("path")?.as_str()?;
+        Some(
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string()),
+        )
+    }
+
+    /// Why this whole-file write is being refused, when it is.
+    ///
+    /// The expensive failure this exists for: the model writes a file, reads
+    /// nothing back, decides on its own that the file is wrong, and writes
+    /// the same file again. Each pass costs a full generation and every one
+    /// of them is guesswork, because nothing between them told it anything.
+    /// The way out is in the message, and it is the cheap one either way:
+    /// run the check, or change the part that is wrong instead of all of it.
+    fn rewritten_blindly(&self, tc: &ToolCall, stacks: &[&Stack]) -> Option<String> {
+        let name = Self::overwritten(tc)?;
+        if *self.rewrites.get(&name)? == 0 {
+            return None;
+        }
+        // Only when there is a check to name, and the reason is not the
+        // wording. `ran_a_check` reads the same list, so with no stack in it
+        // nothing the model can run counts as having found anything out, and
+        // a block here would be one it can never lift: it would be locked
+        // out of writing that file for the rest of the request. A guard that
+        // cannot say what would satisfy it has no business refusing.
+        let s = stacks
+            .iter()
+            .find(|s| s.owns(&name))
+            .or_else(|| stacks.first())?;
+        Some(format!(
+            "STOP: {name} was already written whole in this request, and nothing has been run \
+             against it since. This rewrite is made out of the same guesses as the last one. \
+             Find out what is wrong with it first ({}), then change those parts with edit_file. \
+             Writing the file again from scratch replaces untested code with untested code.",
+            s.check
+        ))
     }
 
     /// Whether a shell call ran one of this project's checks. The words that
@@ -702,15 +795,24 @@ impl Agent {
         // about problems
         let window = window_of(&self.client, &self.cfg);
         let tools_def = tools::definitions(crate::editor::connected());
-        // breaks infinite loops: counts identical tool calls within this task
+        // breaks infinite loops: counts tool calls within this task that
+        // came back with the answer they came back with last time
         self.call_counts.clear();
+        self.rewrites.clear();
         // what this request actually did, for the note at the end of it
         let (mut changed_files, mut ran_command) = (false, false);
         // the stacks are read once for the request: a check is a fact about
-        // the project, and the project does not change kind mid-turn
-        let stacks = stack::here();
+        // the project, and an existing project does not change kind mid-turn.
+        // A directory with nothing in it is the exception, and it is a whole
+        // kind of request: "build me a project" starts with no manifest, so
+        // there is nothing to detect until the model writes one, and until
+        // then nothing it runs can be recognised as a check
+        let mut stacks = stack::here();
         let mut unchecked: Option<&Stack> = None;
         let mut checked = false;
+        // the one turn spent asking for a check that was never run, so a
+        // model that will not run it is not asked round and round
+        let mut nudged = false;
         self.denied = 0;
         let mut compact_pending = false;
         let mut truncations = 0u32;
@@ -816,6 +918,31 @@ impl Agent {
                     // changed anything to say it: that is the plan
                     self.send(AgentEvent::PlanReady);
                 }
+                // Before any of the notes below: they tell the user that the
+                // work was not checked, which is worth saying, but they say
+                // it once the model has already stopped and cannot act on
+                // it. Say it to the model first, once, while there is still
+                // a turn left to fix something in. Only when there is a
+                // check to name, and only when nothing was run at all: a
+                // model that ran its own program and drew the wrong
+                // conclusion needs the note, not another turn.
+                if !nudged
+                    && changed_files
+                    && !ran_command
+                    && let Some(s) = stacks.first()
+                {
+                    nudged = true;
+                    self.messages.push(Message::user(format!(
+                        "You changed code and ran nothing against it this request. Run {} now. \
+                         If it reports problems, fix them and run it again. If you cannot run \
+                         it, say so plainly instead of saying the work is done.",
+                        s.check
+                    )));
+                    self.send(AgentEvent::Info(
+                        "code changed and nothing was run: asking the model to check it".into(),
+                    ));
+                    continue;
+                }
                 // The prompt tells the model to build what it changed, and
                 // a model that did not do it still writes "build passed" at
                 // the end. Whether a command ran is not its word against
@@ -875,21 +1002,33 @@ impl Agent {
                     continue;
                 }
                 let key = format!("{}:{}", tc.function.name, tc.function.arguments);
-                let n = {
-                    let c = self.call_counts.entry(key).or_insert(0);
-                    *c += 1;
-                    *c
-                };
+                let n = self.call_counts.get(&key).map(|(n, _)| *n).unwrap_or(0);
                 if n > 2 {
                     let content = format!(
-                        "STOP: this exact {} call was already run {n} times with identical \
-                         input. The result will not change. Take a different approach, or \
-                         explain what is blocking you and stop.",
+                        "STOP: this exact {} call was already run {n} times and gave the same \
+                         answer every time. Take a different approach, or explain what is \
+                         blocking you and stop.",
                         tc.function.name
                     );
                     self.send(AgentEvent::ToolStart {
                         name: tc.function.name.clone(),
                         summary: "(repeated call blocked)".into(),
+                    });
+                    self.send(AgentEvent::ToolResult {
+                        content: content.clone(),
+                        is_error: true,
+                    });
+                    self.messages.push(Message::tool(
+                        tc.id.clone(),
+                        tc.function.name.clone(),
+                        content,
+                    ));
+                    continue;
+                }
+                if let Some(content) = self.rewritten_blindly(tc, &stacks) {
+                    self.send(AgentEvent::ToolStart {
+                        name: tc.function.name.clone(),
+                        summary: "(rewrite blocked: nothing was checked since the last one)".into(),
                     });
                     self.send(AgentEvent::ToolResult {
                         content: content.clone(),
@@ -919,6 +1058,7 @@ impl Agent {
                         true,
                     ),
                 };
+                self.note_answer(key, &content);
                 self.send(AgentEvent::ToolResult {
                     content: content.clone(),
                     is_error,
@@ -929,12 +1069,27 @@ impl Agent {
                     content,
                 ));
                 if !is_error {
+                    // a manifest just written is a project that did not
+                    // exist when this request started. Only while there is
+                    // nothing to find: once a stack is known, the listing is
+                    // settled and re-reading it every call would be waste
+                    if stacks.is_empty() && tools::changes_files(&tc.function.name) {
+                        stacks = stack::here();
+                    }
                     self.drop_stale_copy(tc);
                     self.forget_reads_of(tc);
                     changed_files |= Self::changed_code(tc);
                     ran_command |= tc.function.name == "shell";
                     unchecked = unchecked.or_else(|| Self::changed_unchecked(tc, &stacks));
-                    checked |= Self::ran_a_check(tc, &stacks);
+                    if Self::ran_a_check(tc, &stacks) {
+                        checked = true;
+                        // something was found out: every file is fair to
+                        // write again on the strength of it
+                        self.rewrites.clear();
+                    }
+                    if let Some(f) = Self::overwritten(tc) {
+                        *self.rewrites.entry(f).or_insert(0) += 1;
+                    }
                 }
             }
             if token.is_cancelled() {
@@ -1150,7 +1305,7 @@ mod tests {
             tx,
             Arc::new(Mutex::new(CancellationToken::new())),
         );
-        agent.call_counts.insert("read_file:{}".into(), 3);
+        agent.call_counts.insert("read_file:{}".into(), (3, 0));
         agent.repeated.insert("read_file:{}".into(), "a".into());
         agent.forget_call_history();
         assert!(agent.call_counts.is_empty(), "still blocked after compact");
@@ -1181,13 +1336,13 @@ mod tests {
         let counted = |a: &Agent, k: &str| a.call_counts.contains_key(k);
 
         let read_key = "read_file:{\"path\":\"src/lib.rs\"}";
-        agent.call_counts.insert(read_key.into(), 3);
+        agent.call_counts.insert(read_key.into(), (3, 0));
         agent
             .call_counts
-            .insert("grep:{\"pattern\":\"lib.rs\"}".into(), 2);
+            .insert("grep:{\"pattern\":\"lib.rs\"}".into(), (2, 0));
         agent
             .call_counts
-            .insert("list_dir:{\"path\":\"src\"}".into(), 1);
+            .insert("list_dir:{\"path\":\"src\"}".into(), (1, 0));
         agent
             .repeated
             .insert(read_key.into(), "old-result".to_string());
@@ -1224,7 +1379,7 @@ mod tests {
         // tests again after a fix is the habit, not a loop
         agent
             .call_counts
-            .insert("shell:{\"command\":\"cargo test\"}".into(), 3);
+            .insert("shell:{\"command\":\"cargo test\"}".into(), (3, 0));
         agent.forget_reads_of(&call("edit_file", "{\"path\":\"src/main.rs\"}"));
         assert!(
             !counted(&agent, "shell:{\"command\":\"cargo test\"}"),
@@ -1232,7 +1387,7 @@ mod tests {
         );
 
         // and a call that changes nothing leaves the count alone
-        agent.call_counts.insert(read_key.into(), 3);
+        agent.call_counts.insert(read_key.into(), (3, 0));
         agent.forget_reads_of(&call("shell", "{\"command\":\"cargo test\"}"));
         assert!(counted(&agent, read_key));
     }
@@ -1470,5 +1625,123 @@ mod tests {
         let text = last.content.clone().unwrap();
         assert!(text.contains("$ echo hello-from-thoth"));
         assert!(text.contains("hello-from-thoth"));
+    }
+
+    /// The rewrite loop this exists to stop: the model writes a file, is
+    /// told nothing by anyone, decides on its own that the file is wrong,
+    /// and writes the whole file again. Each pass is a full generation, and
+    /// each is made out of exactly the knowledge that produced the last one.
+    #[test]
+    fn a_file_cannot_be_written_from_scratch_twice_without_a_check() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cfg = crate::config::resolve(&crate::config::Profile::default());
+        let mut agent = Agent::new(
+            Client::new(&cfg),
+            cfg,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+        let call = |name: &str, args: &str| ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+        };
+        let listing =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| (*s).to_string()).collect() };
+        let rust = stack::detect(&listing(&["Cargo.toml"]));
+        let write = call("write_file", "{\"path\":\"src/main.rs\"}");
+
+        // the first one is how a file gets written at all
+        assert!(agent.rewritten_blindly(&write, &rust).is_none());
+        *agent.rewrites.entry("main.rs".into()).or_insert(0) += 1;
+
+        // the second, with nothing run in between, is the one that costs
+        let blocked = agent
+            .rewritten_blindly(&write, &rust)
+            .expect("a second whole-file write with nothing learned since");
+        assert!(blocked.contains("main.rs"));
+        assert!(
+            blocked.contains(rust[0].check),
+            "it has to name this project's check, not a language it guessed: {blocked}"
+        );
+        assert!(blocked.contains("edit_file"), "and the cheaper way out");
+
+        // naming the same file the other way round is the same file
+        let far = call("write_file", "{\"path\":\"C:/p/src/main.rs\"}");
+        assert!(agent.rewritten_blindly(&far, &rust).is_some());
+
+        // a different file has its own first go
+        let other = call("write_file", "{\"path\":\"src/lib.rs\"}");
+        assert!(agent.rewritten_blindly(&other, &rust).is_none());
+
+        // an edit is the way to fix what one write got wrong, never blocked
+        let edit = call("edit_file", "{\"path\":\"src/main.rs\"}");
+        assert!(agent.rewritten_blindly(&edit, &rust).is_none());
+
+        // and once something has actually been run, the slate is clean
+        assert!(Agent::ran_a_check(
+            &call("shell", "{\"command\":\"cargo check\"}"),
+            &rust
+        ));
+        agent.rewrites.clear();
+        assert!(agent.rewritten_blindly(&write, &rust).is_none());
+
+        // "build me a project" starts in an empty directory: no manifest
+        // means no stack, and `ran_a_check` reads the same empty list, so
+        // nothing the model could run would lift a block made here. It must
+        // not make one, or the file it wrote once can never be written again
+        *agent.rewrites.entry("main.rs".into()).or_insert(0) += 1;
+        let nothing: Vec<&'static Stack> = Vec::new();
+        assert!(!Agent::ran_a_check(
+            &call("shell", "{\"command\":\"cargo check\"}"),
+            &nothing
+        ));
+        assert!(
+            agent.rewritten_blindly(&write, &nothing).is_none(),
+            "a guard with no check to name would be one nothing can satisfy"
+        );
+    }
+
+    /// The breaker's claim is that running this again would tell the model
+    /// nothing new, and that is a claim about the answer, not about the
+    /// question. thoth hands out a log path and asks the model to watch that
+    /// file: the one call it is told to repeat must not be the one it is
+    /// stopped for.
+    #[test]
+    fn a_call_whose_answer_keeps_changing_is_not_going_in_circles() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cfg = crate::config::resolve(&crate::config::Profile::default());
+        let mut agent = Agent::new(
+            Client::new(&cfg),
+            cfg,
+            tx,
+            Arc::new(Mutex::new(CancellationToken::new())),
+        );
+        let key = "read_file:{\"path\":\"build.log\"}";
+        let count = |a: &Agent| a.call_counts.get(key).map(|(n, _)| *n).unwrap_or(0);
+
+        // a log that is still being written to: every read says something new
+        for (i, line) in ["compiling 1/400", "compiling 90/400", "compiling 400/400"]
+            .iter()
+            .enumerate()
+        {
+            agent.note_answer(key.into(), line);
+            assert_eq!(count(&agent), 1, "read {i} moved, so it starts over");
+        }
+
+        // the same answer over and over is the circle the breaker is for
+        agent.note_answer(key.into(), "done");
+        assert_eq!(count(&agent), 1);
+        agent.note_answer(key.into(), "done");
+        assert_eq!(count(&agent), 2);
+        agent.note_answer(key.into(), "done");
+        assert_eq!(count(&agent), 3, "the next one is refused");
+
+        // and one new byte is enough to let it go again
+        agent.note_answer(key.into(), "done, with a warning");
+        assert_eq!(count(&agent), 1);
     }
 }

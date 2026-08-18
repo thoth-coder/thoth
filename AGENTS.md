@@ -135,7 +135,20 @@ along those lines needs no new `pub`.
 
 - Guardrails go in code, not in the prompt, whenever possible. See the
   read registry in `tools/fs.rs`: write_file needs every line of a file
-  covered by earlier reads, not just "a read happened".
+  covered by earlier reads, not just "a read happened". And the rewrite
+  guard in `agent/mod.rs`: a file written whole twice in one request with
+  no check in between was written the second time out of the same knowledge
+  as the first.
+- A note that only reaches the user reaches it too late to fix anything.
+  "Files changed and nothing was run" is worth saying either way, but the
+  model is the one that can still act on it, so it is put to the model first
+  and told to the user afterwards. Once per request: a model that will not
+  run the check must not be asked round and round.
+- A guardrail that refuses has to be able to say what would satisfy it. The
+  rewrite guard stays quiet when no stack is detected, because `ran_a_check`
+  reads the same list: with nothing in it, no command the model could run
+  would lift the block, and a refusal it cannot clear locks it out of the
+  file for the rest of the request.
 - thoth is not a TypeScript tool or a Rust tool. No language, framework,
   file extension or shell command belongs anywhere but a table: `tsc`,
   `cargo`, `php -l` and the rest live in `agent/stack.rs` and nowhere else.

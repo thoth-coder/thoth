@@ -5,7 +5,6 @@
 use super::stream::TextStream;
 use super::{AssistantTurn, Client, FunctionCall, Message, StreamEvent, ToolCall, Usage};
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -126,6 +125,9 @@ impl Client {
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
+        // a stream that has started talking and stopped is a different
+        // failure from one that never started, and waits a different length
+        let mut started = false;
         let mut turn = AssistantTurn::default();
         let mut text = TextStream::new(tools);
         // (id, name, arguments) accumulated per tool-call index
@@ -137,9 +139,9 @@ impl Client {
                     turn.interrupted = true;
                     break 'outer;
                 }
-                chunk = stream.next() => {
-                    let Some(chunk) = chunk else { break 'outer };
-                    let chunk = chunk.context("stream error")?;
+                chunk = super::stream::next_chunk(&mut stream, started) => {
+                    let Some(chunk) = chunk? else { break 'outer };
+                    started = true;
                     buf.extend_from_slice(&chunk);
                     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                         let line: Vec<u8> = buf.drain(..=pos).collect();
