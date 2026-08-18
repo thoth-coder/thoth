@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-08-18
+
 ### Added
 - Lua. One row in the stack table: `luac -p` per file plus luacheck, marked as
   a stack that running does not check, because a chunk is only compiled when
@@ -675,6 +677,7 @@ All notable changes to thoth are documented here. The format follows
   targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
   with install/uninstall scripts for curl | sh and irm | iex.
 
+[0.4.5]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.5
 [0.4.4]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.4
 [0.4.3]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.3
 [0.4.2]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.2
