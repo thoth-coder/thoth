@@ -6,6 +6,11 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- A reply with nothing in it is asked again rather than taken for an answer.
+  A model that spends its turn thinking and emits no text and no tool call
+  was ending the request wherever it had got to: in one run that left a
+  `cargo init` skeleton, a hello-world main, and a report that the work was
+  done. Twice, then it is handed back to the user as before.
 - A request that changed code and ran nothing against it gets one more turn,
   with thoth asking for the check by name before the request ends. The note
   that said so was already there, but it told the user, after the model had

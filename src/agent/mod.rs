@@ -813,6 +813,9 @@ impl Agent {
         // the one turn spent asking for a check that was never run, so a
         // model that will not run it is not asked round and round
         let mut nudged = false;
+        // replies with nothing in them at all, so asking again cannot become
+        // its own loop
+        let mut empty_replies = 0u32;
         self.denied = 0;
         let mut compact_pending = false;
         let mut truncations = 0u32;
@@ -908,7 +911,26 @@ impl Agent {
                 },
             ));
             if tool_calls.is_empty() {
+                // Nothing at all came back: no answer, no call, and not the
+                // context running out either. A thinking model does this
+                // when it spends the reply on reasoning and emits none of
+                // it, and taking it for "finished" ends the request wherever
+                // it happened to be. It is not an answer, so it is not
+                // treated as one: ask again, a couple of times, and only
+                // then hand it back to the user.
                 if !had_content && !turn.truncated {
+                    empty_replies += 1;
+                    if empty_replies <= 2 {
+                        self.messages.push(Message::user(
+                            "That reply was empty. Carry on from where you were, or say what \
+                             is stopping you."
+                                .to_string(),
+                        ));
+                        self.send(AgentEvent::Info(
+                            "empty reply from the model, asking again".into(),
+                        ));
+                        continue;
+                    }
                     self.send(AgentEvent::Info(
                         "(empty response from the model. rephrase, or /compact to free context)"
                             .into(),
