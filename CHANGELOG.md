@@ -5,6 +5,8 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-08-18
+
 ### Added
 - A reply with nothing in it is asked again rather than taken for an answer.
   A model that spends its turn thinking and emits no text and no tool call
@@ -640,6 +642,7 @@ All notable changes to thoth are documented here. The format follows
   targets (Linux x86_64/arm64 musl, macOS Intel/Apple Silicon, Windows),
   with install/uninstall scripts for curl | sh and irm | iex.
 
+[0.4.4]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.4
 [0.4.3]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.3
 [0.4.2]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.2
 [0.4.1]: https://github.com/thoth-coder/thoth/releases/tag/v0.4.1
