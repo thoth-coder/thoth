@@ -11,7 +11,8 @@ All notable changes to thoth are documented here. The format follows
   was ending the request wherever it had got to: in one run that left a
   `cargo init` skeleton, a hello-world main, and a report that the work was
   done. Twice, then it is handed back to the user as before.
-- A request that changed code and ran nothing against it gets one more turn,
+- A request that changed code and has not run anything against it since gets
+  one more turn,
   with thoth asking for the check by name before the request ends. The note
   that said so was already there, but it told the user, after the model had
   stopped and could no longer act on it. In a run of six Rust projects the
@@ -19,6 +20,10 @@ All notable changes to thoth are documented here. The format follows
   and did nothing at run time: five tasks spawned into a channel that
   collected zero results. Asked to check its own work, the model found it and
   fixed it. Once per request, and only where the project has a check to name.
+  The question is what has happened since the last edit, not whether any
+  command ran at all: a model that builds, then edits twice more and stops
+  has run a command and checked nothing, and two runs of the suite caught
+  exactly that, each leaving a project that did not compile.
 
 ### Fixed
 - `-p` mode strips escape sequences from what it prints, which it never did.

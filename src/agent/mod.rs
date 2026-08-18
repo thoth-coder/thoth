@@ -813,6 +813,11 @@ impl Agent {
         // the one turn spent asking for a check that was never run, so a
         // model that will not run it is not asked round and round
         let mut nudged = false;
+        // code has been changed and nothing has been run against it *since*.
+        // Not "no command ran this request": a model that builds, then edits
+        // twice more and stops has run a command and checked nothing, and
+        // that is the shape this is here to catch
+        let mut unchecked_edits = false;
         // replies with nothing in them at all, so asking again cannot become
         // its own loop
         let mut empty_replies = 0u32;
@@ -949,13 +954,12 @@ impl Agent {
                 // model that ran its own program and drew the wrong
                 // conclusion needs the note, not another turn.
                 if !nudged
-                    && changed_files
-                    && !ran_command
+                    && unchecked_edits
                     && let Some(s) = stacks.first()
                 {
                     nudged = true;
                     self.messages.push(Message::user(format!(
-                        "You changed code and ran nothing against it this request. Run {} now. \
+                        "You changed code and have not run anything against it since. Run {} now. \
                          If it reports problems, fix them and run it again. If you cannot run \
                          it, say so plainly instead of saying the work is done.",
                         s.check
@@ -1103,8 +1107,13 @@ impl Agent {
                     changed_files |= Self::changed_code(tc);
                     ran_command |= tc.function.name == "shell";
                     unchecked = unchecked.or_else(|| Self::changed_unchecked(tc, &stacks));
+                    if Self::changed_code(tc) {
+                        unchecked_edits = true;
+                    }
                     if Self::ran_a_check(tc, &stacks) {
                         checked = true;
+                        // the edits up to here have had their answer
+                        unchecked_edits = false;
                         // something was found out: every file is fair to
                         // write again on the strength of it
                         self.rewrites.clear();
