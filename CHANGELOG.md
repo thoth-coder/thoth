@@ -6,6 +6,16 @@ All notable changes to thoth are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- The interface says whether it is working or waiting. "working 14m" with a
+  spinner turning is what an evening looked like when the ollama server had
+  wedged and was sending nothing at all: the elapsed timer cannot tell a model
+  thinking hard from a server that has stopped answering, and the two want
+  opposite things from the person watching. After 45 seconds with nothing back
+  the state line says so, and says whether anything has arrived this turn at
+  all. Note for anyone who meets the same hang: a client-side timeout does not
+  free the server. Ollama stayed stuck behind that request, refusing even a
+  one-word prompt from curl, until thoth's process died and the connection
+  closed.
 - A search that comes back with nothing now says which kind of nothing it is.
   Search is eight results scraped off one page of html with two regexes, and
   an empty parse was reported as "No results found" whether the engine had

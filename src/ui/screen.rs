@@ -142,7 +142,8 @@ impl App {
                 Span::styled(SPINNER[self.spin], Style::default().fg(theme::BUSY)),
                 Span::styled(
                     format!(
-                        " working  {}  esc to interrupt",
+                        " {}  {}  esc to interrupt",
+                        self.busy_word(),
                         fmt_elapsed(self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0))
                     ),
                     theme::muted(),
@@ -599,6 +600,32 @@ impl App {
                 Span::styled(format!("{key:<9}  "), theme::key()),
                 Span::styled(clip(what, width.saturating_sub(13)), theme::muted()),
             ]));
+        }
+    }
+
+    /// What the spinner is spinning for.
+    ///
+    /// "working" and "waiting" look the same from the outside and want
+    /// opposite things from the user. A model that has sent nothing at all
+    /// for a while is not thinking hard, it is a server that has not started
+    /// answering, and the person watching should be told which one it is
+    /// rather than left to guess for ten minutes. The threshold is generous
+    /// because a large local model really does take a minute to read a
+    /// request before its first token.
+    fn busy_word(&self) -> String {
+        const QUIET_SECS: u64 = 45;
+        let silent = match self.last_from_model {
+            Some(t) => t.elapsed().as_secs(),
+            // nothing at all has come back since the request went out
+            None => self.turn_start.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+        };
+        if silent < QUIET_SECS {
+            return "working".into();
+        }
+        if self.last_from_model.is_none() {
+            format!("waiting for the model, nothing back yet after {silent}s")
+        } else {
+            format!("waiting, nothing for {silent}s")
         }
     }
 

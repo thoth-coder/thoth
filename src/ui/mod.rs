@@ -205,6 +205,16 @@ struct App {
     perm_mode: PermMode,
     session_start: std::time::Instant,
     turn_start: Option<std::time::Instant>,
+    /// When the model last sent anything at all this turn: a token of
+    /// reasoning, a token of answer, a tool call. None means the request has
+    /// gone out and nothing has come back yet.
+    ///
+    /// The elapsed timer alone cannot tell a model thinking hard from a
+    /// server that has stopped answering, and those want opposite things from
+    /// the user: wait, or go and look at the server. A local model can take
+    /// minutes over the first token, so this is not an error, it is the
+    /// difference between the two said out loud.
+    last_from_model: Option<std::time::Instant>,
     /// Live "In file.rs, N lines selected" label from the IDE extension.
     editor_status: Option<String>,
     tick_count: u64,
@@ -375,6 +385,7 @@ impl App {
             quit: false,
             session_start: std::time::Instant::now(),
             turn_start: None,
+            last_from_model: None,
             editor_status: crate::editor::live_status(),
             tick_count: 0,
             window: session.window,
@@ -392,6 +403,16 @@ impl App {
     }
 
     fn on_agent_event(&mut self, ev: AgentEvent) {
+        // anything arriving at all is the model still talking to us. Usage
+        // and the connection banner are not: they are thoth telling itself
+        // something, and counting them would hide exactly the silence this
+        // is here to show
+        if !matches!(
+            ev,
+            AgentEvent::Usage { .. } | AgentEvent::Connected { .. } | AgentEvent::TurnEnd
+        ) {
+            self.last_from_model = Some(std::time::Instant::now());
+        }
         match ev {
             AgentEvent::Content(t) => match self.blocks.last_mut() {
                 Some(ChatBlock::Assistant(s)) => s.push_str(&t),
@@ -475,6 +496,7 @@ impl App {
                 }
                 if self.turn_start.is_none() {
                     self.turn_start = Some(std::time::Instant::now());
+                    self.last_from_model = None;
                 }
             }
             AgentEvent::Usage { usage, cost } => {
@@ -881,6 +903,7 @@ impl App {
     fn set_busy(&mut self) {
         self.mode = Mode::Busy;
         self.turn_start = Some(std::time::Instant::now());
+        self.last_from_model = None;
     }
 
     fn command(&mut self, cmd: &str) {
@@ -1399,15 +1422,41 @@ mod tests {
         assert!(s[first + 2].contains("third"), "{:?}", s[first + 2]);
     }
 
+    /// The elapsed timer alone cannot tell a model thinking hard from a
+    /// server that has stopped answering, and the two want opposite things
+    /// from the person watching. One evening cost fourteen minutes of staring
+    /// at a spinner that said "working" while ollama had wedged and was
+    /// sending nothing at all.
     #[test]
-    fn busy_state_shows_spinner_and_elapsed() {
+    fn busy_state_says_whether_it_is_working_or_waiting() {
+        let ago = |n| Some(std::time::Instant::now() - std::time::Duration::from_secs(n));
         let mut a = app();
         a.mode = Mode::Busy;
-        a.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(75));
+
+        // tokens arriving: this is work, however long it has been going
+        a.turn_start = ago(75);
+        a.last_from_model = ago(2);
         let s = screen(&mut a, 80, 12);
         assert!(s[7].contains("working"), "{:?}", s[7]);
         assert!(s[7].contains("1m 15s"), "{:?}", s[7]);
         assert!(s[7].contains("esc to interrupt"));
+
+        // nothing back at all since the request went out
+        a.last_from_model = None;
+        let s = screen(&mut a, 80, 12);
+        assert!(s[7].contains("nothing back yet"), "{:?}", s[7]);
+        assert!(s[7].contains("75s"), "{:?}", s[7]);
+
+        // it was talking and then stopped
+        a.last_from_model = ago(60);
+        let s = screen(&mut a, 80, 12);
+        assert!(s[7].contains("nothing for 60s"), "{:?}", s[7]);
+
+        // and a turn that has only just started says nothing alarming
+        a.turn_start = ago(3);
+        a.last_from_model = None;
+        let s = screen(&mut a, 80, 12);
+        assert!(s[7].contains("working"), "{:?}", s[7]);
     }
 
     #[test]
