@@ -21,6 +21,14 @@ All notable changes to thoth are documented here. The format follows
   fixed it. Once per request, and only where the project has a check to name.
 
 ### Fixed
+- `-p` mode strips escape sequences from what it prints, which it never did.
+  The interface has taken them out of every line it draws since 0.4.2, and
+  this half was missed: a file thoth was asked to read could still repaint or
+  wipe the terminal of anyone running `thoth -p`, and a title-setting OSC or
+  a right-to-left override went straight through. Found by a case that seeds
+  a source file carrying both escapes and instructions addressed to the
+  model; the model ignored the instructions and deleted them from the file,
+  but the escapes reached the terminal.
 - A file cannot be written whole twice in one request with nothing run
   against it in between. The model would write a file, be told nothing by
   anyone, decide on its own that it was wrong, and write the whole thing

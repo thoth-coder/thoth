@@ -6,9 +6,15 @@
 //! Everything that is thoth talking about itself, and every line a tool
 //! printed, goes to stderr, so `thoth -p "..." > answer.txt` leaves a file
 //! with the answer in it and a terminal with the working shown.
+//!
+//! Both halves go through `printable` on the way out. There is a terminal on
+//! the other end of this too, and almost none of what is written to it was
+//! written by thoth: a `\x1b[2J` in a file thoth was asked to read wipes the
+//! screen here exactly as it would in the interface.
 
 use crate::agent::{AgentCmd, AgentEvent, PermReply};
 use crate::ui;
+use crate::ui::render::printable;
 use anyhow::{Result, anyhow};
 use std::io::Write as _;
 use tokio::sync::mpsc;
@@ -24,7 +30,7 @@ pub async fn run(
 ) -> Result<()> {
     let (attachments, labels) = ui::input::expand_mentions(&prompt, &ui::input::cwd());
     for l in labels {
-        eprintln!("* {l}");
+        eprintln!("* {}", printable(&l));
     }
     cmd_tx
         .send(AgentCmd::UserInput(format!("{prompt}{attachments}")))
@@ -34,14 +40,16 @@ pub async fn run(
     while let Some(ev) = ev_rx.recv().await {
         match ev {
             AgentEvent::Content(t) => {
-                print!("{t}");
+                print!("{}", printable(&t));
                 std::io::stdout().flush().ok();
             }
-            AgentEvent::ToolStart { name, summary } => eprintln!("\n[{name}] {summary}"),
+            AgentEvent::ToolStart { name, summary } => {
+                eprintln!("\n[{}] {}", printable(&name), printable(&summary))
+            }
             AgentEvent::ToolResult { content, is_error } => {
                 let lines: Vec<&str> = content.lines().collect();
                 for l in lines.iter().take(RESULT_LINES) {
-                    eprintln!("  | {l}");
+                    eprintln!("  | {}", printable(l));
                 }
                 if lines.len() > RESULT_LINES {
                     eprintln!("  | … +{} lines", lines.len() - RESULT_LINES);
@@ -55,19 +63,19 @@ pub async fn run(
                 preview,
                 reply,
             } => {
-                eprintln!("\n{preview}");
+                eprintln!("\n{}", printable(&preview));
                 let _ = reply.send(ask(&tool).await);
             }
             AgentEvent::Diff(t) => {
                 for l in t.lines() {
-                    eprintln!("  {l}");
+                    eprintln!("  {}", printable(l));
                 }
             }
-            AgentEvent::Info(t) => eprintln!("* {t}"),
-            AgentEvent::Error(t) => eprintln!("error: {t}"),
+            AgentEvent::Info(t) => eprintln!("* {}", printable(&t)),
+            AgentEvent::Error(t) => eprintln!("error: {}", printable(&t)),
             AgentEvent::Models(models) => {
                 for m in models {
-                    eprintln!("  {m}");
+                    eprintln!("  {}", printable(&m));
                 }
             }
             AgentEvent::Usage { usage, cost } => spend.add(&usage, cost),
@@ -77,7 +85,10 @@ pub async fn run(
             AgentEvent::Choice {
                 question, reply, ..
             } => {
-                println!("\n[question, unanswered: nobody is here] {question}");
+                println!(
+                    "\n[question, unanswered: nobody is here] {}",
+                    printable(&question)
+                );
                 let _ = reply.send(None);
             }
             AgentEvent::TurnEnd => break,
@@ -144,5 +155,31 @@ impl Spend {
                 String::new()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-p` has a terminal on the other end of it as much as the interface
+    /// does, and almost nothing it writes there was written by thoth. This
+    /// went unnoticed once already: the escapes were taken out of every line
+    /// the interface draws and out of none of the lines this prints.
+    #[test]
+    fn nothing_reaches_the_terminal_with_its_escapes_still_in_it() {
+        let hostile = "\u{1b}[31mred\u{1b}[0m and \u{1b}[2Jwiped";
+        let out = printable(hostile);
+        assert_eq!(out, "red and wiped");
+        assert!(!out.contains('\u{1b}'));
+
+        // an OSC title change and a bidi override are the other two ways of
+        // making a terminal show one thing and mean another
+        assert_eq!(printable("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(printable("safe\u{202e}gnp.exe"), "safegnp.exe");
+
+        // and ordinary text comes through as it was, tabs aside
+        assert_eq!(printable("lines=2 words=3"), "lines=2 words=3");
+        assert_eq!(printable("a\tb"), "a    b");
     }
 }
