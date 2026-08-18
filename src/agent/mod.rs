@@ -844,6 +844,13 @@ impl Agent {
         // twice more and stops has run a command and checked nothing, and
         // that is the shape this is here to catch
         let mut unchecked_edits = false;
+        // how many files have been changed with nothing run against any of
+        // them. A long task done as one silent stretch of edits and a single
+        // build at the end is the shape a user watches for ten minutes and
+        // sees nothing from, and it is also the shape where the first error
+        // found is buried under five files' worth of consequences
+        let mut edits_since_check = 0u32;
+        let mut asked_to_check_midway = false;
         // replies with nothing in them at all, so asking again cannot become
         // its own loop
         let mut empty_replies = 0u32;
@@ -1135,11 +1142,13 @@ impl Agent {
                     unchecked = unchecked.or_else(|| Self::changed_unchecked(tc, &stacks));
                     if Self::changed_code(tc) {
                         unchecked_edits = true;
+                        edits_since_check += 1;
                     }
                     if Self::ran_a_check(tc, &stacks) {
                         checked = true;
                         // the edits up to here have had their answer
                         unchecked_edits = false;
+                        edits_since_check = 0;
                     }
                     if Self::learned_something(tc, &stacks) {
                         // every file is fair to write again on the strength
@@ -1152,6 +1161,29 @@ impl Agent {
                         *self.rewrites.entry(f).or_insert(0) += 1;
                     }
                 }
+            }
+            // A long task can be done as one silent stretch of edits with a
+            // single build at the end, and that is the worst way round for
+            // everyone: the person watching sees nothing happen for ten
+            // minutes, and the first error is found underneath five files'
+            // worth of changes made on top of it. Said once, as a reminder
+            // rather than a refusal, and only where there is a check to name.
+            // Some changes genuinely only compile together, a rename across
+            // four files being the obvious one, so it says so and leaves the
+            // judgement where it belongs.
+            const EDITS_BEFORE_A_WORD: u32 = 4;
+            if !asked_to_check_midway
+                && edits_since_check >= EDITS_BEFORE_A_WORD
+                && let Some(st) = stacks.first()
+            {
+                asked_to_check_midway = true;
+                self.messages.push(Message::user(format!(
+                    "You have changed {edits_since_check} files and run nothing against any of                      them. Run {} now, before changing anything else, unless these changes only                      make sense together and none of them would build alone. Working in small                      checked steps finds a mistake while it is still one mistake.",
+                    st.check
+                )));
+                self.send(AgentEvent::Info(format!(
+                    "{edits_since_check} files changed and nothing run: asking for a check"
+                )));
             }
             if token.is_cancelled() {
                 self.send(AgentEvent::Info("interrupted".into()));

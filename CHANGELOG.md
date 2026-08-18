@@ -5,6 +5,19 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- thoth asks for a check partway through a long stretch of edits, not only at
+  the end. Four files changed with nothing run against any of them and it says
+  so, once, naming this project's check. A long task done as one silent run of
+  edits and a single build at the end is the worst arrangement for everyone:
+  the person watching sees nothing happen for ten minutes, and the first error
+  is found underneath four more files of changes made on top of it. It is a
+  reminder and not a refusal, because some changes only compile together, and
+  it says that too: renaming a type across four files is the obvious case, and
+  it is the case this was tested against. That run fired the reminder, ran the
+  check, saw the errors it was supposed to see, carried on and passed. Four
+  other cases changed fewer files and never saw it.
+
 ### Fixed
 - The interface says whether it is working or waiting. "working 14m" with a
   spinner turning is what an evening looked like when the ollama server had
