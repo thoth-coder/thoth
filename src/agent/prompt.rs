@@ -152,10 +152,13 @@ changed (never `git add -A` blindly) and write a one-line message describing the
         );
     }
     out.push_str(if editor {
-        "\n- Code you changed is not done until something has run it. Check the `problems` tool \
-first (live editor diagnostics, fast), then build it and run its tests with the shell tool. Do \
-that before you say the task is finished, not only at the very end of a long task: after each \
-file that could break the build."
+        "\n- Code you changed is not done until something has run it. Build it and run its \
+tests with the shell tool before you say the task is finished, not only at the very end of a \
+long task: after each file that could break the build. The `problems` tool comes after that, \
+never instead of it: it reads the editor's language server, which lags behind edits and \
+sometimes needs the server restarted before a fixed error clears. A diagnostic still showing \
+after a build that passed is stale. Say what it says and carry on; do not go back and change \
+working code to satisfy it."
     } else {
         "\n- Code you changed is not done until something has run it. Build it and run its tests \
 with the shell tool before you say the task is finished, not only at the very end of a long task: \
@@ -166,6 +169,22 @@ after each file that could break the build."
     // how a Bun project gets `npm run build` and a Makefile gets a hand-rolled
     // gcc line. The table in `stack` says what checks each kind of project;
     // this only reads it, and knows the name of no language itself.
+    // one line, not one per stack: naming the host to scope a search to is
+    // what turns eight scraped results into the reference instead of a pile
+    // of tutorials, and the hosts come out of the same table as everything
+    // else here
+    let docs: Vec<&str> = stacks
+        .iter()
+        .map(|s| s.docs)
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !docs.is_empty() {
+        out.push_str(&format!(
+            "
+- Look an api up rather than recalling it, and scope the search to the reference: `site:{} <what you need>`. A version number or a signature remembered from training is the thing most likely to be out of date.",
+            docs.join("` or `site:")
+        ));
+    }
     for s in stacks {
         out.push_str(&format!("\n- Check the {} with {}.", s.name, s.check));
         if !s.run_checks {
@@ -467,6 +486,14 @@ mod tests {
         let all = situational_rules(true, true, &ts);
         assert!(all.contains("git commit"), "{all}");
         assert!(all.contains("`problems` tool"), "{all}");
+        // the build is the check and the editor is the second opinion, in
+        // that order. The other way round is a loop: the language server can
+        // still be showing an error the build has already cleared, and a
+        // model told to trust it goes back and changes working code
+        let build_at = all.find("Build it and run its").expect("build rule");
+        let problems_at = all.find("`problems` tool").expect("problems rule");
+        assert!(build_at < problems_at, "the build has to come first: {all}");
+        assert!(all.contains("stale"), "and the lag has to be said: {all}");
         // the command comes out of the table, and the warning with it
         assert!(all.contains("tsc --noEmit"), "{all}");
         assert!(all.contains("Running it is NOT that check"), "{all}");

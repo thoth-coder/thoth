@@ -516,6 +516,23 @@ impl Agent {
         ))
     }
 
+    /// Whether a call told the model something it did not know about the code
+    /// it had just changed. Wider than `ran_a_check` on purpose.
+    ///
+    /// `problems` is the editor's language server answering, and it exists
+    /// only when there is an editor on the other end. It is not the build, so
+    /// it does not settle the question the end-of-request note asks. But it is
+    /// unquestionably finding something out, and the guards that refuse on the
+    /// grounds that nothing has been found out have to see it, or a model that
+    /// does what the `problems` tool description tells it to do gets refused
+    /// for the rest of the request with no way to clear the refusal. That is
+    /// the same trap the empty stack list was, and the same rule applies: a
+    /// guardrail that refuses has to be able to say what would satisfy it, and
+    /// everything it would accept has to be reachable.
+    fn learned_something(tc: &ToolCall, stacks: &[&Stack]) -> bool {
+        tc.function.name == "problems" || Self::ran_a_check(tc, stacks)
+    }
+
     /// Whether a shell call ran one of this project's checks. The words that
     /// count are the stack's own, out of the same table the prompt reads.
     fn ran_a_check(tc: &ToolCall, stacks: &[&Stack]) -> bool {
@@ -1114,8 +1131,12 @@ impl Agent {
                         checked = true;
                         // the edits up to here have had their answer
                         unchecked_edits = false;
-                        // something was found out: every file is fair to
-                        // write again on the strength of it
+                    }
+                    if Self::learned_something(tc, &stacks) {
+                        // every file is fair to write again on the strength
+                        // of it. Deliberately wider than `checked`: the
+                        // editor's diagnostics unblock the model without
+                        // settling what the user is told at the end
                         self.rewrites.clear();
                     }
                     if let Some(f) = Self::overwritten(tc) {
@@ -1711,6 +1732,36 @@ mod tests {
         // an edit is the way to fix what one write got wrong, never blocked
         let edit = call("edit_file", "{\"path\":\"src/main.rs\"}");
         assert!(agent.rewritten_blindly(&edit, &rust).is_none());
+
+        // The editor's diagnostics are the other way of finding something
+        // out, and they only exist when an editor is attached: a session in
+        // the interface with VS Code open gets a `problems` tool that a `-p`
+        // run in a bare directory never sees. The tool's own description
+        // tells the model to reach for it "before falling back to a full
+        // build", so a guard that does not count it refuses the model for
+        // doing exactly what it was told, with nothing it can do to clear the
+        // refusal. That difference was invisible for a day because every lab
+        // case ran `-p` in a temp directory with no editor attached.
+        *agent.rewrites.entry("main.rs".into()).or_insert(0) += 1;
+        let problems = ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: crate::client::FunctionCall {
+                name: "problems".into(),
+                arguments: "{}".to_string(),
+            },
+        };
+        assert!(agent.rewritten_blindly(&write, &rust).is_some());
+        assert!(
+            !Agent::ran_a_check(&problems, &rust),
+            "it is not the build, and the note at the end must still say so"
+        );
+        assert!(
+            Agent::learned_something(&problems, &rust),
+            "but it is finding something out, and the block has to lift"
+        );
+        agent.rewrites.clear();
+        assert!(agent.rewritten_blindly(&write, &rust).is_none());
 
         // and once something has actually been run, the slate is clean
         assert!(Agent::ran_a_check(

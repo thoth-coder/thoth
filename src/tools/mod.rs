@@ -178,7 +178,7 @@ pub fn definitions(with_problems: bool) -> Value {
     if with_problems && let Some(list) = defs.as_array_mut() {
         list.push(json!({"type": "function", "function": {
             "name": "problems",
-            "description": "Get the current errors and warnings from the user's editor (the IDE Problems panel, live from the language server). Cheap and fast. Use it after editing files to check whether problems are fixed, before falling back to a full build. Diagnostics may lag a moment behind edits.",
+            "description": "Get the errors and warnings currently showing in the user's editor (the IDE Problems panel, from the language server). A second opinion, not the check: run the build and the tests first, then look here for anything they did not cover. The language server lags behind edits and can need restarting before a fixed error clears, so a diagnostic that survives a passing build is stale. Report it and move on rather than changing working code to clear it.",
             "parameters": {"type": "object", "properties": {}}
         }}));
     }
@@ -212,10 +212,53 @@ pub fn needs_permission(name: &str, args: &Value) -> bool {
     match name {
         "write_file" | "edit_file" | "multi_edit" | "move_file" | "delete_file" | "shell"
         | "remember" | "web_fetch" => true,
-        // reading inside the project is free; reaching outside it is not
-        "read_file" => !fs::inside_project(args.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+        // reading inside the project is free; reaching outside it is not,
+        // and neither is a file whose whole purpose is to hold secrets, even
+        // when it sits in the middle of the project
+        "read_file" => {
+            let p = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            !fs::inside_project(p) || holds_credentials(p)
+        }
         _ => false,
     }
+}
+
+/// Whether a path is a file kept for secrets rather than for code.
+///
+/// The system prompt has always said not to read these unless the user asked.
+/// That was a sentence and nothing else, which is the wrong place for it: the
+/// prompt is a request and this is a decision the user should get to make. It
+/// is a permission prompt now, on the same footing as reading outside the
+/// project, so the path is shown and the answer is theirs. In auto mode it
+/// still goes through, because auto mode is the user saying nothing should
+/// ask, and that is a choice they made about everything at once.
+///
+/// Matched on the file name only. A directory called `.env` full of ordinary
+/// files would be over-matched, which costs one prompt.
+pub fn holds_credentials(path: &str) -> bool {
+    const NAMES: [&str; 8] = [
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "credentials",
+        "id_rsa",
+        "id_ed25519",
+        ".pgpass",
+        ".htpasswd",
+    ];
+    let Some(name) = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    // .env, .env.local, .env.production and the rest of the family
+    lower == ".env"
+        || lower.starts_with(".env.")
+        || NAMES.contains(&lower.as_str())
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
 }
 
 /// What an "always allow" answer covers. Granting every future shell command
@@ -611,5 +654,37 @@ mod tests {
         assert!(out.starts_with(&"x".repeat(20)));
         assert!(out.contains("truncated at 20 characters"), "{out}");
         assert_eq!(truncate_output("short".into(), 20), "short");
+    }
+
+    /// The prompt has always said not to read these unless the user asked.
+    /// That is a decision the user should get to make, so it is a permission
+    /// prompt now rather than a sentence addressed to the model.
+    #[test]
+    fn a_file_kept_for_secrets_asks_first() {
+        for p in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "config/.env.test",
+            "server.pem",
+            "deploy.key",
+            "/home/u/.ssh/id_rsa",
+            ".npmrc",
+        ] {
+            assert!(holds_credentials(p), "should ask: {p}");
+        }
+        for p in [
+            "src/main.rs",
+            "environment.md",
+            "env.rs",
+            ".envrc",
+            "README.md",
+            "src/keyboard.rs",
+        ] {
+            assert!(!holds_credentials(p), "should not ask: {p}");
+        }
+
+        let args = serde_json::json!({"path": ".env"});
+        assert!(needs_permission("read_file", &args));
     }
 }

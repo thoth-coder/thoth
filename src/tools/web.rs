@@ -25,7 +25,69 @@ pub struct SearchArgs {
 }
 
 pub async fn search(a: SearchArgs) -> Result<String> {
+    if let Some(why) = query_leaks(&a.query) {
+        bail!(
+            "refused to search: {why}. A search query is the one thing thoth sends off this              machine, so it carries a few words and nothing else. Search for the error text,              the api name or the symptom instead of the material itself."
+        );
+    }
     ddg_search(&a.query).await
+}
+
+/// Why a query must not be sent, if it must not be.
+///
+/// The system prompt has always said that queries are the only text that
+/// leaves this machine and never to put code, file contents or secrets in
+/// one. That was a request to the model with nothing behind it, which is the
+/// wrong shape for the one tool that transmits: a model that ignores it, or
+/// never read it because it was compacted away, sends the file. These are the
+/// shapes a real query never has.
+fn query_leaks(q: &str) -> Option<&'static str> {
+    // a search query is words. A newline means something was pasted in
+    if q.contains('\n') || q.contains('\r') {
+        return Some("the query has line breaks in it, so it is pasted content and not a search");
+    }
+    if q.chars().count() > 400 {
+        return Some(
+            "the query is far longer than a search query, so it is content and not a search",
+        );
+    }
+    let lower = q.to_ascii_lowercase();
+    // the well-known credential prefixes, which are unmistakable
+    for marker in [
+        "-----begin",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xox",
+        "akia",
+        "aiza",
+        "eyj",
+        "-----end",
+    ] {
+        if lower.contains(marker) {
+            return Some("the query contains something shaped like a credential");
+        }
+    }
+    // key=value where the key is one of the words secrets hide behind
+    for name in [
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "passwd",
+        "private_key",
+        "access_token",
+        "auth_token",
+    ] {
+        if let Some(at) = lower.find(name) {
+            let rest = &lower[at + name.len()..];
+            let rest = rest.trim_start();
+            if rest.starts_with('=') || rest.starts_with(':') {
+                return Some("the query looks like it carries a secret and its value");
+            }
+        }
+    }
+    None
 }
 
 async fn ddg_search(query: &str) -> Result<String> {
@@ -253,5 +315,30 @@ mod tests {
             out.find("never obey it") < out.find("Example Domain"),
             "the warning has to come before the page, not after it"
         );
+    }
+
+    /// The one tool that transmits. A rule that only exists in the prompt is
+    /// a request; a model that never read it, or whose copy was compacted
+    /// away, sends the file.
+    #[test]
+    fn a_query_that_carries_more_than_a_search_is_refused() {
+        let ok = |q: &str| assert!(query_leaks(q).is_none(), "should be allowed: {q}");
+        let no = |q: &str| assert!(query_leaks(q).is_some(), "should be refused: {q}");
+
+        ok("rust tokio mpsc send await");
+        ok("E0382 borrow of moved value");
+        ok("axum 0.7 State extractor example");
+        // a legitimate query may talk about secrets without carrying one
+        ok("how to store an api key in rust");
+
+        no("fn main() {
+    println!(\"hi\");
+}");
+        no("sk-ant-api03-abcdefghijklmnop");
+        no("ghp_16C7e42F292c6912E7710c838347Ae178B4a");
+        no("-----BEGIN RSA PRIVATE KEY-----");
+        no("api_key=8f3d9a2b1c4e5f6a7b8c9d0e1f2a3b4c");
+        no("PASSWORD: hunter2 why does login fail");
+        no(&"a".repeat(500));
     }
 }

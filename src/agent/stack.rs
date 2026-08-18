@@ -31,6 +31,13 @@ pub struct Stack {
     /// Extensions this stack owns. Only consulted for stacks that running
     /// does not check, to notice a file that was changed and never looked at.
     pub exts: &'static [&'static str],
+    /// Where this ecosystem's api documentation lives, as a bare host, so a
+    /// search can be pointed at it with `site:`. thoth's search is eight
+    /// results scraped off one page, and a model guessing a phrase gets
+    /// tutorials and stale blog posts; naming the host it should scope to is
+    /// the cheapest thing that turns that into the reference. Empty when the
+    /// ecosystem has no single obvious home.
+    pub docs: &'static str,
     /// Whole words in a shell command that mean a check is what ran. Same
     /// note: only the unchecked stacks need it, but every row carries it,
     /// because "what command checks this" is a fact about the stack and not
@@ -53,6 +60,7 @@ check no types at all",
         run_checks: false,
         because: "the types are stripped out before the code runs",
         exts: &["ts", "tsx", "mts", "cts", "svelte", "vue", "astro"],
+        docs: "www.typescriptlang.org",
         ran: &[
             "tsc",
             "vue-tsc",
@@ -70,6 +78,7 @@ file you changed",
         run_checks: false,
         because: "a file is not even parsed until something imports it",
         exts: &["js", "jsx", "mjs", "cjs"],
+        docs: "developer.mozilla.org",
         ran: &["lint", "eslint", "biome", "standard", "--check"],
     },
     Stack {
@@ -79,6 +88,7 @@ file you changed",
         run_checks: true,
         because: "",
         exts: &["rs"],
+        docs: "docs.rs",
         ran: &["cargo"],
     },
     Stack {
@@ -88,6 +98,7 @@ file you changed",
         run_checks: true,
         because: "",
         exts: &["go"],
+        docs: "pkg.go.dev",
         ran: &["go"],
     },
     Stack {
@@ -98,6 +109,7 @@ it has one",
         run_checks: false,
         because: "only the files a request actually reaches are ever parsed",
         exts: &["php"],
+        docs: "www.php.net",
         ran: &["-l", "lint", "phpstan", "psalm", "phan"],
     },
     Stack {
@@ -113,6 +125,7 @@ it has one",
         run_checks: false,
         because: "a name is only looked up when its line runs",
         exts: &["py", "pyi"],
+        docs: "docs.python.org",
         ran: &[
             "mypy",
             "ruff",
@@ -130,6 +143,7 @@ it has one",
         run_checks: false,
         because: "a file is only parsed when it is required",
         exts: &["rb", "rake"],
+        docs: "rubydoc.info",
         ran: &["-c", "rubocop", "sorbet", "srb"],
     },
     Stack {
@@ -139,6 +153,7 @@ it has one",
         run_checks: true,
         because: "",
         exts: &["cs", "fs"],
+        docs: "learn.microsoft.com",
         ran: &["dotnet", "msbuild"],
     },
     Stack {
@@ -159,6 +174,7 @@ call you assembled yourself",
         run_checks: true,
         because: "",
         exts: &["c", "h", "cc", "cpp", "cxx", "hpp", "hh"],
+        docs: "en.cppreference.com",
         ran: &[
             "make", "cmake", "ninja", "meson", "cc", "gcc", "g++", "clang", "clang++",
         ],
@@ -170,7 +186,22 @@ call you assembled yourself",
         run_checks: true,
         because: "",
         exts: &["java", "kt", "kts"],
+        docs: "docs.oracle.com",
         ran: &["mvn", "gradle", "gradlew", "javac", "kotlinc"],
+    },
+    Stack {
+        // rockspecs carry the version in the file name, and a plain
+        // .luacheckrc is as much a declaration of a Lua project as a manifest
+        markers: &["*.rockspec", ".luacheckrc", "luacheck.rc", "stylua.toml"],
+        name: "Lua",
+        check: "`luac -p` on each file you changed, plus luacheck if the project uses it",
+        run_checks: false,
+        because: "a chunk is only compiled when it is first required, so a typo                   in a branch nothing took is still there",
+        exts: &["lua"],
+        docs: "www.lua.org",
+        // not "-p": `luac -p` already carries `luac`, and a bare -p is
+        // `mkdir -p` far more often than it is a Lua syntax check
+        ran: &["luac", "luacheck", "selene"],
     },
 ];
 
@@ -321,5 +352,32 @@ mod tests {
             // writes for the stacks that need one
             assert_eq!(s.because.is_empty(), s.run_checks, "{}", s.name);
         }
+    }
+
+    /// Lua is an interpreted stack, so it carries the same trap as PHP and
+    /// Ruby: the file runs, and a branch nothing took is still wrong.
+    #[test]
+    fn lua_is_found_and_is_not_checked_by_running_it() {
+        let lua = detect(&listing(&["main.lua", "thoth-1.0-1.rockspec"]));
+        assert_eq!(lua.len(), 1);
+        let lua = lua[0];
+        assert_eq!(lua.name, "Lua");
+        assert!(!lua.run_checks);
+        assert!(!lua.because.is_empty());
+        assert!(lua.owns("scripts/init.lua"));
+        assert!(!lua.owns("init.rs"));
+
+        assert!(lua.checked_by("luac -p init.lua"));
+        assert!(lua.checked_by("luacheck ."));
+        assert!(
+            !lua.checked_by("lua init.lua"),
+            "running it is not the check"
+        );
+        // the flag on its own must not count, or every mkdir is a check
+        assert!(!lua.checked_by("mkdir -p build"));
+        assert!(!lua.docs.is_empty());
+
+        // a .luacheckrc alone is enough to say what kind of project this is
+        assert_eq!(detect(&listing(&[".luacheckrc"])).len(), 1);
     }
 }

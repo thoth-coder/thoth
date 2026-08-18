@@ -5,6 +5,39 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Lua. One row in the stack table: `luac -p` per file plus luacheck, marked as
+  a stack that running does not check, because a chunk is only compiled when
+  it is first required and a typo in a branch nothing took is still there.
+- thoth names the reference to search, per stack: `site:docs.rs`,
+  `site:pkg.go.dev`, `site:docs.python.org` and so on, out of the same table
+  as everything else. Search is eight results scraped off one page, and a
+  model guessing a phrase gets tutorials and stale blog posts; a version
+  number recalled from training is the thing most likely to be wrong.
+
+### Fixed
+- **The interface behaved far worse than `-p` on the same task, and this was
+  why.** With an editor attached thoth adds a `problems` tool, and its
+  description told the model to reach for it "before falling back to a full
+  build". Editor diagnostics are not a build: they were invisible to the guard
+  that refuses a second whole-file rewrite, so a model doing exactly what the
+  tool told it to do got refused for the rest of the request with nothing it
+  could do to clear the refusal. A `-p` run in a bare directory has no editor
+  and never saw it. The build is the check now and `problems` is the second
+  opinion, in that order, in both the tool description and the prompt; the
+  language server lags behind edits and can need restarting before a fixed
+  error clears, so a diagnostic that survives a passing build is stale and
+  says so, rather than sending the model back to change working code.
+- Two of thoth's own rules were sentences addressed to the model with nothing
+  behind them, which is the wrong shape for a rule about what leaves the
+  machine. A search query that carries line breaks, a whole file's worth of
+  text, or something shaped like a credential is now refused in code, since a
+  query is the one thing thoth transmits. Reading `.env` and its family, and
+  `.pem`, `.key`, `.npmrc`, `id_rsa` and the rest, is a permission prompt
+  rather than a request: the path is shown and the answer is the user's. Auto
+  mode still lets both through, because auto mode is the user saying nothing
+  should ask.
+
 ## [0.4.4] - 2026-08-18
 
 ### Added
