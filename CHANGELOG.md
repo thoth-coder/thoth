@@ -5,6 +5,19 @@ All notable changes to thoth are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A search that comes back with nothing now says which kind of nothing it is.
+  Search is eight results scraped off one page of html with two regexes, and
+  an empty parse was reported as "No results found" whether the engine had
+  answered honestly, refused the request, or simply changed a css class. That
+  is the worst failure a search can have: it is silent, and it reads as
+  evidence that the thing does not exist. A model was watched concluding
+  exactly that about a crate, correctly, on a day the scraper worked; it would
+  have concluded the same on a day it did not. A refusal, a page this code no
+  longer understands, and a reply that is not a results page are all errors
+  now, each saying which it was, and each saying plainly that nothing was
+  searched so the emptiness means nothing.
+
 ## [0.4.5] - 2026-08-18
 
 ### Added

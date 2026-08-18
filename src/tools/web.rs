@@ -33,6 +33,68 @@ pub async fn search(a: SearchArgs) -> Result<String> {
     ddg_search(&a.query).await
 }
 
+/// Why a page of search results parsed to nothing.
+///
+/// The one that matters is the difference between the first and the rest.
+/// Search is eight results scraped off one page of html with two regexes; the
+/// day DuckDuckGo renames a css class, every search returns nothing and looks
+/// exactly like "there is no such thing". A model was watched concluding that
+/// a crate did not exist from an empty result set, correctly, on a day the
+/// scraper worked. It would draw the same conclusion on a day it did not.
+#[derive(Debug, PartialEq, Eq)]
+enum Empty {
+    /// The engine answered, and there really is nothing.
+    NoResults,
+    /// The engine refused us: rate limit, captcha, anomaly page.
+    Refused,
+    /// The engine answered with a page this code no longer understands.
+    MarkupChanged,
+    /// Not a page of results at all.
+    NotAPage,
+}
+
+impl Empty {
+    fn say(&self) -> &'static str {
+        match self {
+            Empty::NoResults => "no results",
+            Empty::Refused => "the search engine refused the request (rate limit or a captcha)",
+            Empty::MarkupChanged => {
+                "the results page is no longer in the shape this code reads, so the scraper                  needs updating"
+            }
+            Empty::NotAPage => "the reply was not a results page at all",
+        }
+    }
+}
+
+fn why_empty(html: &str) -> Empty {
+    let low = html.to_ascii_lowercase();
+    // being turned away comes first: such a page carries none of the rest
+    for marker in [
+        "anomaly",
+        "captcha",
+        "unusual traffic",
+        "are you a robot",
+        "/challenge",
+    ] {
+        if low.contains(marker) {
+            return Empty::Refused;
+        }
+    }
+    // the engine's own way of saying it found nothing
+    if low.contains("no-results") || low.contains("no results found") {
+        return Empty::NoResults;
+    }
+    // a results page is tens of kilobytes. Anything this short is a redirect,
+    // an error page, or an empty body
+    if html.len() < 2000 {
+        return Empty::NotAPage;
+    }
+    // the class is still there and nothing was captured, so the attributes
+    // around it moved; or it is gone entirely. Either way this code is out of
+    // date and must not pass that off as an answer
+    Empty::MarkupChanged
+}
+
 /// Why a query must not be sent, if it must not be.
 ///
 /// The system prompt has always said that queries are the only text that
@@ -122,7 +184,16 @@ async fn ddg_search(query: &str) -> Result<String> {
         }
     }
     if out.is_empty() {
-        return Ok("No results found.".into());
+        return match why_empty(&html) {
+            Empty::NoResults => Ok(format!("No results found for: {query}")),
+            reason => bail!(
+                "the search came back with nothing readable, and that is a thoth problem \
+rather than an answer: {}. Do not read it as \"there is no such thing\": nothing \
+was searched. Say the search is unavailable and carry on with what can be done \
+without it.",
+                reason.say()
+            ),
+        };
     }
     out.push_str("\nUse web_fetch with a URL to read a page.");
     // titles and snippets are written by whoever owns the page, and a search
@@ -340,5 +411,55 @@ mod tests {
         no("api_key=8f3d9a2b1c4e5f6a7b8c9d0e1f2a3b4c");
         no("PASSWORD: hunter2 why does login fail");
         no(&"a".repeat(500));
+    }
+
+    /// An empty result set has to say which kind of empty it is. Eight
+    /// results scraped off one page with two regexes is one css rename away
+    /// from answering "nothing exists" to every question ever asked.
+    #[test]
+    fn an_empty_page_says_whether_it_is_an_answer_or_a_breakage() {
+        let big = "x".repeat(50_000);
+
+        // the engine turning us away, in its several wordings
+        assert_eq!(why_empty("<html>anomaly detected</html>"), Empty::Refused);
+        assert_eq!(
+            why_empty("<html>please solve the CAPTCHA</html>"),
+            Empty::Refused
+        );
+        assert_eq!(
+            why_empty("<html>unusual traffic from your network</html>"),
+            Empty::Refused
+        );
+
+        // the engine answering honestly
+        assert_eq!(
+            why_empty(&format!("<div class=\"no-results\">{big}</div>")),
+            Empty::NoResults
+        );
+        assert_eq!(
+            why_empty("No results found for that query."),
+            Empty::NoResults
+        );
+
+        // a full page that this code can no longer read: the dangerous one,
+        // because it is the one that looks like an answer
+        assert_eq!(
+            why_empty(&format!("<div class=\"result__body_v2\">{big}</div>")),
+            Empty::MarkupChanged
+        );
+
+        // and something that is not a results page at all
+        assert_eq!(why_empty(""), Empty::NotAPage);
+        assert_eq!(why_empty("<html><body>502</body></html>"), Empty::NotAPage);
+
+        // whatever it is, it has to be sayable
+        for e in [
+            Empty::NoResults,
+            Empty::Refused,
+            Empty::MarkupChanged,
+            Empty::NotAPage,
+        ] {
+            assert!(!e.say().is_empty());
+        }
     }
 }
