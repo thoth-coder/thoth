@@ -5,3 +5,7 @@
 
 # personal notes
 note.txt
+
+# the agent lab: real-model runs, graded by building what they produce.
+# Kept out of the published tree until it earns a place there.
+/lab/

@@ -497,6 +497,15 @@ impl Agent {
         if *self.rewrites.get(&name)? == 0 {
             return None;
         }
+        // Nothing was refused, or the way out of this refusal may itself have
+        // been refused. In accept-edits mode a file change goes through and a
+        // shell command asks, so a user answering no to the build leaves the
+        // model able to write and unable to check, and a block that can only
+        // be lifted by checking is one it cannot lift. The user has already
+        // said what they want here; do not also take the file away.
+        if self.denied > 0 {
+            return None;
+        }
         // Only when there is a check to name, and the reason is not the
         // wording. `ran_a_check` reads the same list, so with no stack in it
         // nothing the model can run counts as having found anything out, and
@@ -1762,6 +1771,21 @@ mod tests {
         );
         agent.rewrites.clear();
         assert!(agent.rewritten_blindly(&write, &rust).is_none());
+
+        // A refusal the model cannot clear is the same trap again. In
+        // accept-edits mode writes go through and the shell asks, so a user
+        // who says no to the build leaves the model able to write and unable
+        // to check: blocking the write then is taking away the only thing it
+        // is still allowed to do.
+        *agent.rewrites.entry("main.rs".into()).or_insert(0) += 1;
+        assert!(agent.rewritten_blindly(&write, &rust).is_some());
+        agent.denied = 1;
+        assert!(
+            agent.rewritten_blindly(&write, &rust).is_none(),
+            "the way out of the block may itself have been refused"
+        );
+        agent.denied = 0;
+        agent.rewrites.clear();
 
         // and once something has actually been run, the slate is clean
         assert!(Agent::ran_a_check(
