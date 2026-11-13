@@ -1,0 +1,56 @@
+name: Bug report
+description: Something thoth did wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you asked for, what thoth did, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: transcript
+    attributes:
+      label: Transcript or output
+      description: The relevant part of the session, the `-p` output, or `thoth --view` output for a screen bug. Remove api keys and anything private.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: thoth version
+      description: Output of `thoth --version`
+      placeholder: thoth 0.4.5
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      placeholder: Windows Terminal, PowerShell console, iTerm2, kitty...
+  - type: dropdown
+    id: api
+    attributes:
+      label: api
+      description: The `api` setting in use, or what auto picked
+      options:
+        - auto
+        - ollama
+        - openai
+        - anthropic
+  - type: input
+    id: model
+    attributes:
+      label: Server and model
+      placeholder: Ollama, qwen3:8b, context_window 32768
