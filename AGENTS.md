@@ -1,185 +1,27 @@
-# Thoth
+# AGENTS.md
 
-Agentic coding assistant (TUI). Talks to self-hosted models through Ollama
-or any OpenAI-compatible server, and to hosted apis (Anthropic natively,
-OpenAI/Google/OpenRouter over the OpenAI api). Rust, edition 2024.
+Rust 2024, stable 1.85+. Run `cargo fmt`, `cargo clippy -- -D warnings`
+and `cargo test` before you finish. CI runs them on Linux, macOS and
+Windows. Tests go in `mod tests` at the bottom of the file.
 
-## Build and test
+Don't hardcode tool names like `cargo` or `tsc` outside `agent/stack.rs`.
+Adding a language is a new row in that table.
 
-```sh
-cargo build                 # debug build
-cargo build --release       # -> target/release/thoth
-cargo fmt                   # rustfmt defaults, no config
-cargo test                  # unit tests
-cargo test -- --ignored     # network tests (need internet)
-cargo clippy -- -D warnings # CI enforces zero warnings
-```
+If the model must not do something, block it in code. Don't rely on the
+prompt. When a guard says no, it should say what the model can do instead.
 
-Stable Rust 1.85+ (edition 2024). CI runs `build --release`, `test` and
-`clippy` on Linux, macOS and Windows, so a `cfg!(windows)` branch that only
-compiles on one side fails the matrix.
+Show the user every command and diff, also when it's auto-approved.
+"Always allow" is per program or per host.
 
-Tests live in a `#[cfg(test)] mod tests` at the bottom of the file they
-cover. There is no `tests/` directory, don't add one.
+Keep an eye on context size. If a tool cuts output, say so and say how to
+get the rest. After changing the prompt, check
+`cargo test prompt_budget -- --ignored --nocapture`.
 
-A file past roughly a thousand lines is a sign it holds two things: split it
-into a module directory (`client/`) or a sibling (`ui/screen.rs`) rather than
-letting it grow. A child module sees its parent's private items, so a split
-along those lines needs no new `pub`.
+Don't trust anything from the network or from files: no byte-offset
+slicing, no unchecked paths.
 
-## Architecture (src/)
+Use `cfg!(windows)` instead of `#[cfg]` where you can. Debug-only stuff
+goes behind `#[cfg(debug_assertions)]`. Don't add big dependencies.
 
-- `main.rs`: the order things happen in at startup, and nothing else. Config
-  resolution, model discovery, spawning the agent task, then TUI or `-p`.
-- `cli.rs`: the clap surface and the subcommands that answer without ever
-  starting a session (`upgrade`, `config`, `--view`). Everything here has to
-  work on a machine with no model running, which is why it sits before the
-  config load rather than inside it.
-- `print.rs`: `-p` mode. The split down the middle is the point: the model's
-  answer goes to stdout and nothing else does, so `thoth -p "..." > out.txt`
-  leaves a file with the answer and a terminal with the working shown.
-- `config.rs`: named profiles in `~/.thoth/config.toml` plus the resolution
-  order: CLI flag, then `THOTH_*` env var, then the active profile, then the
-  built-in default. Owns `thoth_home()`, the one definition of `~/.thoth`
-  that session state and the editor bridge also use. Reads the pre-0.3 file
-  (flat, in the platform config dir) as a profile called `default`. A new setting means all of `Config`, `Profile`,
-  `resolve`, the field list in `ui/config.rs` and `docs/configuration.md`.
-- `client/`: LLM transport, one module per wire protocol. `mod.rs` holds
-  the message shape, the `Client` and the transport choice: `auto` picks by
-  url and only probes `/api/version` on a local address, because a paid
-  endpoint must never see a request to a path we guessed. `openai.rs` is
-  OpenAI-compatible SSE (`/chat/completions`), `ollama.rs` the native
-  `/api/chat` (which takes the context window per request), `anthropic.rs`
-  the native `/v1/messages` (which allows prompt caching). `stream.rs` is
-  what both text protocols need: `ThinkFilter` routes inline `<think>` tags
-  to reasoning, `ToolTextFilter` reads a tool call a model wrote as text,
-  and `TextStream` is the pair of them, so neither transport grows its own
-  copy.
-- `agent/mod.rs`: the agentic loop (model call, tool calls, results, repeat).
-  Owns conversation history, permission gating, duplicate-call breaker,
-  truncation recovery, /recap, editor-context injection, `!command` runs.
-- `agent/history.rs`: what leaves the conversation, since context is the
-  scarce resource and three things spend it. The summary that replaces a
-  history too long to send (`compact`, automatic at 2/3 of the window or on
-  `/compact`), the trim that saves a request the server already truncated
-  (`hard_trim`), and the older copy of a result a newer identical read has
-  superseded (`drop_stale_copy`) - where identical is the whole safety
-  condition. A child module, so these stay `impl Agent`.
-- `agent/prompt.rs`: system prompt. Environment (cwd, os, date, git branch),
-  project scan, guardrail rules, instruction file (THOTH.md/AGENTS.md/
-  CLAUDE.md, pointers followed), project memory.
-- `agent/stack.rs`: what kind of project this is and what checks it. One
-  table, one row per stack (marker files, extensions, the check command, the
-  words that mean a check ran, and whether running the code already was that
-  check). The prompt reads it to name the command, the agent loop reads it to
-  notice code that was changed and never checked. Supporting another language
-  is adding a row: nothing else in thoth may name a language or a tool.
-- `agent/undo.rs`: what a file looked like before thoth changed it. Each
-  request is one checkpoint under `~/.thoth/projects/<key>/undo/`; `/undo`
-  puts the newest one back and leaves alone anything that changed since.
-  Recording is armed by `main.rs`, so the file tools stay inert outside a
-  real session (which also keeps the tests off the user's state).
-- `agent/session.rs`: per-project state under
-  `~/.thoth/projects/<key>/`: saved transcript for `--continue` and the
-  persistent permission allowlist. Written atomically, owner-only on unix.
-- `tools/`: `fs.rs` (read/write/edit/multi_edit/move/delete, read-coverage
-  registry, unified diffs, line-ending alignment), `search.rs` (grep with
-  optional context lines), `shell.rs` (foreground with timeout, background
-  mode), `web.rs` (DuckDuckGo search, html to text), `memory.rs` (project
-  memory, session recap, project key), `todo.rs` (the plan for the task),
-  `mod.rs` (tool schemas, dispatch, permission rules, `output_cap`).
-- `editor.rs`: VS Code awareness. Reads state files written by the
-  companion extension (thoth-for-vscode) from `~/.thoth/ide/`, falls back
-  to window titles on Windows.
-- `ui/mod.rs`: ratatui interface. The state and everything that changes it:
-  agent events, slash commands, the transcript blocks. `ui/screen.rs` is the
-  other half, the drawing, including the incremental wrap cache; it is a
-  child module, so it reads `App`'s private fields without any of them being
-  made public. `ui/keys.rs` is what a key means: the mode routing (chooser,
-  permission prompt, completion popup, plain typing) and the input editing
-  that follows from it, and the order the modes are tested in is the whole of
-  the routing. `ui/render.rs` turns text into
-  styled lines (markdown, diffs, wrapping), `ui/theme.rs` holds colors and
-  glyphs, `ui/input.rs` handles `@path` attachments and completion.
-- `ui/clipboard.rs`: OSC 52, so the terminal does the copying and thoth
-  carries no clipboard library and no platform code. `ctrl+t` (mouse capture
-  off) is the way out for terminals that ignore it.
-- `ui/demo.rs`: fake sessions for every screen, printed by `thoth --view
-  <name>` in a debug build. A screen that only appears after a permission
-  prompt, an `ask_user` call or a plan-mode turn is otherwise minutes of
-  model time away, so it never gets looked at and the bugs stay. Child
-  module of `ui`, so it builds an `App` and sets its private fields.
-  `every_view_draws` renders all of them at two sizes on `cargo test`; a new
-  screen means a new view here.
-- `ui/config.rs`: the profile screen. One struct drives both `thoth config`
-  (its own event loop) and `/config` (the App holds it and forwards keys),
-  so the two cannot drift. Saving hands back a `Config` that the agent
-  applies to the live session.
-- `upgrade.rs`: `thoth upgrade`, replacing the running binary with the
-  latest verified GitHub release.
-
-## Everything else
-
-- `docs/`: the user-facing docs (getting-started, usage, configuration,
-  tools). A new flag, tool or slash command is not done until the matching
-  page says so.
-- `CHANGELOG.md`: one line under Unreleased for anything user-visible.
-- `scripts/`: install and uninstall, sh and PowerShell. They must stay in
-  step with the release asset names in `.github/workflows/release.yml` and
-  with `upgrade.rs`.
-- `THOTH.md` and `CLAUDE.md` are pointers to this file. Keep them that way,
-  put the content here.
-- `note.txt` is gitignored personal notes. Leave it alone.
-
-## Conventions
-
-- Guardrails go in code, not in the prompt, whenever possible. See the
-  read registry in `tools/fs.rs`: write_file needs every line of a file
-  covered by earlier reads, not just "a read happened". And the rewrite
-  guard in `agent/mod.rs`: a file written whole twice in one request with
-  no check in between was written the second time out of the same knowledge
-  as the first.
-- A note that only reaches the user reaches it too late to fix anything.
-  "Files changed and nothing was run" is worth saying either way, but the
-  model is the one that can still act on it, so it is put to the model first
-  and told to the user afterwards. Once per request: a model that will not
-  run the check must not be asked round and round.
-- A guardrail that refuses has to be able to say what would satisfy it. The
-  rewrite guard stays quiet when no stack is detected, because `ran_a_check`
-  reads the same list: with nothing in it, no command the model could run
-  would lift the block, and a refusal it cannot clear locks it out of the
-  file for the rest of the request.
-- thoth is not a TypeScript tool or a Rust tool. No language, framework,
-  file extension or shell command belongs anywhere but a table: `tsc`,
-  `cargo`, `php -l` and the rest live in `agent/stack.rs` and nowhere else.
-  If a fix wants a rule about one language, the fix is a row plus a rule
-  written in terms of the row's fields. Anything else is a stack that
-  happens to be the one being tested that day, and it strands every other
-  language the user works in.
-- Anything that touches the user's machine must be visible in the UI: full
-  command lines, full diffs, even when auto-approved.
-- "Always allow" is scoped, never a blanket grant: shell is keyed by
-  program (`shell:cargo`), web_fetch by host. See `permission_key` in
-  `tools/mod.rs`.
-- Context is the scarce resource. Everything sent on every request is
-  budgeted against the window: `tools::output_cap` sizes tool results,
-  `prompt::situational_rules` drops rules for things that are not there, and
-  the instruction file is capped the same way. `cargo test prompt_budget --
-  --ignored --nocapture` prints what a request costs before the conversation
-  starts; check it after touching the prompt or the tool schemas.
-- A tool that truncates its own output says what was cut and how to get the
-  rest. Never let a caller blindly cut a result that had a footer.
-- Anything parsed from the network or from a file can be hostile: no
-  slicing by byte offset, no unvalidated value in a filesystem path.
-- Prefer runtime `cfg!(windows)` over `#[cfg]` so both branches compile on
-  every platform. `#[cfg]` items need a non-Windows stub.
-- No new heavyweight dependencies without a good reason.
-- Development-only code is `#[cfg(debug_assertions)]`, not a runtime `if`.
-  `ui/demo.rs` carries made-up transcripts nobody who installs thoth will
-  ever see; the optimizer happened to drop them, and `#[cfg]` is the same
-  thing said as a guarantee. The release profile is tuned for what a user
-  downloads (`lto = "fat"`, one codegen unit, symbols stripped, `panic =
-  "abort"`): thoth has no `catch_unwind` and nothing that must run while a
-  panic travels, and ratatui's hook still puts the terminal back under
-  abort, so the unwinding tables were pure weight. Adding either would mean
-  taking `panic = "abort"` back out.
+User-facing changes need `docs/` and a `CHANGELOG.md` line. New screens
+need a view in `ui/demo.rs`.
